@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: instagram-scraper-db
+    environment:
+      POSTGRES_USER: scraper
+      POSTGRES_PASSWORD: scraper_password
+      POSTGRES_DB: instagram_scraper
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scraper"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # FastAPI Application
+  app:
+    build: .
+    container_name: instagram-scraper-app
+    environment:
+      FASTAPI_ENV: development
+      FASTAPI_HOST: 0.0.0.0
+      FASTAPI_PORT: 8000
+      DATABASE_URL: postgresql://scraper:scraper_password@postgres:5432/instagram_scraper
+      BROWSERLESS_HOST: ${BROWSERLESS_HOST:-https://chrome.browserless.io}
+      BROWSERLESS_TOKEN: ${BROWSERLESS_TOKEN:-your-token-here}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-your-api-key}
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: python -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  postgres_data:

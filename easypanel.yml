@@ -1,0 +1,79 @@
+# Configuração para EasyPanel
+# Este arquivo define como a aplicação deve ser deployada no EasyPanel
+
+version: '1.0'
+
+app:
+  name: instagram-scraper
+  displayName: Instagram Scraper API
+  description: Sistema de raspagem de dados do Instagram com IA
+
+docker:
+  # Dockerfile a usar
+  dockerfile: Dockerfile
+  
+  # Porta exposta
+  ports:
+    - 8000
+
+  # Health check
+  healthCheck:
+    path: /api/health
+    interval: 30
+    timeout: 10
+    retries: 3
+
+# Variáveis de ambiente necessárias
+environment:
+  FASTAPI_ENV: production
+  FASTAPI_HOST: 0.0.0.0
+  FASTAPI_PORT: 8000
+  LOG_LEVEL: INFO
+  MAX_RETRIES: 3
+  REQUEST_TIMEOUT: 30
+
+# Variáveis de ambiente sensíveis (devem ser configuradas no EasyPanel)
+secrets:
+  - DATABASE_URL
+  - BROWSERLESS_HOST
+  - BROWSERLESS_TOKEN
+  - OPENAI_API_KEY
+  - INSTAGRAM_USERNAME
+  - INSTAGRAM_PASSWORD
+
+# Recursos
+resources:
+  memory: 512Mi
+  cpu: 0.5
+
+# Volumes (se necessário)
+volumes: []
+
+# Comandos de inicialização
+commands:
+  start: python -m uvicorn main:app --host 0.0.0.0 --port 8000
+
+# Dependências externas
+dependencies:
+  - postgres:15
+  - redis:7  # Opcional, para cache/queue no futuro
+
+# Configuração de banco de dados
+database:
+  type: postgresql
+  version: 15
+  name: instagram_scraper
+  user: scraper
+  # Password será gerada automaticamente pelo EasyPanel
+
+# Configuração de logs
+logging:
+  level: INFO
+  format: json
+  stdout: true
+
+# Configuração de backup
+backup:
+  enabled: true
+  schedule: "0 2 * * *"  # 2 AM diariamente
+  retention: 30  # Manter últimos 30 backups
