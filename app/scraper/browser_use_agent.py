@@ -6,6 +6,9 @@ Browser Use usa IA para tomar decisões autônomas durante a navegação.
 import logging
 import asyncio
 from typing import Optional, Dict, Any
+from urllib.parse import urlparse
+
+from browser_use import Agent, BrowserSession, ChatOpenAI
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -20,10 +23,37 @@ class BrowserUseAgent:
     """
 
     def __init__(self):
-        self.model = "gpt-4-mini"  # Modelo mais barato
+        self.model = "gpt-4o-mini"
         self.api_key = settings.openai_api_key
         self.browserless_host = settings.browserless_host
         self.browserless_token = settings.browserless_token
+        self.browserless_ws_url = settings.browserless_ws_url
+
+    def _build_browserless_cdp_url(self) -> str:
+        if not self.browserless_token:
+            raise ValueError("BROWSERLESS_TOKEN is required for Browser Use.")
+
+        base_url = self.browserless_ws_url
+        if not base_url:
+            parsed = urlparse(self.browserless_host)
+            if not parsed.netloc:
+                raise ValueError("BROWSERLESS_HOST must be a valid URL.")
+            scheme = "wss" if parsed.scheme in ("https", "wss") else "ws"
+            base_url = f"{scheme}://{parsed.netloc}"
+
+        if "token=" in base_url:
+            return base_url
+
+        separator = "&" if "?" in base_url else "?"
+        return f"{base_url}{separator}token={self.browserless_token}"
+
+    async def _safe_stop_session(self, session: BrowserSession) -> None:
+        stop_fn = getattr(session, "stop", None)
+        if stop_fn is None:
+            return
+        result = stop_fn()
+        if asyncio.iscoroutine(result):
+            await result
 
     async def navigate_and_scrape_profile(
         self,
@@ -43,9 +73,10 @@ class BrowserUseAgent:
         try:
             logger.info(f"🤖 Iniciando Browser Use Agent para: {profile_url}")
 
-            # Nota: Browser Use requer instalação e configuração específica
-            # Para esta implementação, usaremos uma abordagem alternativa
-            # que combina Browserless com IA para simulação de comportamento humano
+            if not self.api_key:
+                raise ValueError("OPENAI_API_KEY is required for Browser Use.")
+
+            cdp_url = self._build_browserless_cdp_url()
 
             task = f"""
             Acesse o perfil do Instagram em {profile_url} e:
@@ -65,19 +96,31 @@ class BrowserUseAgent:
             Não use seletores CSS fixos - adapte-se ao layout.
             """
 
-            # Simulação: Em produção, isso seria executado pelo Browser Use
-            # Por enquanto, retornamos uma estrutura esperada
+            browser_session = BrowserSession(cdp_url=cdp_url)
+            llm = ChatOpenAI(model=self.model, api_key=self.api_key)
+            agent = Agent(
+                task=task,
+                llm=llm,
+                browser_session=browser_session,
+            )
+
+            try:
+                history = await agent.run()
+            finally:
+                await self._safe_stop_session(browser_session)
+
+            status = "unknown"
+            if history.is_done():
+                status = "success" if history.is_successful() else "failed"
+
             result = {
                 "profile_url": profile_url,
-                "screenshots": [],
-                "html_content": [],
-                "extracted_data": {
-                    "username": None,
-                    "bio": None,
-                    "is_private": False,
-                    "posts": [],
-                },
-                "status": "pending",
+                "final_result": history.final_result(),
+                "extracted_content": history.extracted_content(),
+                "screenshots": history.screenshots(),
+                "urls": history.urls(),
+                "errors": history.errors(),
+                "status": status,
                 "task": task,
             }
 

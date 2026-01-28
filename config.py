@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # Browserless
     browserless_host: str
     browserless_token: str
+    browserless_ws_url: Optional[str] = None
 
     # OpenAI
     openai_api_key: str
