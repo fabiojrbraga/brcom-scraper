@@ -63,10 +63,21 @@ class BrowserUseAgent:
         if parsed_ws.hostname in ("0.0.0.0", "127.0.0.1", "localhost"):
             parsed_ws = parsed_ws._replace(netloc=external_host, scheme=scheme)
 
+        # Normalize path like "/token=..." into query param.
         query_items = dict(parse_qsl(parsed_ws.query))
+        if "token=" in (parsed_ws.path or "") and not query_items:
+            token_value = parsed_ws.path.lstrip("/").split("token=", 1)[-1]
+            if token_value:
+                query_items["token"] = token_value
+                parsed_ws = parsed_ws._replace(path="/")
+
         if "token" not in query_items and self.browserless_token:
             query_items["token"] = self.browserless_token
             parsed_ws = parsed_ws._replace(query=urlencode(query_items))
+
+        # Ensure we don't return an URL with token in the path.
+        if "token=" in (parsed_ws.path or "") and parsed_ws.query:
+            parsed_ws = parsed_ws._replace(path="/")
 
         return urlunparse(parsed_ws)
 
