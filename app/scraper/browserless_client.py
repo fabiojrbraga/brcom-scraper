@@ -21,6 +21,20 @@ class BrowserlessClient:
         self.timeout = settings.request_timeout
         self.client = httpx.AsyncClient(timeout=self.timeout)
 
+    def _is_field_validation_error(self, response: httpx.Response, fields: list[str]) -> bool:
+        if response.status_code != 400:
+            return False
+        try:
+            message = response.text or ""
+        except Exception:
+            return False
+        if "not allowed" not in message:
+            return False
+        return any(f'"{field}" is not allowed' in message for field in fields)
+
+    def _strip_payload_fields(self, payload: Dict[str, Any], fields: list[str]) -> Dict[str, Any]:
+        return {key: value for key, value in payload.items() if key not in fields}
+
     async def close(self):
         """Fecha a conexão com Browserless."""
         await self.client.aclose()
@@ -72,9 +86,21 @@ class BrowserlessClient:
                 screenshot_data = response.json().get("data")
                 logger.info(f"✅ Screenshot capturado: {url}")
                 return screenshot_data
-            else:
-                logger.error(f"❌ Erro ao capturar screenshot: {response.text}")
-                raise Exception(f"Browserless error: {response.text}")
+
+            if self._is_field_validation_error(response, ["fullPage", "timeout"]):
+                fallback_payload = self._strip_payload_fields(payload, ["fullPage", "timeout"])
+                response = await self.client.post(
+                    f"{self.host}/screenshot",
+                    json=fallback_payload,
+                    headers=self._get_headers(),
+                )
+                if response.status_code == 200:
+                    screenshot_data = response.json().get("data")
+                    logger.info(f"✅ Screenshot capturado (fallback): {url}")
+                    return screenshot_data
+
+            logger.error(f"❌ Erro ao capturar screenshot: {response.text}")
+            raise Exception(f"Browserless error: {response.text}")
 
         except Exception as e:
             logger.error(f"❌ Erro ao capturar screenshot de {url}: {e}")
@@ -116,9 +142,21 @@ class BrowserlessClient:
                 html = response.json().get("data")
                 logger.info(f"✅ HTML obtido: {url}")
                 return html
-            else:
-                logger.error(f"❌ Erro ao obter HTML: {response.text}")
-                raise Exception(f"Browserless error: {response.text}")
+
+            if self._is_field_validation_error(response, ["timeout"]):
+                fallback_payload = self._strip_payload_fields(payload, ["timeout"])
+                response = await self.client.post(
+                    f"{self.host}/content",
+                    json=fallback_payload,
+                    headers=self._get_headers(),
+                )
+                if response.status_code == 200:
+                    html = response.json().get("data")
+                    logger.info(f"✅ HTML obtido (fallback): {url}")
+                    return html
+
+            logger.error(f"❌ Erro ao obter HTML: {response.text}")
+            raise Exception(f"Browserless error: {response.text}")
 
         except Exception as e:
             logger.error(f"❌ Erro ao obter HTML de {url}: {e}")
@@ -158,9 +196,21 @@ class BrowserlessClient:
                 result = response.json().get("data")
                 logger.info(f"✅ Script executado em: {url}")
                 return result
-            else:
-                logger.error(f"❌ Erro ao executar script: {response.text}")
-                raise Exception(f"Browserless error: {response.text}")
+
+            if self._is_field_validation_error(response, ["timeout"]):
+                fallback_payload = self._strip_payload_fields(payload, ["timeout"])
+                response = await self.client.post(
+                    f"{self.host}/execute",
+                    json=fallback_payload,
+                    headers=self._get_headers(),
+                )
+                if response.status_code == 200:
+                    result = response.json().get("data")
+                    logger.info(f"✅ Script executado (fallback): {url}")
+                    return result
+
+            logger.error(f"❌ Erro ao executar script: {response.text}")
+            raise Exception(f"Browserless error: {response.text}")
 
         except Exception as e:
             logger.error(f"❌ Erro ao executar script em {url}: {e}")
@@ -197,9 +247,21 @@ class BrowserlessClient:
                 pdf_data = response.content
                 logger.info(f"✅ PDF gerado: {url}")
                 return pdf_data
-            else:
-                logger.error(f"❌ Erro ao gerar PDF: {response.text}")
-                raise Exception(f"Browserless error: {response.text}")
+
+            if self._is_field_validation_error(response, ["timeout"]):
+                fallback_payload = self._strip_payload_fields(payload, ["timeout"])
+                response = await self.client.post(
+                    f"{self.host}/pdf",
+                    json=fallback_payload,
+                    headers=self._get_headers(),
+                )
+                if response.status_code == 200:
+                    pdf_data = response.content
+                    logger.info(f"✅ PDF gerado (fallback): {url}")
+                    return pdf_data
+
+            logger.error(f"❌ Erro ao gerar PDF: {response.text}")
+            raise Exception(f"Browserless error: {response.text}")
 
         except Exception as e:
             logger.error(f"❌ Erro ao gerar PDF de {url}: {e}")
