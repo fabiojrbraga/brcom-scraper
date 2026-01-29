@@ -29,7 +29,7 @@ Este documento contém instruções detalhadas para configurar e executar o Inst
 ### 1. Clonar Repositório
 
 ```bash
-git clone <seu-repositorio>
+git clone https://github.com/fabiojrbraga/instagram-scraper.git
 cd instagram-scraper
 ```
 
