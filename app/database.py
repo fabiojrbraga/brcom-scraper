@@ -10,9 +10,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Normalizar URL do Postgres para SQLAlchemy
+database_url = settings.database_url
+if database_url.startswith("postgres://"):
+    database_url = database_url.replace("postgres://", "postgresql://", 1)
+
 # Criar engine do SQLAlchemy
 engine = create_engine(
-    settings.database_url,
+    database_url,
     echo=settings.fastapi_env == "development",
     poolclass=NullPool if settings.fastapi_env == "production" else None,
     connect_args={"connect_timeout": settings.request_timeout}
