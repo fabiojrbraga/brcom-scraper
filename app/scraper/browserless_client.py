@@ -82,8 +82,12 @@ class BrowserlessClient:
             )
 
             if response.status_code == 200:
-                # Browserless retorna a imagem em base64
-                screenshot_data = response.json().get("data")
+                # Alguns Browserless retornam JSON com base64, outros retornam bytes da imagem.
+                content_type = response.headers.get("content-type", "").lower()
+                if "application/json" in content_type:
+                    screenshot_data = response.json().get("data")
+                else:
+                    screenshot_data = base64.b64encode(response.content).decode("ascii")
                 logger.info(f"✅ Screenshot capturado: {url}")
                 return screenshot_data
 
@@ -95,7 +99,11 @@ class BrowserlessClient:
                     headers=self._get_headers(),
                 )
                 if response.status_code == 200:
-                    screenshot_data = response.json().get("data")
+                    content_type = response.headers.get("content-type", "").lower()
+                    if "application/json" in content_type:
+                        screenshot_data = response.json().get("data")
+                    else:
+                        screenshot_data = base64.b64encode(response.content).decode("ascii")
                     logger.info(f"✅ Screenshot capturado (fallback): {url}")
                     return screenshot_data
 
