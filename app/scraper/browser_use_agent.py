@@ -119,6 +119,19 @@ class BrowserUseAgent:
         if asyncio.iscoroutine(result):
             await result
 
+    def _create_browser_session(self, cdp_url: str, storage_state: Optional[Dict[str, Any]] = None) -> BrowserSession:
+        """
+        Cria BrowserSession tentando desativar compressÃ£o do WebSocket quando suportado.
+        """
+        try:
+            return BrowserSession(
+                cdp_url=cdp_url,
+                storage_state=storage_state,
+                ws_connect_kwargs={"compression": None},
+            )
+        except TypeError:
+            return BrowserSession(cdp_url=cdp_url, storage_state=storage_state)
+
     def _get_latest_session(self, db: Session) -> Optional[InstagramSession]:
         return (
             db.query(InstagramSession)
@@ -171,7 +184,7 @@ class BrowserUseAgent:
         logger.info("ðŸ” Iniciando login no Instagram via Browser Use...")
 
         cdp_url = await self._resolve_browserless_cdp_url()
-        browser_session = BrowserSession(cdp_url=cdp_url)
+        browser_session = self._create_browser_session(cdp_url)
         llm = ChatOpenAI(model=self.model, api_key=self.api_key)
 
         login_task = f"""
@@ -267,7 +280,7 @@ class BrowserUseAgent:
             Não use seletores CSS fixos - adapte-se ao layout.
             """
 
-            browser_session = BrowserSession(cdp_url=cdp_url)
+            browser_session = self._create_browser_session(cdp_url)
             llm = ChatOpenAI(model=self.model, api_key=self.api_key)
             agent = Agent(
                 task=task,
