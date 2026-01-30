@@ -11,6 +11,7 @@ from datetime import datetime
 
 from browser_use import Agent, BrowserSession, ChatOpenAI
 import httpx
+import websockets
 from config import settings
 from app.models import InstagramSession
 from sqlalchemy.orm import Session
@@ -32,9 +33,29 @@ class BrowserUseAgent:
         self.browserless_host = settings.browserless_host
         self.browserless_token = settings.browserless_token
         self.browserless_ws_url = settings.browserless_ws_url
-        # Reduce noisy logs that may include sensitive task details.
-        logging.getLogger("browser_use").setLevel(logging.WARNING)
-        logging.getLogger("browser_use.Agent").setLevel(logging.WARNING)
+        # Respect LOG_LEVEL from .env for browser_use logs.
+        level = getattr(logging, settings.log_level, logging.INFO)
+        logging.getLogger("browser_use").setLevel(level)
+        logging.getLogger("browser_use.Agent").setLevel(level)
+        self._patch_websocket_compression()
+
+    _ws_patched = False
+
+    @classmethod
+    def _patch_websocket_compression(cls) -> None:
+        """
+        Força compression=None no websockets.connect para evitar erro 1002 (RSV bits).
+        """
+        if cls._ws_patched:
+            return
+        original_connect = websockets.connect
+
+        async def _connect(*args, **kwargs):
+            kwargs.setdefault("compression", None)
+            return await original_connect(*args, **kwargs)
+
+        websockets.connect = _connect  # type: ignore[assignment]
+        cls._ws_patched = True
 
     def _build_browserless_cdp_url(self) -> str:
         if not self.browserless_token:
@@ -197,6 +218,18 @@ class BrowserUseAgent:
 
         return resp.status_code == 200
 
+    def _should_retry_login_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        retry_markers = (
+            "root cdp client not initialized",
+            "failed to establish cdp connection",
+            "connectionclosederror",
+            "protocol error",
+            "websocket",
+            "navigation failed",
+        )
+        return any(marker in message for marker in retry_markers)
+
     async def ensure_instagram_session(self, db: Session) -> Optional[Dict[str, Any]]:
         """
         Garante uma sessÃ£o autenticada do Instagram salva no banco.
@@ -219,7 +252,28 @@ class BrowserUseAgent:
             db.commit()
             logger.warning("Sessao do Instagram invalida; realizando novo login.")
 
-        return await self._login_and_save_session(db)
+        attempts = max(1, settings.max_retries)
+        last_error: Optional[BaseException] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._login_and_save_session(db)
+            except Exception as exc:
+                last_error = exc
+                if not self._should_retry_login_error(exc) or attempt == attempts:
+                    raise
+                delay = min(10, 2 ** attempt)
+                logger.warning(
+                    "Login falhou (tentativa %s/%s): %s. Retentando em %ss...",
+                    attempt,
+                    attempts,
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+
+        if last_error:
+            raise last_error
+        return None
 
     async def _login_and_save_session(self, db: Session) -> Dict[str, Any]:
         """
@@ -240,8 +294,9 @@ class BrowserUseAgent:
         2) Preencha o campo de usuÃ¡rio com: {settings.instagram_username}
         3) Preencha o campo de senha com: {settings.instagram_password}
         4) Clique em "Log in"/"Entrar".
-        5) Aguarde o feed inicial carregar e confirme que o login foi bem sucedido.
-        6) Se houver challenge/2FA, pare e reporte erro.
+        5) Se aparecer a tela "Save your login info?", clique em "Save info".
+        6) Aguarde o feed inicial carregar e confirme que o login foi bem sucedido.
+        7) Se houver challenge/2FA, pare e reporte erro.
 
         Importante:
         - Use apenas a aba atual (nÃ£o abrir nova aba).
