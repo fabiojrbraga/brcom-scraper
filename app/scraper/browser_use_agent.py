@@ -717,69 +717,75 @@ class BrowserUseAgent:
         Returns:
             Dicionário com posts extraídos
         """
-        try:
-            logger.info(f"🤖 Browser Use: Raspando posts de {profile_url}")
+        max_retries = getattr(settings, 'browser_use_max_retries', 3)
+        retry_delay = 5  # segundos
 
-            if not self.api_key:
-                raise ValueError("OPENAI_API_KEY is required for Browser Use.")
+        for attempt in range(1, max_retries + 1):
+            browser_session = None
+            restore_event_bus = None
 
-            cdp_url = await self._resolve_browserless_cdp_url()
-
-            task = f"""
-            Você é um raspador de dados do Instagram. Sua tarefa é extrair informações de posts.
-
-            INSTRUÇÕES:
-            1. Acesse o perfil: {profile_url}
-            2. Aguarde a página carregar completamente
-            3. Faça scroll suave para carregar os primeiros {max_posts} posts (role a página lentamente 2-3 vezes)
-            4. Para cada um dos primeiros {max_posts} posts visíveis no grid:
-               a) Identifique a URL do post (formato: https://instagram.com/p/CODIGO/)
-               b) Clique no post para abri-lo em modal/overlay
-               c) Extraia as seguintes informações:
-                  - Caption/descrição completa do post
-                  - Número de curtidas (likes)
-                  - Número de comentários
-                  - Data de publicação (se visível)
-               d) Feche o modal e volte para o grid
-               e) Aguarde 1-2 segundos antes do próximo post
-            5. Retorne os dados em formato JSON estruturado
-
-            FORMATO DE SAÍDA (copie exatamente este formato):
-            {{
-              "posts": [
-                {{
-                  "post_url": "https://instagram.com/p/CODIGO/",
-                  "caption": "texto da caption",
-                  "like_count": 123,
-                  "comment_count": 45,
-                  "posted_at": "2 dias atrás" ou null
-                }}
-              ],
-              "total_found": 5
-            }}
-
-            IMPORTANTE:
-            - Se o perfil for privado, retorne: {{"posts": [], "total_found": 0, "error": "private_profile"}}
-            - Se não conseguir abrir um post, pule para o próximo
-            - Sempre feche modais antes de abrir outro post
-            - Simule comportamento humano (delays, scroll suave)
-            """
-
-            browser_session = self._create_browser_session(cdp_url, storage_state=storage_state)
-            llm = ChatOpenAI(model=self.model, api_key=self.api_key)
-            agent = self._create_agent(
-                task=task,
-                llm=llm,
-                browser_session=browser_session,
-            )
-
-            restore_event_bus = self._patch_event_bus_for_stop(browser_session)
             try:
+                logger.info(f"🤖 Browser Use: Raspando posts de {profile_url} (tentativa {attempt}/{max_retries})")
+
+                if not self.api_key:
+                    raise ValueError("OPENAI_API_KEY is required for Browser Use.")
+
+                cdp_url = await self._resolve_browserless_cdp_url()
+
+                task = f"""
+                Você é um raspador de dados do Instagram. Sua tarefa é extrair informações de posts.
+
+                INSTRUÇÕES:
+                1. Acesse o perfil: {profile_url}
+                2. Aguarde a página carregar completamente
+                3. Faça scroll suave para carregar os primeiros {max_posts} posts (role a página lentamente 2-3 vezes)
+                4. Para cada um dos primeiros {max_posts} posts visíveis no grid:
+                   a) Identifique a URL do post (formato: https://instagram.com/p/CODIGO/)
+                   b) Clique no post para abri-lo em modal/overlay
+                   c) Extraia as seguintes informações:
+                      - Caption/descrição completa do post
+                      - Número de curtidas (likes)
+                      - Número de comentários
+                      - Data de publicação (se visível)
+                   d) Feche o modal e volte para o grid
+                   e) Aguarde 1-2 segundos antes do próximo post
+                5. Retorne os dados em formato JSON estruturado
+
+                FORMATO DE SAÍDA (copie exatamente este formato):
+                {{
+                  "posts": [
+                    {{
+                      "post_url": "https://instagram.com/p/CODIGO/",
+                      "caption": "texto da caption",
+                      "like_count": 123,
+                      "comment_count": 45,
+                      "posted_at": "2 dias atrás" ou null
+                    }}
+                  ],
+                  "total_found": 5
+                }}
+
+                IMPORTANTE:
+                - Se o perfil for privado, retorne: {{"posts": [], "total_found": 0, "error": "private_profile"}}
+                - Se não conseguir abrir um post, pule para o próximo
+                - Sempre feche modais antes de abrir outro post
+                - Simule comportamento humano (delays, scroll suave)
+                """
+
+                browser_session = self._create_browser_session(cdp_url, storage_state=storage_state)
+                llm = ChatOpenAI(model=self.model, api_key=self.api_key)
+                agent = self._create_agent(
+                    task=task,
+                    llm=llm,
+                    browser_session=browser_session,
+                )
+
+                restore_event_bus = self._patch_event_bus_for_stop(browser_session)
                 history = await agent.run()
 
                 if not history.is_done():
                     logger.warning("⚠️ Browser Use não completou a tarefa")
-                    return {"posts": [], "total_found": 0, "error": "incomplete"}
+                    # Não fazer return aqui, deixar o except capturar
 
                 final_result = history.final_result() or ""
 
@@ -793,9 +799,9 @@ class BrowserUseAgent:
                     try:
                         data = json.loads(json_match.group(0))
                         logger.info(f"✅ Browser Use extraiu {len(data.get('posts', []))} posts")
-                        return data
+                        return data  # Sucesso!
                     except json.JSONDecodeError:
-                        logger.warning("⚠️ Falha ao parsear JSON, tentando extrair manualmente")
+                        logger.warning("⚠️ Falha ao parsear JSON")
 
                 # Fallback: retornar resultado bruto
                 logger.warning("⚠️ Não foi possível extrair JSON estruturado")
@@ -806,14 +812,38 @@ class BrowserUseAgent:
                     "error": "parse_failed"
                 }
 
+            except Exception as e:
+                error_msg = str(e)
+                is_retryable = any(marker in error_msg.lower() for marker in [
+                    "http 500",
+                    "connection",
+                    "timeout",
+                    "websocket",
+                    "failed to establish"
+                ])
+
+                if is_retryable and attempt < max_retries:
+                    wait_time = retry_delay * attempt
+                    logger.warning(
+                        f"⚠️ Tentativa {attempt}/{max_retries} falhou: {error_msg[:100]}. "
+                        f"Aguardando {wait_time}s antes de tentar novamente..."
+                    )
+                    await asyncio.sleep(wait_time)
+                    # Continue para próxima iteração
+                else:
+                    # Não é retryável ou última tentativa
+                    logger.error(f"❌ Erro no Browser Use Agent (tentativa {attempt}/{max_retries}): {e}")
+                    return {"posts": [], "total_found": 0, "error": str(e)}
+
             finally:
+                # Sempre limpar recursos
                 if callable(restore_event_bus):
                     restore_event_bus()
-                await self._detach_browser_session(browser_session)
+                if browser_session:
+                    await self._detach_browser_session(browser_session)
 
-        except Exception as e:
-            logger.error(f"❌ Erro no Browser Use Agent: {e}")
-            return {"posts": [], "total_found": 0, "error": str(e)}
+        # Se saiu do loop sem retornar, todas as tentativas falharam
+        return {"posts": [], "total_found": 0, "error": "all_retries_failed"}
 
     async def scroll_and_load_more(
         self,
