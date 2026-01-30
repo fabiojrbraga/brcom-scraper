@@ -60,3 +60,12 @@ Thumbs.db
 # Project specific
 .env.production
 secrets/
+
+# Claude Code
+.claude/
+CLAUDE.md
+SESSAO_PERSISTENTE.md
+SETUP_SESSAO.md
+CHECKLIST_SESSAO.md
+test_session_persistence.py
+patch.diff

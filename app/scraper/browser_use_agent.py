@@ -5,6 +5,7 @@ Browser Use usa IA para tomar decisões autônomas durante a navegação.
 
 import logging
 import asyncio
+import inspect
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from datetime import datetime
@@ -218,17 +219,75 @@ class BrowserUseAgent:
                 logger.warning("Erro ao desconectar sessao do browser: %s", exc)
         await self._safe_stop_session(session)
 
+    def _patch_event_bus_for_stop(self, browser_session: BrowserSession):
+        event_bus = getattr(browser_session, "event_bus", None)
+        if event_bus is None:
+            return None
+        original_publish = getattr(event_bus, "publish", None)
+        original_emit = getattr(event_bus, "emit", None)
+
+        def _should_block(event) -> bool:
+            name = getattr(event, "name", "") or getattr(event, "event_name", "")
+            return event.__class__.__name__ == "BrowserStopEvent" or name in (
+                "BrowserStopEvent",
+                "browser_stop",
+                "browser_stop_event",
+            )
+
+        if callable(original_publish):
+            def _publish_wrapper(event, *args, **kwargs):
+                if _should_block(event):
+                    return None
+                return original_publish(event, *args, **kwargs)
+
+            try:
+                event_bus.publish = _publish_wrapper  # type: ignore[assignment]
+            except Exception:
+                pass
+
+        if callable(original_emit):
+            def _emit_wrapper(event, *args, **kwargs):
+                if _should_block(event):
+                    return None
+                return original_emit(event, *args, **kwargs)
+
+            try:
+                event_bus.emit = _emit_wrapper  # type: ignore[assignment]
+            except Exception:
+                pass
+
+        def _restore():
+            if callable(original_publish):
+                try:
+                    event_bus.publish = original_publish  # type: ignore[assignment]
+                except Exception:
+                    pass
+            if callable(original_emit):
+                try:
+                    event_bus.emit = original_emit  # type: ignore[assignment]
+                except Exception:
+                    pass
+
+        return _restore
+
     def _create_browser_session(self, cdp_url: str, storage_state: Optional[Dict[str, Any]] = None) -> BrowserSession:
         """
         Cria BrowserSession tentando desativar compress??o do WebSocket quando suportado.
         """
-        try:
-            session = BrowserSession(
-                cdp_url=cdp_url,
-                storage_state=storage_state,
-                ws_connect_kwargs={"compression": None},
-            )
-        except TypeError:
+        session = None
+        ctor_attempts = [
+            dict(cdp_url=cdp_url, storage_state=storage_state, ws_connect_kwargs={"compression": None}, keep_alive=True),
+            dict(cdp_url=cdp_url, storage_state=storage_state, keep_alive=True),
+            dict(cdp_url=cdp_url, storage_state=storage_state, ws_connect_kwargs={"compression": None}),
+            dict(cdp_url=cdp_url, storage_state=storage_state),
+        ]
+        for kwargs in ctor_attempts:
+            try:
+                session = BrowserSession(**kwargs)
+                break
+            except TypeError:
+                continue
+        if session is None:
             session = BrowserSession(cdp_url=cdp_url, storage_state=storage_state)
 
         keep_alive_setters = (
@@ -246,7 +305,29 @@ class BrowserUseAgent:
                 session.keep_alive = True
             except Exception:
                 pass
+        if hasattr(session, "auto_close"):
+            try:
+                session.auto_close = False
+            except Exception:
+                pass
         return session
+
+    def _create_agent(self, task: str, llm: ChatOpenAI, browser_session: BrowserSession) -> Agent:
+        possible_kwargs = {
+            "task": task,
+            "llm": llm,
+            "browser_session": browser_session,
+            "auto_close": False,
+            "close_browser": False,
+            "keep_browser_open": True,
+            "keep_browser_session": True,
+        }
+        try:
+            sig = inspect.signature(Agent.__init__)
+            allowed = {k: v for k, v in possible_kwargs.items() if k in sig.parameters}
+        except Exception:
+            allowed = possible_kwargs
+        return Agent(**allowed)
 
     def _get_latest_session(self, db: Session) -> Optional[InstagramSession]:
         return (
@@ -354,6 +435,19 @@ class BrowserUseAgent:
                 return storage_state
         except Exception as exc:
             logger.warning("Falha ao reutilizar sessao via reconnect: %s", exc)
+        finally:
+            await self._detach_browser_session(browser_session)
+        return None
+
+    async def _export_storage_state_from_reconnect(self, reconnect_url: str) -> Optional[Dict[str, Any]]:
+        cdp_url = self._ensure_ws_token(reconnect_url)
+        browser_session = self._create_browser_session(cdp_url)
+        try:
+            storage_state = await self._export_storage_state_with_retry(browser_session)
+            if storage_state and self._extract_cookies(storage_state):
+                return storage_state
+        except Exception as exc:
+            logger.warning("Falha ao exportar storage state via reconnect: %s", exc)
         finally:
             await self._detach_browser_session(browser_session)
         return None
@@ -515,7 +609,8 @@ class BrowserUseAgent:
         4) Clique em "Log in"/"Entrar".
         5) Se aparecer a tela "Save your login info?", clique em "Save info".
         6) Aguarde o feed inicial carregar e confirme que o login foi bem sucedido.
-        7) Se houver challenge/2FA, pare e reporte erro.
+        7) Se aparecer mensagem de login invalido (senha incorreta/usuario invalido), responda com "LOGIN_INVALID" e pare.
+        8) Se houver challenge/2FA, pare e reporte erro.
 
         Importante:
         - Use apenas a aba atual (nao abrir nova aba).
@@ -525,21 +620,45 @@ class BrowserUseAgent:
         Ao final, confirme sucesso com um texto curto: "LOGIN_OK".
         """
 
-        agent = Agent(
+        agent = self._create_agent(
             task=login_task,
             llm=llm,
             browser_session=browser_session,
         )
         login_ok = False
+        original_stop = getattr(browser_session, "stop", None)
+        stop_patched = False
+        if callable(original_stop):
+            async def _noop_stop(*_args, **_kwargs):
+                return None
+            try:
+                browser_session.stop = _noop_stop  # type: ignore[assignment]
+                stop_patched = True
+            except Exception:
+                pass
+        restore_event_bus = self._patch_event_bus_for_stop(browser_session)
         try:
             history = await agent.run()
             if not history.is_done() or not history.is_successful():
                 raise RuntimeError("Login nao foi concluido com sucesso.")
+            final_text = (history.final_result() or "").strip().upper()
+            if "LOGIN_INVALID" in final_text:
+                raise RuntimeError("Login invalido detectado pelo agente.")
 
             logger.info("Exportando storage state do navegador...")
+            if stop_patched and callable(original_stop):
+                try:
+                    browser_session.stop = original_stop  # type: ignore[assignment]
+                except Exception:
+                    pass
+            reconnect_url = None
             try:
+                reconnect_url = await self._prepare_browserless_reconnect(browser_session)
                 storage_state = await self._export_storage_state_with_retry(browser_session)
             except Exception as exc:
+                storage_state = None
+                if reconnect_url:
+                    storage_state = await self._export_storage_state_from_reconnect(reconnect_url)
                 fallback_state = getattr(browser_session, "storage_state", None)
                 if isinstance(fallback_state, dict) and self._extract_cookies(fallback_state):
                     storage_state = fallback_state
@@ -548,15 +667,14 @@ class BrowserUseAgent:
                     logger.exception("Falha ao exportar storage state: %s", exc)
                     raise
 
+            if reconnect_url and storage_state is not None:
+                storage_state["_browserless_reconnect"] = reconnect_url
+
             if not storage_state or not self._extract_cookies(storage_state):
                 raise RuntimeError("Storage state nao possui cookies do Instagram.")
 
             if session_info:
                 storage_state["_browserless_session"] = session_info
-
-            reconnect_url = await self._prepare_browserless_reconnect(browser_session)
-            if reconnect_url:
-                storage_state["_browserless_reconnect"] = reconnect_url
 
             session = InstagramSession(
                 instagram_username=settings.instagram_username,
@@ -572,6 +690,8 @@ class BrowserUseAgent:
             return storage_state
 
         finally:
+            if callable(restore_event_bus):
+                restore_event_bus()
             if login_ok and settings.browserless_session_enabled:
                 await self._detach_browser_session(browser_session)
             else:
