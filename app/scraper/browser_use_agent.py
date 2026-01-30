@@ -35,8 +35,10 @@ class BrowserUseAgent:
         self.browserless_ws_url = settings.browserless_ws_url
         # Respect LOG_LEVEL from .env for browser_use logs.
         level = getattr(logging, settings.log_level, logging.INFO)
-        logging.getLogger("browser_use").setLevel(level)
-        logging.getLogger("browser_use.Agent").setLevel(level)
+        for name in ("browser_use", "browser_use.Agent", "browser_use.BrowserSession", "browser_use.tools"):
+            log = logging.getLogger(name)
+            log.setLevel(level)
+            log.propagate = True
         self._patch_websocket_compression()
 
     _ws_patched = False
@@ -74,6 +76,12 @@ class BrowserUseAgent:
 
         separator = "&" if "?" in base_url else "?"
         return f"{base_url}{separator}token={self.browserless_token}"
+
+    def _build_browserless_http_url(self) -> str:
+        host = (self.browserless_host or "").rstrip("/")
+        if not host.startswith("http"):
+            host = f"http://{host}"
+        return host
 
     def _rewrite_ws_url(self, ws_url: str) -> str:
         parsed_ws = urlparse(ws_url)
@@ -130,6 +138,43 @@ class BrowserUseAgent:
 
         return self._build_browserless_cdp_url()
 
+    async def _create_browserless_session(self) -> Dict[str, Any]:
+        if not settings.browserless_session_enabled:
+            return {}
+
+        host = self._build_browserless_http_url()
+        url = f"{host}/session?token={self.browserless_token}"
+        payload = {
+            "ttl": settings.browserless_session_ttl_ms,
+            "stealth": settings.browserless_session_stealth,
+            "headless": settings.browserless_session_headless,
+        }
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code >= 400:
+                raise RuntimeError(f"Erro ao criar sessao Browserless: {resp.status_code} {resp.text}")
+            return resp.json()
+
+    async def _stop_browserless_session(self, stop_url: str) -> None:
+        if not stop_url:
+            return
+        url = stop_url
+        if "token=" not in url and self.browserless_token:
+            separator = "&" if "?" in url else "?"
+            url = f"{url}{separator}token={self.browserless_token}"
+        url = f"{url}&force=true" if "force=" not in url else url
+
+        host = self._build_browserless_http_url()
+        if url.startswith("/"):
+            url = f"{host}{url}"
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                await client.delete(url)
+        except Exception as exc:
+            logger.warning("Falha ao encerrar sessao Browserless: %s", exc)
+
     async def _maybe_await(self, value):
         if asyncio.iscoroutine(value):
             return await value
@@ -139,22 +184,54 @@ class BrowserUseAgent:
         stop_fn = getattr(session, "stop", None)
         if stop_fn is None:
             return
-        result = stop_fn()
-        if asyncio.iscoroutine(result):
-            await result
+        try:
+            result = stop_fn()
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:
+            logger.warning("Erro ao encerrar sessao do browser: %s", exc)
+
+    async def _detach_browser_session(self, session: BrowserSession) -> None:
+        disconnect_fn = getattr(session, "disconnect", None)
+        if callable(disconnect_fn):
+            try:
+                result = disconnect_fn()
+                if asyncio.iscoroutine(result):
+                    await result
+                return
+            except Exception as exc:
+                logger.warning("Erro ao desconectar sessao do browser: %s", exc)
+        await self._safe_stop_session(session)
 
     def _create_browser_session(self, cdp_url: str, storage_state: Optional[Dict[str, Any]] = None) -> BrowserSession:
         """
-        Cria BrowserSession tentando desativar compressÃ£o do WebSocket quando suportado.
+        Cria BrowserSession tentando desativar compress??o do WebSocket quando suportado.
         """
         try:
-            return BrowserSession(
+            session = BrowserSession(
                 cdp_url=cdp_url,
                 storage_state=storage_state,
                 ws_connect_kwargs={"compression": None},
             )
         except TypeError:
-            return BrowserSession(cdp_url=cdp_url, storage_state=storage_state)
+            session = BrowserSession(cdp_url=cdp_url, storage_state=storage_state)
+
+        keep_alive_setters = (
+            getattr(session, "set_keep_alive", None),
+            getattr(session, "set_keepalive", None),
+        )
+        for setter in keep_alive_setters:
+            if callable(setter):
+                try:
+                    setter(True)
+                except Exception:
+                    pass
+        if hasattr(session, "keep_alive"):
+            try:
+                session.keep_alive = True
+            except Exception:
+                pass
+        return session
 
     def _get_latest_session(self, db: Session) -> Optional[InstagramSession]:
         return (
@@ -173,6 +250,12 @@ class BrowserUseAgent:
         if isinstance(cookies, list):
             return cookies
         return []
+
+    def _get_browserless_session_info(self, storage_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not storage_state:
+            return {}
+        info = storage_state.get("_browserless_session")
+        return info if isinstance(info, dict) else {}
 
     def get_cookies(self, storage_state: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Retorna lista de cookies a partir de um storage_state."""
@@ -230,42 +313,66 @@ class BrowserUseAgent:
         )
         return any(marker in message for marker in retry_markers)
 
+    async def _export_storage_state_with_retry(
+        self,
+        browser_session: BrowserSession,
+        attempts: int = 2,
+    ) -> Dict[str, Any]:
+        last_error: Optional[BaseException] = None
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                return await self._maybe_await(browser_session.export_storage_state())
+            except Exception as exc:
+                last_error = exc
+                if attempt == attempts or not self._should_retry_login_error(exc):
+                    raise
+                await asyncio.sleep(1)
+        if last_error:
+            raise last_error
+        return {}
+
     async def ensure_instagram_session(self, db: Session) -> Optional[Dict[str, Any]]:
         """
-        Garante uma sessÃ£o autenticada do Instagram salva no banco.
-        Retorna storage_state quando disponÃ­vel.
+        Garante uma sess??o autenticada do Instagram salva no banco.
+        Retorna storage_state quando dispon??vel.
         """
         if db is None:
-            logger.warning("âš ï¸ SessÃ£o de banco nÃ£o fornecida; login nÃ£o serÃ¡ persistido.")
+            logger.warning("?????? Sess??o de banco n??o fornecida; login n??o ser?? persistido.")
             return None
 
         if not settings.instagram_username or not settings.instagram_password:
-            logger.warning("âš ï¸ INSTAGRAM_USERNAME/PASSWORD nÃ£o configurados; login nÃ£o serÃ¡ feito.")
+            logger.warning("?????? INSTAGRAM_USERNAME/PASSWORD n??o configurados; login n??o ser?? feito.")
             return None
         existing = self._get_latest_session(db)
         if existing and existing.storage_state:
             if await self._is_session_valid(existing.storage_state):
                 self._touch_session(db, existing)
-                logger.info("Session do Instagram reutilizada do banco.")
+                logger.info("Sessao do Instagram reutilizada do banco.")
                 return existing.storage_state
+
+            if settings.browserless_session_enabled:
+                session_info = self._get_browserless_session_info(existing.storage_state)
+                stop_url = session_info.get("stop")
+                if stop_url:
+                    await self._stop_browserless_session(stop_url)
+
             existing.is_active = False
             db.commit()
-            logger.warning("Sessao do Instagram invalida; realizando novo login.")
+            logger.info("Sessao do Instagram expirada; realizando novo login.")
 
-        attempts = max(1, settings.max_retries)
-        last_error: Optional[BaseException] = None
-        for attempt in range(1, attempts + 1):
+        last_error = None
+        for attempt in range(1, settings.browser_use_max_retries + 1):
             try:
                 return await self._login_and_save_session(db)
             except Exception as exc:
                 last_error = exc
-                if not self._should_retry_login_error(exc) or attempt == attempts:
-                    raise
-                delay = min(10, 2 ** attempt)
+                if attempt >= settings.browser_use_max_retries or not self._should_retry_login_error(exc):
+                    break
+                delay = settings.browser_use_retry_backoff * attempt
                 logger.warning(
                     "Login falhou (tentativa %s/%s): %s. Retentando em %ss...",
                     attempt,
-                    attempts,
+                    settings.browser_use_max_retries,
                     exc,
                     delay,
                 )
@@ -276,22 +383,27 @@ class BrowserUseAgent:
         return None
 
     async def _login_and_save_session(self, db: Session) -> Dict[str, Any]:
-        """
-        Faz login via Browser Use e salva storage_state no banco.
-        """
-        logger.info("ðŸ” Iniciando login no Instagram via Browser Use...")
+        logger.info("Iniciando login no Instagram via Browser Use...")
 
-        cdp_url = await self._resolve_browserless_cdp_url()
+        session_info: Dict[str, Any] = {}
+        connect_url: Optional[str] = None
+        stop_url: Optional[str] = None
+        if settings.browserless_session_enabled:
+            session_info = await self._create_browserless_session()
+            connect_url = session_info.get("connect")
+            stop_url = session_info.get("stop")
+
+        cdp_url = connect_url or await self._resolve_browserless_cdp_url()
         browser_session = self._create_browser_session(cdp_url)
         llm = ChatOpenAI(model=self.model, api_key=self.api_key)
 
         login_task = f"""
-        VocÃª estÃ¡ em um navegador controlado por IA. 
+        Voce esta em um navegador controlado por IA.
         Acesse https://www.instagram.com/accounts/login/.
 
         Passos:
         1) Se aparecer um modal de cookies, clique em "Allow all cookies" (ou equivalente).
-        2) Preencha o campo de usuÃ¡rio com: {settings.instagram_username}
+        2) Preencha o campo de usuario com: {settings.instagram_username}
         3) Preencha o campo de senha com: {settings.instagram_password}
         4) Clique em "Log in"/"Entrar".
         5) Se aparecer a tela "Save your login info?", clique em "Save info".
@@ -299,8 +411,9 @@ class BrowserUseAgent:
         7) Se houver challenge/2FA, pare e reporte erro.
 
         Importante:
-        - Use apenas a aba atual (nÃ£o abrir nova aba).
+        - Use apenas a aba atual (nao abrir nova aba).
         - Aguarde o DOM carregar; se ficar vazio, aguarde alguns segundos e recarregue uma vez.
+        - Nao clique em "Forgot password?"; se nao encontrar um botao claro de login, pressione Enter no campo de senha.
 
         Ao final, confirme sucesso com um texto curto: "LOGIN_OK".
         """
@@ -310,18 +423,29 @@ class BrowserUseAgent:
             llm=llm,
             browser_session=browser_session,
         )
-
+        login_ok = False
         try:
             history = await agent.run()
             if not history.is_done() or not history.is_successful():
-                raise RuntimeError("Login nÃ£o foi concluÃ­do com sucesso.")
+                raise RuntimeError("Login nao foi concluido com sucesso.")
 
-            storage_state = await self._maybe_await(
-                browser_session.export_storage_state()
-            )
+            logger.info("Exportando storage state do navegador...")
+            try:
+                storage_state = await self._export_storage_state_with_retry(browser_session)
+            except Exception as exc:
+                fallback_state = getattr(browser_session, "storage_state", None)
+                if isinstance(fallback_state, dict) and self._extract_cookies(fallback_state):
+                    storage_state = fallback_state
+                    logger.warning("Storage state export falhou, usando fallback em memoria: %s", exc)
+                else:
+                    logger.exception("Falha ao exportar storage state: %s", exc)
+                    raise
 
             if not storage_state or not self._extract_cookies(storage_state):
-                raise RuntimeError("Storage state nÃ£o possui cookies do Instagram.")
+                raise RuntimeError("Storage state nao possui cookies do Instagram.")
+
+            if session_info:
+                storage_state["_browserless_session"] = session_info
 
             session = InstagramSession(
                 instagram_username=settings.instagram_username,
@@ -332,11 +456,18 @@ class BrowserUseAgent:
             db.commit()
             db.refresh(session)
 
-            logger.info("âœ… SessÃ£o do Instagram salva no banco.")
+            login_ok = True
+            logger.info("Sessao do Instagram salva no banco.")
             return storage_state
 
         finally:
-            await self._safe_stop_session(browser_session)
+            if login_ok and settings.browserless_session_enabled:
+                await self._detach_browser_session(browser_session)
+            else:
+                await self._safe_stop_session(browser_session)
+            if not login_ok and stop_url:
+                await self._stop_browserless_session(stop_url)
+
 
     async def navigate_and_scrape_profile(
         self,

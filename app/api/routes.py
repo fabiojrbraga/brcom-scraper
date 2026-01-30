@@ -384,7 +384,7 @@ async def _scrape_profile_background(job_id: str, profile_url: str):
         logger.info(f"✅ Job concluído: {job_id}")
 
     except Exception as e:
-        logger.error(f"❌ Erro no scraping em background: {e}")
+        logger.exception("❌ Erro no scraping em background: %s", e)
 
         if db:
             job = db.query(ScrapingJob).filter(ScrapingJob.id == job_id).first()

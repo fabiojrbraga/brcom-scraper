@@ -25,6 +25,12 @@ class Settings(BaseSettings):
     browserless_host: str
     browserless_token: str
     browserless_ws_url: Optional[str] = None
+    browserless_session_enabled: bool = False
+    browserless_session_ttl_ms: int = 300000
+    browserless_session_stealth: bool = False
+    browserless_session_headless: bool = True
+    browser_use_max_retries: int = 3
+    browser_use_retry_backoff: int = 2
 
     # OpenAI
     openai_api_key: str

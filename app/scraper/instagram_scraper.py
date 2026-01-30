@@ -154,7 +154,7 @@ class InstagramScraper:
             return result
 
         except Exception as e:
-            logger.error(f"❌ Erro ao raspar perfil {profile_url}: {e}")
+            logger.exception("❌ Erro ao raspar perfil %s: %s", profile_url, e)
             raise
 
     async def _scrape_posts(
@@ -192,7 +192,7 @@ class InstagramScraper:
             return posts_data[:max_posts]
 
         except Exception as e:
-            logger.error(f"❌ Erro ao raspar posts: {e}")
+            logger.exception("❌ Erro ao raspar posts: %s", e)
             return []
 
     async def _scrape_post_interactions(
