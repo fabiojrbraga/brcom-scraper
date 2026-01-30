@@ -98,13 +98,14 @@ class InstagramScraper:
             else:
                 profile_db = None
 
-            # FASE 4: Raspar posts
-            logger.info(f"📝 Raspando posts do perfil...")
+            # FASE 4: Raspar posts usando Browser Use
+            logger.info(f"📝 Raspando posts do perfil com Browser Use...")
             posts_data = await self._scrape_posts(
                 profile_url,
                 max_posts=max_posts,
                 profile_html=profile_html,
                 cookies=cookies,
+                storage_state=storage_state,
             )
 
             # FASE 5: Raspar comentários e interações
@@ -163,32 +164,41 @@ class InstagramScraper:
         max_posts: int = 5,
         profile_html: Optional[str] = None,
         cookies: Optional[list[dict]] = None,
+        storage_state: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Raspa posts de um perfil.
+        Raspa posts de um perfil usando Browser Use Agent.
 
         Args:
             profile_url: URL do perfil
             max_posts: Número máximo de posts
-            profile_html: HTML do perfil (para extração com IA)
+            profile_html: HTML do perfil (não usado mais)
+            cookies: Cookies da sessão (não usado mais)
+            storage_state: Storage state da sessão autenticada
 
         Returns:
             Lista de posts extraídos
         """
         try:
-            # Simular scroll para carregar mais posts
-            await asyncio.sleep(self._get_random_delay())
+            logger.info(f"🤖 Usando Browser Use para raspar {max_posts} posts...")
 
-            # Capturar screenshot dos posts
-            posts_screenshot = await self.browserless.screenshot(profile_url, cookies=cookies)
-
-            # Extrair posts com IA
-            posts_data = await self.ai_extractor.extract_posts_info(
-                screenshot_base64=posts_screenshot,
-                html_content=profile_html,
+            # Usar Browser Use Agent para navegar e extrair posts
+            result = await browser_use_agent.scrape_profile_posts(
+                profile_url=profile_url,
+                storage_state=storage_state,
+                max_posts=max_posts,
             )
 
-            logger.info(f"✅ {len(posts_data)} posts extraídos")
+            posts_data = result.get("posts", [])
+
+            if result.get("error"):
+                logger.warning(f"⚠️ Browser Use retornou erro: {result['error']}")
+                if result["error"] == "private_profile":
+                    logger.info("🔒 Perfil privado detectado")
+                elif result["error"] == "parse_failed":
+                    logger.warning(f"⚠️ Falha ao parsear resposta: {result.get('raw_result', '')[:200]}")
+
+            logger.info(f"✅ {len(posts_data)} posts extraídos via Browser Use")
             return posts_data[:max_posts]
 
         except Exception as e:
