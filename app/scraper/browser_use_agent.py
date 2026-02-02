@@ -57,11 +57,30 @@ class BrowserUseAgent:
             return
         original_connect = websockets.connect
 
-        async def _connect(*args, **kwargs):
-            kwargs.setdefault("compression", None)
-            return await original_connect(*args, **kwargs)
+        # Keep the same connect() contract (awaitable/context manager) and hard-disable compression.
+        def _connect(*args, **kwargs):
+            kwargs["compression"] = None
+            return original_connect(*args, **kwargs)
 
         websockets.connect = _connect  # type: ignore[assignment]
+        # Also patch common module aliases used by dependencies.
+        try:
+            import websockets.client as ws_client  # type: ignore
+            ws_client.connect = _connect  # type: ignore[assignment]
+        except Exception:
+            pass
+        try:
+            import websockets.asyncio.client as ws_async_client  # type: ignore
+            ws_async_client.connect = _connect  # type: ignore[assignment]
+        except Exception:
+            pass
+        try:
+            import cdp_use.client as cdp_client_module  # type: ignore
+            cdp_ws = getattr(cdp_client_module, "websockets", None)
+            if cdp_ws and hasattr(cdp_ws, "connect"):
+                cdp_ws.connect = _connect  # type: ignore[assignment]
+        except Exception:
+            pass
         cls._ws_patched = True
 
     def _build_browserless_cdp_url(self) -> str:
@@ -417,6 +436,34 @@ class BrowserUseAgent:
         separator = "&" if "?" in ws_url else "?"
         return f"{ws_url}{separator}token={self.browserless_token}"
 
+    def _contains_protocol_error(self, text: str) -> bool:
+        if not text:
+            return False
+        lowered = text.lower()
+        markers = (
+            "protocol error",
+            "reserved bits must be 0",
+            "connectionclosederror",
+            "client is stopping",
+            "sent 1002",
+        )
+        return any(marker in lowered for marker in markers)
+
+    def _extract_json_object_with_key(self, text: str, key: str) -> Optional[Dict[str, Any]]:
+        if not text:
+            return None
+        decoder = json.JSONDecoder()
+        for idx, char in enumerate(text):
+            if char != "{":
+                continue
+            try:
+                obj, _ = decoder.raw_decode(text[idx:])
+            except Exception:
+                continue
+            if isinstance(obj, dict) and key in obj:
+                return obj
+        return None
+
     async def _send_cdp_command(
         self,
         browser_session: BrowserSession,
@@ -555,6 +602,9 @@ class BrowserUseAgent:
             "failed to establish cdp connection",
             "connectionclosederror",
             "protocol error",
+            "reserved bits must be 0",
+            "sent 1002",
+            "client is stopping",
             "websocket",
             "navigation failed",
         )
@@ -866,31 +916,44 @@ class BrowserUseAgent:
 
                     final_result = history.final_result() or ""
 
-                # Tentar extrair JSON da resposta
-                    import re
+                    if (not history.is_successful()) and self._contains_protocol_error(final_result) and attempt < max_retries:
+                        wait_time = retry_delay * attempt
+                        logger.warning(
+                            "Sessao CDP instavel detectada (tentativa %s/%s). Retentando em %ss...",
+                            attempt,
+                            max_retries,
+                            wait_time,
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
 
-                    # Procurar por JSON na resposta
-                    json_match = re.search(r'\{[\s\S]*"posts"[\s\S]*\}', final_result)
-                    if json_match:
-                        try:
-                            data = json.loads(json_match.group(0))
-                            if data.get("error") == "login_required" and attempt < max_retries:
-                                wait_time = retry_delay * attempt
-                                logger.warning(
-                                    "Agente retornou login_required (tentativa %s/%s). Retentando em %ss...",
-                                    attempt,
-                                    max_retries,
-                                    wait_time,
-                                )
-                                await asyncio.sleep(wait_time)
-                                continue
-                            logger.info(f"✅ Browser Use extraiu {len(data.get('posts', []))} posts")
-                            return data  # Sucesso!
-                        except json.JSONDecodeError:
-                            logger.warning("⚠️ Falha ao parsear JSON")
+                    data = self._extract_json_object_with_key(final_result, "posts")
+                    if data is not None:
+                        if data.get("error") == "login_required" and attempt < max_retries:
+                            wait_time = retry_delay * attempt
+                            logger.warning(
+                                "Agente retornou login_required (tentativa %s/%s). Retentando em %ss...",
+                                attempt,
+                                max_retries,
+                                wait_time,
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+                        logger.info(f"✅ Browser Use extraiu {len(data.get('posts', []))} posts")
+                        return data  # Sucesso!
 
                     # Fallback: retornar resultado bruto
                     logger.warning("⚠️ Não foi possível extrair JSON estruturado")
+                    if self._contains_protocol_error(final_result) and attempt < max_retries:
+                        wait_time = retry_delay * attempt
+                        logger.warning(
+                            "Falha de protocolo detectada no resultado final (%s/%s). Retentando em %ss...",
+                            attempt,
+                            max_retries,
+                            wait_time,
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
                     return {
                         "posts": [],
                         "total_found": 0,
@@ -905,7 +968,10 @@ class BrowserUseAgent:
                         "connection",
                         "timeout",
                         "websocket",
-                        "failed to establish"
+                        "failed to establish",
+                        "protocol error",
+                        "reserved bits",
+                        "client is stopping",
                     ])
 
                     if is_retryable and attempt < max_retries:
@@ -1028,23 +1094,30 @@ class BrowserUseAgent:
                     history = await agent.run()
                     final_result = history.final_result() or ""
 
-                    import re
+                    if (not history.is_successful()) and self._contains_protocol_error(final_result) and attempt < max_retries:
+                        wait_time = retry_delay * attempt
+                        logger.warning(
+                            "Sessao CDP instavel ao coletar curtidores (%s/%s). Retentando em %ss...",
+                            attempt,
+                            max_retries,
+                            wait_time,
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
 
-                    json_match = re.search(r"\{[\s\S]*\"likes_accessible\"[\s\S]*\}", final_result)
-                    if not json_match:
+                    data = self._extract_json_object_with_key(final_result, "likes_accessible")
+                    if data is None:
                         logger.warning("⚠️ Falha ao extrair JSON de curtidores: %s", final_result[:180])
-                        return {
-                            "post_url": post_url,
-                            "likes_accessible": False,
-                            "like_users": [],
-                            "error": "parse_failed",
-                            "raw_result": final_result,
-                        }
-
-                    try:
-                        data = json.loads(json_match.group(0))
-                    except json.JSONDecodeError:
-                        logger.warning("⚠️ JSON inválido ao extrair curtidores")
+                        if self._contains_protocol_error(final_result) and attempt < max_retries:
+                            wait_time = retry_delay * attempt
+                            logger.warning(
+                                "Falha de protocolo detectada na coleta de curtidores (%s/%s). Retentando em %ss...",
+                                attempt,
+                                max_retries,
+                                wait_time,
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
                         return {
                             "post_url": post_url,
                             "likes_accessible": False,
@@ -1088,7 +1161,16 @@ class BrowserUseAgent:
                     error_msg = str(exc).lower()
                     is_retryable = any(
                         marker in error_msg
-                        for marker in ("http 500", "connection", "timeout", "websocket", "failed to establish")
+                        for marker in (
+                            "http 500",
+                            "connection",
+                            "timeout",
+                            "websocket",
+                            "failed to establish",
+                            "protocol error",
+                            "reserved bits",
+                            "client is stopping",
+                        )
                     )
                     if is_retryable and attempt < max_retries:
                         wait_time = retry_delay * attempt

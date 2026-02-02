@@ -7,6 +7,7 @@ import logging
 import asyncio
 import random
 import re
+import json
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 
@@ -48,6 +49,24 @@ class InstagramScraper:
         # URL pode ser: https://instagram.com/username ou https://www.instagram.com/username/
         parts = url.rstrip("/").split("/")
         return parts[-1]
+
+    def _recover_posts_from_raw_result(self, raw_result: str) -> List[Dict[str, Any]]:
+        """
+        Tenta recuperar payload JSON com "posts" mesmo quando o agente retorna texto extra.
+        """
+        if not raw_result:
+            return []
+        decoder = json.JSONDecoder()
+        for idx, char in enumerate(raw_result):
+            if char != "{":
+                continue
+            try:
+                obj, _ = decoder.raw_decode(raw_result[idx:])
+            except Exception:
+                continue
+            if isinstance(obj, dict) and isinstance(obj.get("posts"), list):
+                return obj.get("posts", [])
+        return []
 
     def _is_recent_post(self, posted_at: Any, recent_hours: int = 24) -> bool:
         """
@@ -399,6 +418,10 @@ class InstagramScraper:
                     logger.info("🔒 Perfil privado detectado")
                 elif result["error"] == "parse_failed":
                     logger.warning(f"⚠️ Falha ao parsear resposta: {result.get('raw_result', '')[:200]}")
+                    recovered = self._recover_posts_from_raw_result(result.get("raw_result", ""))
+                    if recovered:
+                        logger.info("✅ Recuperados %s posts do raw_result.", len(recovered))
+                        posts_data = recovered
 
             logger.info(f"✅ {len(posts_data)} posts extraídos via Browser Use")
             return posts_data[:max_posts]
