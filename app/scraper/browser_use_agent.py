@@ -6,9 +6,13 @@ Browser Use usa IA para tomar decisões autônomas durante a navegação.
 import logging
 import asyncio
 import inspect
-from typing import Optional, Dict, Any, List
+import json
+import tempfile
+from pathlib import Path
+from typing import Optional, Dict, Any, List, Union
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from datetime import datetime
+from uuid import uuid4
 
 from browser_use import Agent, BrowserSession, ChatOpenAI
 import httpx
@@ -270,7 +274,11 @@ class BrowserUseAgent:
 
         return _restore
 
-    def _create_browser_session(self, cdp_url: str, storage_state: Optional[Dict[str, Any]] = None) -> BrowserSession:
+    def _create_browser_session(
+        self,
+        cdp_url: str,
+        storage_state: Optional[Union[Dict[str, Any], str, Path]] = None,
+    ) -> BrowserSession:
         """
         Cria BrowserSession tentando desativar compress??o do WebSocket quando suportado.
         """
@@ -360,11 +368,18 @@ class BrowserUseAgent:
         reconnect_url = storage_state.get("_browserless_reconnect")
         return reconnect_url if isinstance(reconnect_url, str) and reconnect_url else None
 
-    def _sanitize_storage_state(self, storage_state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def _sanitize_storage_state(
+        self,
+        storage_state: Optional[Union[Dict[str, Any], str, Path]],
+    ) -> Optional[Union[Dict[str, Any], str]]:
         """
         Playwright aceita apenas cookies/origins no storage_state.
         """
         if not storage_state:
+            return None
+        if isinstance(storage_state, (str, Path)):
+            return str(storage_state)
+        if not isinstance(storage_state, dict):
             return None
         cookies = self._extract_cookies(storage_state)
         origins = storage_state.get("origins")
@@ -376,6 +391,25 @@ class BrowserUseAgent:
             "cookies": cookies,
             "origins": origins,
         }
+
+    def _write_storage_state_temp_file(self, storage_state: Optional[Dict[str, Any]]) -> Optional[str]:
+        clean_state = self._sanitize_storage_state(storage_state)
+        if not isinstance(clean_state, dict):
+            return None
+
+        temp_dir = Path(tempfile.gettempdir()) / "instagram-scraper"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_file = temp_dir / f"browser_use_storage_{uuid4().hex}.json"
+        temp_file.write_text(json.dumps(clean_state), encoding="utf-8")
+        return str(temp_file)
+
+    def _cleanup_storage_state_temp_file(self, path: Optional[str]) -> None:
+        if not path:
+            return
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception as exc:
+            logger.debug("Nao foi possivel remover storage_state temporario %s: %s", path, exc)
 
     def _ensure_ws_token(self, ws_url: str) -> str:
         if "token=" in ws_url:
@@ -738,153 +772,166 @@ class BrowserUseAgent:
         max_retries = getattr(settings, 'browser_use_max_retries', 3)
         retry_delay = 5  # segundos
         reconnect_url = self._get_browserless_reconnect_url(storage_state)
+        session_info = self._get_browserless_session_info(storage_state)
+        session_connect_url = session_info.get("connect") if isinstance(session_info.get("connect"), str) else None
         clean_storage_state = self._sanitize_storage_state(storage_state)
+        storage_state_file = self._write_storage_state_temp_file(storage_state)
+        storage_state_for_session: Optional[Union[Dict[str, Any], str]]
+        storage_state_for_session = storage_state_file or clean_storage_state
         logger.info(
             "Browser Use recebeu storage_state com %s cookies.",
             len(self._extract_cookies(storage_state or {})),
         )
+        if storage_state_file:
+            logger.info("Storage state persistido em arquivo temporario para compatibilidade com browser-use 0.11.x.")
 
-        for attempt in range(1, max_retries + 1):
-            browser_session = None
-            restore_event_bus = None
+        try:
+            for attempt in range(1, max_retries + 1):
+                browser_session = None
+                restore_event_bus = None
 
-            try:
-                logger.info(f"🤖 Browser Use: Raspando posts de {profile_url} (tentativa {attempt}/{max_retries})")
+                try:
+                    logger.info(f"🤖 Browser Use: Raspando posts de {profile_url} (tentativa {attempt}/{max_retries})")
 
-                if not self.api_key:
-                    raise ValueError("OPENAI_API_KEY is required for Browser Use.")
+                    if not self.api_key:
+                        raise ValueError("OPENAI_API_KEY is required for Browser Use.")
 
-                use_reconnect = bool(reconnect_url and attempt == 1)
-                if use_reconnect:
-                    cdp_url = self._ensure_ws_token(reconnect_url)
-                    logger.info("Tentando reaproveitar navegador autenticado via reconnect.")
-                else:
-                    cdp_url = await self._resolve_browserless_cdp_url()
-                    logger.info("Usando CDP padrao com storage_state.")
+                    use_reconnect = bool(reconnect_url and attempt == 1)
+                    use_session_connect = bool((not reconnect_url) and session_connect_url and attempt == 1)
+                    if use_reconnect:
+                        cdp_url = self._ensure_ws_token(reconnect_url)
+                        logger.info("Tentando reaproveitar navegador autenticado via reconnect.")
+                    elif use_session_connect:
+                        cdp_url = self._ensure_ws_token(session_connect_url)
+                        logger.info("Tentando reaproveitar sessao Browserless existente.")
+                    else:
+                        cdp_url = await self._resolve_browserless_cdp_url()
+                        logger.info("Usando CDP padrao com storage_state.")
 
-                task = f"""
-                Você é um raspador de dados do Instagram. Sua tarefa é extrair informações de posts.
+                    task = f"""
+                    Você é um raspador de dados do Instagram. Sua tarefa é extrair informações de posts.
 
-                INSTRUÇÕES:
-                1. Acesse o perfil: {profile_url}
-                2. Aguarde a página carregar completamente
-                3. Faça scroll suave para carregar os primeiros {max_posts} posts (role a página lentamente 2-3 vezes)
-                4. Para cada um dos primeiros {max_posts} posts visíveis no grid:
-                   a) Identifique a URL do post (formato: https://instagram.com/p/CODIGO/)
-                   b) Clique no post para abri-lo em modal/overlay
-                   c) Extraia as seguintes informações:
-                      - Caption/descrição completa do post
-                      - Número de curtidas (likes)
-                      - Número de comentários
-                      - Data de publicação (se visível)
-                   d) Feche o modal e volte para o grid
-                   e) Aguarde 1-2 segundos antes do próximo post
-                5. Retorne os dados em formato JSON estruturado
+                    INSTRUÇÕES:
+                    1. Acesse o perfil: {profile_url}
+                    2. Aguarde a página carregar completamente
+                    3. Faça scroll suave para carregar os primeiros {max_posts} posts (role a página lentamente 2-3 vezes)
+                    4. Para cada um dos primeiros {max_posts} posts visíveis no grid:
+                       a) Identifique a URL do post (formato: https://instagram.com/p/CODIGO/)
+                       b) Clique no post para abri-lo em modal/overlay
+                       c) Extraia as seguintes informações:
+                          - Caption/descrição completa do post
+                          - Número de curtidas (likes)
+                          - Número de comentários
+                          - Data de publicação (se visível)
+                       d) Feche o modal e volte para o grid
+                       e) Aguarde 1-2 segundos antes do próximo post
+                    5. Retorne os dados em formato JSON estruturado
 
-                FORMATO DE SAÍDA (copie exatamente este formato):
-                {{
-                  "posts": [
+                    FORMATO DE SAÍDA (copie exatamente este formato):
                     {{
-                      "post_url": "https://instagram.com/p/CODIGO/",
-                      "caption": "texto da caption",
-                      "like_count": 123,
-                      "comment_count": 45,
-                      "posted_at": "2 dias atrás" ou null
+                      "posts": [
+                        {{
+                          "post_url": "https://instagram.com/p/CODIGO/",
+                          "caption": "texto da caption",
+                          "like_count": 123,
+                          "comment_count": 45,
+                          "posted_at": "2 dias atrás" ou null
+                        }}
+                      ],
+                      "total_found": 5
                     }}
-                  ],
-                  "total_found": 5
-                }}
 
-                IMPORTANTE:
-                - Se o perfil for privado, retorne: {{"posts": [], "total_found": 0, "error": "private_profile"}}
-                - Use apenas a aba atual; nao abra nova aba ou janela.
-                - Se não conseguir abrir um post, pule para o próximo
-                - Sempre feche modais antes de abrir outro post
-                - Simule comportamento humano (delays, scroll suave)
-                """
+                    IMPORTANTE:
+                    - Se o perfil for privado, retorne: {{"posts": [], "total_found": 0, "error": "private_profile"}}
+                    - Use apenas a aba atual; nao abra nova aba ou janela.
+                    - Se não conseguir abrir um post, pule para o próximo
+                    - Sempre feche modais antes de abrir outro post
+                    - Simule comportamento humano (delays, scroll suave)
+                    """
 
-                browser_session = self._create_browser_session(cdp_url, storage_state=clean_storage_state)
-                llm = ChatOpenAI(model=self.model, api_key=self.api_key)
-                agent = self._create_agent(
-                    task=task,
-                    llm=llm,
-                    browser_session=browser_session,
-                )
+                    browser_session = self._create_browser_session(cdp_url, storage_state=storage_state_for_session)
+                    llm = ChatOpenAI(model=self.model, api_key=self.api_key)
+                    agent = self._create_agent(
+                        task=task,
+                        llm=llm,
+                        browser_session=browser_session,
+                    )
 
-                restore_event_bus = self._patch_event_bus_for_stop(browser_session)
-                history = await agent.run()
+                    restore_event_bus = self._patch_event_bus_for_stop(browser_session)
+                    history = await agent.run()
 
-                if not history.is_done():
-                    logger.warning("⚠️ Browser Use não completou a tarefa")
-                    # Não fazer return aqui, deixar o except capturar
+                    if not history.is_done():
+                        logger.warning("⚠️ Browser Use não completou a tarefa")
+                        # Não fazer return aqui, deixar o except capturar
 
-                final_result = history.final_result() or ""
+                    final_result = history.final_result() or ""
 
                 # Tentar extrair JSON da resposta
-                import json
-                import re
+                    import re
 
-                # Procurar por JSON na resposta
-                json_match = re.search(r'\{[\s\S]*"posts"[\s\S]*\}', final_result)
-                if json_match:
-                    try:
-                        data = json.loads(json_match.group(0))
-                        if data.get("error") == "login_required" and attempt < max_retries:
-                            wait_time = retry_delay * attempt
-                            logger.warning(
-                                "Agente retornou login_required (tentativa %s/%s). Retentando em %ss...",
-                                attempt,
-                                max_retries,
-                                wait_time,
-                            )
-                            await asyncio.sleep(wait_time)
-                            continue
-                        logger.info(f"✅ Browser Use extraiu {len(data.get('posts', []))} posts")
-                        return data  # Sucesso!
-                    except json.JSONDecodeError:
-                        logger.warning("⚠️ Falha ao parsear JSON")
+                    # Procurar por JSON na resposta
+                    json_match = re.search(r'\{[\s\S]*"posts"[\s\S]*\}', final_result)
+                    if json_match:
+                        try:
+                            data = json.loads(json_match.group(0))
+                            if data.get("error") == "login_required" and attempt < max_retries:
+                                wait_time = retry_delay * attempt
+                                logger.warning(
+                                    "Agente retornou login_required (tentativa %s/%s). Retentando em %ss...",
+                                    attempt,
+                                    max_retries,
+                                    wait_time,
+                                )
+                                await asyncio.sleep(wait_time)
+                                continue
+                            logger.info(f"✅ Browser Use extraiu {len(data.get('posts', []))} posts")
+                            return data  # Sucesso!
+                        except json.JSONDecodeError:
+                            logger.warning("⚠️ Falha ao parsear JSON")
 
-                # Fallback: retornar resultado bruto
-                logger.warning("⚠️ Não foi possível extrair JSON estruturado")
-                return {
-                    "posts": [],
-                    "total_found": 0,
-                    "raw_result": final_result,
-                    "error": "parse_failed"
-                }
+                    # Fallback: retornar resultado bruto
+                    logger.warning("⚠️ Não foi possível extrair JSON estruturado")
+                    return {
+                        "posts": [],
+                        "total_found": 0,
+                        "raw_result": final_result,
+                        "error": "parse_failed"
+                    }
 
-            except Exception as e:
-                error_msg = str(e)
-                is_retryable = any(marker in error_msg.lower() for marker in [
-                    "http 500",
-                    "connection",
-                    "timeout",
-                    "websocket",
-                    "failed to establish"
-                ])
+                except Exception as e:
+                    error_msg = str(e)
+                    is_retryable = any(marker in error_msg.lower() for marker in [
+                        "http 500",
+                        "connection",
+                        "timeout",
+                        "websocket",
+                        "failed to establish"
+                    ])
 
-                if is_retryable and attempt < max_retries:
-                    wait_time = retry_delay * attempt
-                    logger.warning(
-                        f"⚠️ Tentativa {attempt}/{max_retries} falhou: {error_msg[:100]}. "
-                        f"Aguardando {wait_time}s antes de tentar novamente..."
-                    )
-                    await asyncio.sleep(wait_time)
-                    # Continue para próxima iteração
-                else:
-                    # Não é retryável ou última tentativa
-                    logger.error(f"❌ Erro no Browser Use Agent (tentativa {attempt}/{max_retries}): {e}")
-                    return {"posts": [], "total_found": 0, "error": str(e)}
+                    if is_retryable and attempt < max_retries:
+                        wait_time = retry_delay * attempt
+                        logger.warning(
+                            f"⚠️ Tentativa {attempt}/{max_retries} falhou: {error_msg[:100]}. "
+                            f"Aguardando {wait_time}s antes de tentar novamente..."
+                        )
+                        await asyncio.sleep(wait_time)
+                        # Continue para próxima iteração
+                    else:
+                        # Não é retryável ou última tentativa
+                        logger.error(f"❌ Erro no Browser Use Agent (tentativa {attempt}/{max_retries}): {e}")
+                        return {"posts": [], "total_found": 0, "error": str(e)}
 
-            finally:
-                # Sempre limpar recursos
-                if callable(restore_event_bus):
-                    restore_event_bus()
-                if browser_session:
-                    await self._detach_browser_session(browser_session)
+                finally:
+                    # Sempre limpar recursos
+                    if callable(restore_event_bus):
+                        restore_event_bus()
+                    if browser_session:
+                        await self._detach_browser_session(browser_session)
 
-        # Se saiu do loop sem retornar, todas as tentativas falharam
-        return {"posts": [], "total_found": 0, "error": "all_retries_failed"}
+            # Se saiu do loop sem retornar, todas as tentativas falharam
+            return {"posts": [], "total_found": 0, "error": "all_retries_failed"}
+        finally:
+            self._cleanup_storage_state_temp_file(storage_state_file)
 
     async def scroll_and_load_more(
         self,
