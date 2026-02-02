@@ -38,32 +38,74 @@ class BrowserUseAgent:
         self.browserless_host = settings.browserless_host
         self.browserless_token = settings.browserless_token
         self.browserless_ws_url = settings.browserless_ws_url
+        self.ws_compression_mode = self._normalize_ws_compression_mode(
+            getattr(settings, "browser_use_ws_compression", "auto")
+        )
         # Respect LOG_LEVEL from .env for browser_use logs.
         level = getattr(logging, settings.log_level, logging.INFO)
         for name in ("browser_use", "browser_use.Agent", "browser_use.BrowserSession", "browser_use.tools"):
             log = logging.getLogger(name)
             log.setLevel(level)
             log.propagate = True
-        self._patch_websocket_compression()
+        self._patch_websocket_compression(self.ws_compression_mode)
+        logger.info("Browser Use WebSocket compression mode: %s", self.ws_compression_mode)
 
     _ws_patched = False
+    _ws_patch_mode = "auto"
+    _ws_original_connect = None
 
     @classmethod
-    def _patch_websocket_compression(cls) -> None:
-        """
-        Força compression=None no websockets.connect para evitar erro 1002 (RSV bits).
-        """
-        if cls._ws_patched:
-            return
-        original_connect = websockets.connect
+    def _normalize_ws_compression_mode(cls, mode: Optional[str]) -> str:
+        normalized = (mode or "auto").strip().lower()
+        if normalized not in {"auto", "none", "deflate"}:
+            return "auto"
+        return normalized
 
-        # Keep the same connect() contract (awaitable/context manager) and hard-disable compression.
+    @classmethod
+    def _patch_websocket_compression(cls, mode: Optional[str] = None) -> None:
+        """
+        Ajusta websocket compression globalmente para compatibilidade com CDP/browserless.
+        """
+        normalized_mode = cls._normalize_ws_compression_mode(mode)
+
+        if cls._ws_original_connect is None:
+            cls._ws_original_connect = websockets.connect
+
+        original_connect = cls._ws_original_connect
+        if normalized_mode == "auto":
+            if cls._ws_patched and original_connect is not None:
+                websockets.connect = original_connect  # type: ignore[assignment]
+                try:
+                    import websockets.client as ws_client  # type: ignore
+                    ws_client.connect = original_connect  # type: ignore[assignment]
+                except Exception:
+                    pass
+                try:
+                    import websockets.asyncio.client as ws_async_client  # type: ignore
+                    ws_async_client.connect = original_connect  # type: ignore[assignment]
+                except Exception:
+                    pass
+                try:
+                    import cdp_use.client as cdp_client_module  # type: ignore
+                    cdp_ws = getattr(cdp_client_module, "websockets", None)
+                    if cdp_ws and hasattr(cdp_ws, "connect"):
+                        cdp_ws.connect = original_connect  # type: ignore[assignment]
+                except Exception:
+                    pass
+            cls._ws_patched = False
+            cls._ws_patch_mode = "auto"
+            return
+
+        if cls._ws_patched and cls._ws_patch_mode == normalized_mode:
+            return
+
+        compression_value = None if normalized_mode == "none" else "deflate"
+
         def _connect(*args, **kwargs):
-            kwargs["compression"] = None
+            kwargs["compression"] = compression_value
             return original_connect(*args, **kwargs)
 
         websockets.connect = _connect  # type: ignore[assignment]
-        # Also patch common module aliases used by dependencies.
         try:
             import websockets.client as ws_client  # type: ignore
             ws_client.connect = _connect  # type: ignore[assignment]
@@ -82,6 +124,15 @@ class BrowserUseAgent:
         except Exception:
             pass
         cls._ws_patched = True
+        cls._ws_patch_mode = normalized_mode
+
+    def _get_ws_connect_kwargs(self) -> Optional[Dict[str, Any]]:
+        mode = self._normalize_ws_compression_mode(self.ws_compression_mode)
+        if mode == "auto":
+            return None
+        if mode == "none":
+            return {"compression": None}
+        return {"compression": "deflate"}
 
     def _build_browserless_cdp_url(self) -> str:
         if not self.browserless_token:
@@ -299,16 +350,19 @@ class BrowserUseAgent:
         storage_state: Optional[Union[Dict[str, Any], str, Path]] = None,
     ) -> BrowserSession:
         """
-        Cria BrowserSession tentando desativar compress??o do WebSocket quando suportado.
+        Cria BrowserSession com fallback de argumentos para diferentes versoes do browser-use.
         """
         clean_storage_state = self._sanitize_storage_state(storage_state)
+        ws_connect_kwargs = self._get_ws_connect_kwargs()
         session = None
-        ctor_attempts = [
-            dict(cdp_url=cdp_url, storage_state=clean_storage_state, ws_connect_kwargs={"compression": None}, keep_alive=True),
-            dict(cdp_url=cdp_url, storage_state=clean_storage_state, keep_alive=True),
-            dict(cdp_url=cdp_url, storage_state=clean_storage_state, ws_connect_kwargs={"compression": None}),
-            dict(cdp_url=cdp_url, storage_state=clean_storage_state),
-        ]
+        base_kwargs = dict(cdp_url=cdp_url, storage_state=clean_storage_state)
+        ctor_attempts = []
+        if ws_connect_kwargs is not None:
+            ctor_attempts.append({**base_kwargs, "ws_connect_kwargs": ws_connect_kwargs, "keep_alive": True})
+        ctor_attempts.append({**base_kwargs, "keep_alive": True})
+        if ws_connect_kwargs is not None:
+            ctor_attempts.append({**base_kwargs, "ws_connect_kwargs": ws_connect_kwargs})
+        ctor_attempts.append({**base_kwargs})
         for kwargs in ctor_attempts:
             try:
                 session = BrowserSession(**kwargs)

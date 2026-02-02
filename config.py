@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     browserless_reconnect_timeout_ms: int = 60000
     browser_use_max_retries: int = 3
     browser_use_retry_backoff: int = 2
+    browser_use_ws_compression: str = "auto"  # auto | none | deflate
 
     # OpenAI
     openai_api_key: str

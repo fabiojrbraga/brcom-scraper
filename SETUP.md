@@ -53,6 +53,7 @@ DATABASE_URL=postgresql://user:password@postgres:5432/instagram_scraper
 # Browserless
 BROWSERLESS_HOST=https://chrome.browserless.io
 BROWSERLESS_TOKEN=seu-token-aqui
+BROWSER_USE_WS_COMPRESSION=auto  # auto | none | deflate
 
 # OpenAI
 OPENAI_API_KEY=sk-sua-chave-aqui
@@ -148,6 +149,7 @@ FASTAPI_ENV=development
 DATABASE_URL=postgresql://scraper:scraper_password@localhost:5432/instagram_scraper
 BROWSERLESS_HOST=https://chrome.browserless.io
 BROWSERLESS_TOKEN=seu-token
+BROWSER_USE_WS_COMPRESSION=auto
 OPENAI_API_KEY=sk-sua-chave
 ```
 
