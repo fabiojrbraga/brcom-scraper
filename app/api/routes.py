@@ -61,9 +61,11 @@ async def start_scraping(
         logger.info(f"📥 Requisição de scraping recebida: {request.profile_url}")
 
         # Criar job de scraping
+        request_payload = request.model_dump(mode="json", exclude_unset=True)
         job = ScrapingJob(
             profile_url=request.profile_url,
             status="pending",
+            metadata_json={"request": request_payload},
         )
         db.add(job)
         db.commit()
@@ -74,6 +76,7 @@ async def start_scraping(
             _scrape_profile_background,
             job_id=job.id,
             profile_url=request.profile_url,
+            options={k: v for k, v in request_payload.items() if k != "profile_url"},
         )
 
         logger.info(f"✅ Job de scraping criado: {job.id}")
@@ -157,6 +160,44 @@ async def get_scraping_results(
                 detail=f"Job ainda não foi concluído. Status: {job.status}",
             )
 
+        metadata = job.metadata_json or {}
+        flow = metadata.get("flow")
+        flow_result = metadata.get("result")
+
+        if flow == "recent_likes" and isinstance(flow_result, dict):
+            posts = flow_result.get("posts", []) or []
+            summary = flow_result.get("summary", {}) or {}
+            profile_payload = flow_result.get("profile", {}) or {}
+            return ScrapingCompleteResponse(
+                job_id=job.id,
+                status=job.status,
+                flow="recent_likes",
+                profile={
+                    "username": profile_payload.get("username") or "",
+                    "profile_url": profile_payload.get("profile_url") or job.profile_url,
+                    "bio": profile_payload.get("bio"),
+                    "is_private": bool(profile_payload.get("is_private", False)),
+                    "follower_count": profile_payload.get("follower_count"),
+                    "posts": [
+                        {
+                            "post_url": post.get("post_url", ""),
+                            "caption": post.get("caption"),
+                            "like_count": int(post.get("like_count", 0) or 0),
+                            "comment_count": int(post.get("comment_count", 0) or 0),
+                            "interactions": [],
+                        }
+                        for post in posts
+                        if post.get("post_url")
+                    ],
+                },
+                extracted_posts=posts,
+                total_posts=int(summary.get("total_posts", len(posts)) or 0),
+                total_interactions=int(summary.get("total_like_users", 0) or 0),
+                raw_result=flow_result,
+                error_message=job.error_message,
+                completed_at=job.completed_at,
+            )
+
         # Buscar perfil associado
         profile = db.query(Profile).filter(
             Profile.instagram_url == job.profile_url
@@ -175,6 +216,7 @@ async def get_scraping_results(
         result = ScrapingCompleteResponse(
             job_id=job.id,
             status=job.status,
+            flow="default",
             profile={
                 "username": profile.instagram_username,
                 "profile_url": profile.instagram_url,
@@ -345,13 +387,14 @@ async def get_profile_interactions(
 
 # ==================== Background Tasks ====================
 
-async def _scrape_profile_background(job_id: str, profile_url: str):
+async def _scrape_profile_background(job_id: str, profile_url: str, options: dict | None = None):
     """
     Executa scraping em background.
 
     Args:
         job_id: ID do job
         profile_url: URL do perfil a raspar
+        options: opções avançadas do fluxo
     """
     db = None
     try:
@@ -367,18 +410,48 @@ async def _scrape_profile_background(job_id: str, profile_url: str):
         job.started_at = datetime.utcnow()
         db.commit()
 
-        # Executar scraping
-        result = await instagram_scraper.scrape_profile(
-            profile_url=profile_url,
-            max_posts=5,
-            db=db,
-        )
+        opts = dict(options or {})
+        flow = (opts.get("flow") or "default").lower().strip()
+        default_max_posts = 3 if flow == "recent_likes" else 5
+        max_posts = int(opts.get("max_posts", default_max_posts))
+        recent_hours = int(opts.get("recent_hours", 24))
+        max_like_users_per_post = int(opts.get("max_like_users_per_post", 30))
+        collect_like_user_profiles = bool(opts.get("collect_like_user_profiles", True))
+
+        # Executar scraping de acordo com o fluxo.
+        if flow == "recent_likes":
+            result = await instagram_scraper.scrape_recent_posts_like_users(
+                profile_url=profile_url,
+                max_posts=max_posts,
+                recent_hours=recent_hours,
+                max_like_users_per_post=max_like_users_per_post,
+                collect_like_user_profiles=collect_like_user_profiles,
+                db=db,
+            )
+        else:
+            result = await instagram_scraper.scrape_profile(
+                profile_url=profile_url,
+                max_posts=max_posts,
+                db=db,
+            )
 
         # Atualizar job com resultados
         job.status = "completed"
         job.completed_at = datetime.utcnow()
-        job.posts_scraped = result["summary"]["total_posts"]
-        job.interactions_scraped = result["summary"]["total_interactions"]
+        summary = result.get("summary", {}) if isinstance(result, dict) else {}
+        total_posts = int(summary.get("total_posts", 0) or 0)
+        if flow == "recent_likes":
+            total_interactions = int(summary.get("total_like_users", 0) or 0)
+        else:
+            total_interactions = int(summary.get("total_interactions", 0) or 0)
+
+        job.posts_scraped = total_posts
+        job.interactions_scraped = total_interactions
+        metadata = job.metadata_json or {}
+        metadata["flow"] = flow
+        metadata["options"] = opts
+        metadata["result"] = result
+        job.metadata_json = metadata
         db.commit()
 
         logger.info(f"✅ Job concluído: {job_id}")

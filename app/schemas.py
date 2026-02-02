@@ -3,7 +3,7 @@ Schemas Pydantic para validação de requisições e respostas da API.
 """
 
 from pydantic import BaseModel, HttpUrl, Field
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 from enum import Enum
 
@@ -123,6 +123,14 @@ class InteractionResponse(InteractionBase):
 class ScrapingJobCreate(BaseModel):
     """Schema para criar job de scraping."""
     profile_url: str = Field(..., description="URL do perfil Instagram a ser raspado")
+    flow: str = Field(default="default", description="Fluxo: default ou recent_likes")
+    max_posts: int = Field(default=5, ge=1, le=20, description="Quantidade maxima de posts")
+    recent_hours: int = Field(default=24, ge=1, le=168, description="Janela de horas para considerar post recente")
+    max_like_users_per_post: int = Field(default=30, ge=1, le=200, description="Maximo de perfis curtidores por post")
+    collect_like_user_profiles: bool = Field(
+        default=True,
+        description="Se True, coleta screenshot e extrai dados dos perfis curtidores com IA",
+    )
 
 
 class ScrapingJobResponse(BaseModel):
@@ -162,6 +170,32 @@ class ScrapingResultPost(BaseModel):
     interactions: List[ScrapingResultInteraction] = []
 
 
+class ScrapingLikeUserResult(BaseModel):
+    """Perfil de usuário curtidor enriquecido."""
+    user_url: str
+    user_username: Optional[str] = None
+    bio: Optional[str] = None
+    is_private: Optional[bool] = None
+    follower_count: Optional[int] = None
+    verified: Optional[bool] = None
+    confidence: Optional[float] = None
+    error: Optional[str] = None
+
+
+class ScrapingRecentPostResult(BaseModel):
+    """Resultado detalhado para fluxo de posts recentes e curtidores."""
+    post_url: str
+    caption: Optional[str] = None
+    like_count: int = 0
+    comment_count: int = 0
+    posted_at: Optional[str] = None
+    is_recent_24h: bool = False
+    likes_accessible: bool = False
+    like_users: List[str] = []
+    like_users_data: List[ScrapingLikeUserResult] = []
+    error: Optional[str] = None
+
+
 class ScrapingResultProfile(BaseModel):
     """Resultado completo de scraping de um perfil."""
     username: str
@@ -176,9 +210,12 @@ class ScrapingCompleteResponse(BaseModel):
     """Resposta completa de um job de scraping."""
     job_id: str
     status: str
+    flow: Optional[str] = None
     profile: Optional[ScrapingResultProfile] = None
+    extracted_posts: List[ScrapingRecentPostResult] = []
     total_posts: int = 0
     total_interactions: int = 0
+    raw_result: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
     completed_at: Optional[datetime] = None
 

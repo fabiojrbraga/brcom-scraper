@@ -6,9 +6,9 @@ Coordena o fluxo completo de raspagem: navegação, extração, processamento.
 import logging
 import asyncio
 import random
+import re
 from typing import Optional, Dict, Any, List
-from datetime import datetime
-from urllib.parse import urlparse
+from datetime import datetime, timezone
 
 from app.scraper.browserless_client import BrowserlessClient
 from app.scraper.browser_use_agent import browser_use_agent
@@ -48,6 +48,89 @@ class InstagramScraper:
         # URL pode ser: https://instagram.com/username ou https://www.instagram.com/username/
         parts = url.rstrip("/").split("/")
         return parts[-1]
+
+    def _is_recent_post(self, posted_at: Any, recent_hours: int = 24) -> bool:
+        """
+        Determina se o post é recente baseado no texto/valor retornado pelo scraper.
+        """
+        if posted_at is None:
+            return False
+
+        now = datetime.now(timezone.utc)
+
+        if isinstance(posted_at, datetime):
+            post_dt = posted_at if posted_at.tzinfo else posted_at.replace(tzinfo=timezone.utc)
+            return (now - post_dt).total_seconds() <= recent_hours * 3600
+
+        text = str(posted_at).strip().lower()
+        if not text:
+            return False
+
+        if text in {"now", "just now", "agora", "agora mesmo"}:
+            return True
+
+        iso_candidate = text.replace("z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(iso_candidate)
+            parsed = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            return (now - parsed).total_seconds() <= recent_hours * 3600
+        except Exception:
+            pass
+
+        number_match = re.search(r"(\d+)", text)
+        value = int(number_match.group(1)) if number_match else None
+
+        minute_tokens = ("min", "minute", "minutes", "minuto", "minutos", "m")
+        hour_tokens = ("hour", "hours", "hora", "horas", "h")
+        day_tokens = ("day", "days", "dia", "dias", "d")
+        week_tokens = ("week", "weeks", "semana", "semanas", "w")
+
+        if any(token in text for token in minute_tokens):
+            return True
+        if any(token in text for token in hour_tokens):
+            if value is None:
+                return False
+            return value <= recent_hours
+        if any(token in text for token in day_tokens):
+            return False
+        if any(token in text for token in week_tokens):
+            return False
+
+        return False
+
+    async def _extract_like_user_profile(
+        self,
+        user_url: str,
+        cookies: Optional[list[dict]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Captura screenshot + HTML e aplica IA para extrair dados do perfil curtidor.
+        """
+        username = self._extract_username_from_url(user_url)
+        try:
+            screenshot = await self.browserless.screenshot(user_url, cookies=cookies)
+            html = await self.browserless.get_html(user_url, cookies=cookies)
+            extracted = await self.ai_extractor.extract_user_info(
+                screenshot_base64=screenshot,
+                html_content=html,
+                username=username,
+            )
+            return {
+                "user_url": user_url,
+                "user_username": username,
+                "bio": extracted.get("bio"),
+                "is_private": extracted.get("is_private"),
+                "follower_count": extracted.get("follower_count"),
+                "verified": extracted.get("verified"),
+                "confidence": extracted.get("confidence"),
+            }
+        except Exception as exc:
+            logger.warning("⚠️ Falha ao enriquecer perfil curtidor %s: %s", user_url, exc)
+            return {
+                "user_url": user_url,
+                "user_username": username,
+                "error": str(exc),
+            }
 
     async def scrape_profile(
         self,
@@ -156,6 +239,125 @@ class InstagramScraper:
 
         except Exception as e:
             logger.exception("❌ Erro ao raspar perfil %s: %s", profile_url, e)
+            raise
+
+    async def scrape_recent_posts_like_users(
+        self,
+        profile_url: str,
+        max_posts: int = 3,
+        recent_hours: int = 24,
+        max_like_users_per_post: int = 30,
+        collect_like_user_profiles: bool = True,
+        db: Optional[Session] = None,
+    ) -> Dict[str, Any]:
+        """
+        Fluxo avançado:
+        1) coleta os posts mais recentes do perfil;
+        2) para posts dentro da janela recente, coleta usuários que curtiram;
+        3) opcionalmente enriquece os perfis curtidores com IA.
+        """
+        try:
+            logger.info("🚀 Iniciando fluxo recent_likes para %s", profile_url)
+
+            if not profile_url.startswith("http"):
+                profile_url = f"https://instagram.com/{profile_url}"
+
+            username = self._extract_username_from_url(profile_url)
+            storage_state = await browser_use_agent.ensure_instagram_session(db) if db else None
+            cookies = browser_use_agent.get_cookies(storage_state)
+
+            posts_data = await self._scrape_posts(
+                profile_url=profile_url,
+                max_posts=max_posts,
+                cookies=cookies,
+                storage_state=storage_state,
+            )
+
+            extracted_posts: List[Dict[str, Any]] = []
+            total_like_users = 0
+            total_recent_posts = 0
+
+            for post in posts_data[:max_posts]:
+                post_url = post.get("post_url")
+                if not post_url:
+                    continue
+
+                posted_at = post.get("posted_at")
+                is_recent = self._is_recent_post(posted_at, recent_hours=recent_hours)
+                if is_recent:
+                    total_recent_posts += 1
+
+                post_payload: Dict[str, Any] = {
+                    "post_url": post_url,
+                    "caption": post.get("caption"),
+                    "like_count": post.get("like_count", 0),
+                    "comment_count": post.get("comment_count", 0),
+                    "posted_at": posted_at,
+                    "is_recent_24h": is_recent,
+                    "likes_accessible": False,
+                    "like_users": [],
+                    "like_users_data": [],
+                    "error": None,
+                }
+
+                if not is_recent:
+                    post_payload["error"] = "post_older_than_window"
+                    extracted_posts.append(post_payload)
+                    continue
+
+                like_users_result = await browser_use_agent.scrape_post_like_users(
+                    post_url=post_url,
+                    storage_state=storage_state,
+                    max_users=max_like_users_per_post,
+                )
+
+                post_payload["likes_accessible"] = bool(like_users_result.get("likes_accessible"))
+                post_payload["error"] = like_users_result.get("error")
+
+                like_users = like_users_result.get("like_users") or []
+                if isinstance(like_users, list):
+                    dedup_users = []
+                    for item in like_users:
+                        if isinstance(item, str) and item not in dedup_users:
+                            dedup_users.append(item)
+                    post_payload["like_users"] = dedup_users
+                else:
+                    post_payload["like_users"] = []
+
+                total_like_users += len(post_payload["like_users"])
+
+                if collect_like_user_profiles and post_payload["like_users"]:
+                    for user_url in post_payload["like_users"]:
+                        user_data = await self._extract_like_user_profile(user_url=user_url, cookies=cookies)
+                        post_payload["like_users_data"].append(user_data)
+
+                extracted_posts.append(post_payload)
+
+            result = {
+                "status": "success",
+                "flow": "recent_likes",
+                "profile": {
+                    "username": username,
+                    "profile_url": profile_url,
+                },
+                "posts": extracted_posts,
+                "summary": {
+                    "total_posts": len(extracted_posts),
+                    "recent_posts": total_recent_posts,
+                    "total_like_users": total_like_users,
+                    "scraped_at": datetime.utcnow().isoformat(),
+                },
+            }
+
+            logger.info(
+                "✅ Fluxo recent_likes concluído: posts=%s recentes=%s curtidores=%s",
+                len(extracted_posts),
+                total_recent_posts,
+                total_like_users,
+            )
+            return result
+        except Exception as exc:
+            logger.exception("❌ Erro no fluxo recent_likes para %s: %s", profile_url, exc)
             raise
 
     async def _scrape_posts(

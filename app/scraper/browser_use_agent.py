@@ -933,6 +933,195 @@ class BrowserUseAgent:
         finally:
             self._cleanup_storage_state_temp_file(storage_state_file)
 
+    async def scrape_post_like_users(
+        self,
+        post_url: str,
+        storage_state: Optional[Dict[str, Any]],
+        max_users: int = 30,
+    ) -> Dict[str, Any]:
+        """
+        Abre um post e tenta extrair os perfis que curtiram.
+
+        Returns:
+            {
+              "post_url": str,
+              "likes_accessible": bool,
+              "like_users": [url, ...],
+              "error": Optional[str]
+            }
+        """
+        max_retries = getattr(settings, "browser_use_max_retries", 3)
+        retry_delay = 5
+        reconnect_url = self._get_browserless_reconnect_url(storage_state)
+        session_info = self._get_browserless_session_info(storage_state)
+        session_connect_url = session_info.get("connect") if isinstance(session_info.get("connect"), str) else None
+        clean_storage_state = self._sanitize_storage_state(storage_state)
+        storage_state_file = self._write_storage_state_temp_file(storage_state)
+        storage_state_for_session: Optional[Union[Dict[str, Any], str]]
+        storage_state_for_session = storage_state_file or clean_storage_state
+
+        try:
+            for attempt in range(1, max_retries + 1):
+                browser_session = None
+                restore_event_bus = None
+                try:
+                    logger.info(
+                        "🤖 Browser Use: Coletando curtidores de %s (tentativa %s/%s)",
+                        post_url,
+                        attempt,
+                        max_retries,
+                    )
+
+                    if not self.api_key:
+                        raise ValueError("OPENAI_API_KEY is required for Browser Use.")
+
+                    use_reconnect = bool(reconnect_url and attempt == 1)
+                    use_session_connect = bool((not reconnect_url) and session_connect_url and attempt == 1)
+                    if use_reconnect:
+                        cdp_url = self._ensure_ws_token(reconnect_url)
+                    elif use_session_connect:
+                        cdp_url = self._ensure_ws_token(session_connect_url)
+                    else:
+                        cdp_url = await self._resolve_browserless_cdp_url()
+
+                    task = f"""
+                    Você está em um navegador autenticado no Instagram.
+                    Sua tarefa é extrair os links dos perfis que curtiram um post.
+
+                    PASSOS:
+                    1) Acesse o post: {post_url}
+                    2) Aguarde a página carregar.
+                    3) Se houver modal de cookies, aceite.
+                    4) Localize e clique no link/botão de curtidas para abrir a lista de usuários.
+                    5) Se a lista abrir, role o modal/lista até coletar até {max_users} links únicos de perfis.
+                    6) Retorne os links no formato https://www.instagram.com/usuario/
+
+                    FORMATO DE SAÍDA (JSON):
+                    {{
+                      "post_url": "{post_url}",
+                      "likes_accessible": true,
+                      "like_users": ["https://www.instagram.com/usuario1/"],
+                      "total_collected": 1
+                    }}
+
+                    REGRAS:
+                    - Se não for possível abrir a lista de curtidas, retorne:
+                      {{
+                        "post_url": "{post_url}",
+                        "likes_accessible": false,
+                        "like_users": [],
+                        "error": "likes_unavailable"
+                      }}
+                    - Não abra nova aba.
+                    - Não invente links.
+                    """
+
+                    browser_session = self._create_browser_session(cdp_url, storage_state=storage_state_for_session)
+                    llm = ChatOpenAI(model=self.model, api_key=self.api_key)
+                    agent = self._create_agent(
+                        task=task,
+                        llm=llm,
+                        browser_session=browser_session,
+                    )
+
+                    restore_event_bus = self._patch_event_bus_for_stop(browser_session)
+                    history = await agent.run()
+                    final_result = history.final_result() or ""
+
+                    import re
+
+                    json_match = re.search(r"\{[\s\S]*\"likes_accessible\"[\s\S]*\}", final_result)
+                    if not json_match:
+                        logger.warning("⚠️ Falha ao extrair JSON de curtidores: %s", final_result[:180])
+                        return {
+                            "post_url": post_url,
+                            "likes_accessible": False,
+                            "like_users": [],
+                            "error": "parse_failed",
+                            "raw_result": final_result,
+                        }
+
+                    try:
+                        data = json.loads(json_match.group(0))
+                    except json.JSONDecodeError:
+                        logger.warning("⚠️ JSON inválido ao extrair curtidores")
+                        return {
+                            "post_url": post_url,
+                            "likes_accessible": False,
+                            "like_users": [],
+                            "error": "parse_failed",
+                            "raw_result": final_result,
+                        }
+
+                    if data.get("error") == "login_required" and attempt < max_retries:
+                        wait_time = retry_delay * attempt
+                        logger.warning(
+                            "Agente retornou login_required ao coletar curtidores (%s/%s). Retentando em %ss...",
+                            attempt,
+                            max_retries,
+                            wait_time,
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+
+                    unique_users: list[str] = []
+                    for value in data.get("like_users", []) or []:
+                        if not isinstance(value, str):
+                            continue
+                        if "instagram.com" not in value:
+                            continue
+                        normalized = value.strip()
+                        if normalized and normalized not in unique_users:
+                            unique_users.append(normalized)
+                        if len(unique_users) >= max_users:
+                            break
+
+                    return {
+                        "post_url": data.get("post_url") or post_url,
+                        "likes_accessible": bool(data.get("likes_accessible")),
+                        "like_users": unique_users,
+                        "total_collected": len(unique_users),
+                        "error": data.get("error"),
+                    }
+
+                except Exception as exc:
+                    error_msg = str(exc).lower()
+                    is_retryable = any(
+                        marker in error_msg
+                        for marker in ("http 500", "connection", "timeout", "websocket", "failed to establish")
+                    )
+                    if is_retryable and attempt < max_retries:
+                        wait_time = retry_delay * attempt
+                        logger.warning(
+                            "⚠️ Tentativa %s/%s falhou ao coletar curtidores: %s. Retentando em %ss...",
+                            attempt,
+                            max_retries,
+                            str(exc)[:120],
+                            wait_time,
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    return {
+                        "post_url": post_url,
+                        "likes_accessible": False,
+                        "like_users": [],
+                        "error": str(exc),
+                    }
+                finally:
+                    if callable(restore_event_bus):
+                        restore_event_bus()
+                    if browser_session:
+                        await self._detach_browser_session(browser_session)
+
+            return {
+                "post_url": post_url,
+                "likes_accessible": False,
+                "like_users": [],
+                "error": "all_retries_failed",
+            }
+        finally:
+            self._cleanup_storage_state_temp_file(storage_state_file)
+
     async def scroll_and_load_more(
         self,
         url: str,
