@@ -403,6 +403,17 @@ async def scrape_profile_info(
         logger.error("❌ Erro ao raspar perfil %s: %s", request.profile_url, e)
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/profiles/scrape")
+async def scrape_profile_info_get_not_allowed():
+    """
+    Evita conflito com rota dinamica /profiles/{username}.
+    """
+    raise HTTPException(
+        status_code=405,
+        detail="Use POST /api/profiles/scrape com body JSON (profile_url).",
+    )
+
+
 @router.get("/profiles/{username}", response_model=ProfileResponse)
 async def get_profile(
     username: str,
