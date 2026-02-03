@@ -8,6 +8,7 @@ import asyncio
 import random
 import re
 import json
+from urllib.parse import urlparse
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 
@@ -49,6 +50,216 @@ class InstagramScraper:
         # URL pode ser: https://instagram.com/username ou https://www.instagram.com/username/
         parts = url.rstrip("/").split("/")
         return parts[-1]
+
+    def _extract_post_urls_from_html(self, html: str, max_posts: int) -> List[str]:
+        """
+        Extrai links canônicos de posts (/p/...) a partir do HTML do perfil.
+        """
+        if not html:
+            return []
+
+        matches = re.findall(r'href=["\'](/p/[A-Za-z0-9_-]+/?)(?:\?[^"\']*)?["\']', html)
+        found: List[str] = []
+        for path in matches:
+            normalized = path if path.startswith("/") else f"/{path}"
+            if not normalized.endswith("/"):
+                normalized = f"{normalized}/"
+            url = f"https://www.instagram.com{normalized}"
+            if url not in found:
+                found.append(url)
+            if len(found) >= max_posts:
+                break
+        return found
+
+    def _to_int_or_none(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+
+        text = str(value).strip().lower()
+        if not text:
+            return None
+
+        match = re.search(r"(\d+(?:[.,]\d+)?)\s*([km]?)", text)
+        if not match:
+            return None
+
+        number_text = match.group(1)
+        suffix = match.group(2)
+
+        if "," in number_text and "." not in number_text:
+            parts = number_text.split(",")
+            if len(parts[-1]) == 3:
+                number_text = "".join(parts)
+            else:
+                number_text = ".".join(parts)
+        elif "." in number_text and "," not in number_text:
+            parts = number_text.split(".")
+            if len(parts[-1]) == 3 and len(parts) > 1:
+                number_text = "".join(parts)
+        else:
+            number_text = number_text.replace(",", "")
+
+        try:
+            number = float(number_text)
+        except ValueError:
+            return None
+
+        if suffix == "k":
+            number *= 1_000
+        elif suffix == "m":
+            number *= 1_000_000
+
+        return int(number)
+
+    def _normalize_post_item(self, item: Dict[str, Any], fallback_url: Optional[str] = None) -> Dict[str, Any]:
+        post_url = item.get("post_url") or item.get("canonical_post_url") or fallback_url
+        if isinstance(post_url, str):
+            post_url = post_url.strip()
+            if post_url.startswith("/p/"):
+                post_url = f"https://www.instagram.com{post_url}"
+            if post_url and "/p/" in post_url and not post_url.endswith("/"):
+                post_url = f"{post_url}/"
+        else:
+            post_url = fallback_url
+
+        caption = item.get("caption")
+        if caption is None:
+            caption = item.get("full_caption_text")
+        if caption is not None:
+            caption = str(caption).strip() or None
+
+        posted_at = item.get("posted_at")
+        if isinstance(posted_at, datetime):
+            posted_at = posted_at.isoformat()
+        elif posted_at is not None:
+            posted_at = str(posted_at).strip() or None
+
+        like_count = self._to_int_or_none(item.get("like_count"))
+        comment_count = self._to_int_or_none(item.get("comment_count"))
+
+        return {
+            "post_url": post_url,
+            "caption": caption,
+            "like_count": like_count if like_count is not None else 0,
+            "comment_count": comment_count if comment_count is not None else 0,
+            "posted_at": posted_at,
+        }
+
+    def _merge_posts_data(
+        self,
+        primary: List[Dict[str, Any]],
+        fallback: List[Dict[str, Any]],
+        max_posts: int,
+    ) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        by_url: Dict[str, Dict[str, Any]] = {}
+
+        def _url_key(url: Optional[str]) -> Optional[str]:
+            if not url:
+                return None
+            try:
+                parsed = urlparse(url)
+                return f"{parsed.netloc}{parsed.path}".rstrip("/")
+            except Exception:
+                return url.rstrip("/")
+
+        for src in primary:
+            normalized = self._normalize_post_item(src)
+            url_key = _url_key(normalized.get("post_url"))
+            if url_key and url_key not in by_url:
+                by_url[url_key] = normalized
+                merged.append(normalized)
+            elif not url_key:
+                merged.append(normalized)
+
+        for src in fallback:
+            normalized = self._normalize_post_item(src)
+            url_key = _url_key(normalized.get("post_url"))
+            if url_key and url_key in by_url:
+                target = by_url[url_key]
+                if not target.get("caption") and normalized.get("caption"):
+                    target["caption"] = normalized["caption"]
+                if target.get("like_count", 0) == 0 and normalized.get("like_count", 0) > 0:
+                    target["like_count"] = normalized["like_count"]
+                if target.get("comment_count", 0) == 0 and normalized.get("comment_count", 0) > 0:
+                    target["comment_count"] = normalized["comment_count"]
+                if not target.get("posted_at") and normalized.get("posted_at"):
+                    target["posted_at"] = normalized["posted_at"]
+                continue
+            if url_key and url_key not in by_url:
+                by_url[url_key] = normalized
+            merged.append(normalized)
+            if len(merged) >= max_posts:
+                break
+
+        return merged[:max_posts]
+
+    async def _fallback_scrape_posts_via_browserless(
+        self,
+        profile_url: str,
+        max_posts: int,
+        cookies: Optional[list[dict]] = None,
+        profile_html: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fallback sem Browser Use:
+        - extrai links /p/ do HTML do perfil
+        - abre cada post diretamente e usa IA para extrair campos.
+        """
+        try:
+            html = profile_html or await self.browserless.get_html(profile_url, cookies=cookies)
+            post_urls = self._extract_post_urls_from_html(html, max_posts=max_posts)
+            if not post_urls:
+                return []
+
+            recovered: List[Dict[str, Any]] = []
+            for post_url in post_urls[:max_posts]:
+                screenshot_base64: Optional[str] = None
+                post_html: Optional[str] = None
+                try:
+                    screenshot_base64 = await self.browserless.screenshot(post_url, cookies=cookies)
+                except Exception as exc:
+                    logger.warning("⚠️ Falha ao capturar screenshot do post %s: %s", post_url, exc)
+                try:
+                    post_html = await self.browserless.get_html(post_url, cookies=cookies)
+                except Exception as exc:
+                    logger.warning("⚠️ Falha ao obter HTML do post %s: %s", post_url, exc)
+
+                ai_candidates: List[Dict[str, Any]] = []
+                if screenshot_base64 or post_html:
+                    try:
+                        ai_candidates = await self.ai_extractor.extract_posts_info(
+                            screenshot_base64=screenshot_base64,
+                            html_content=post_html,
+                        )
+                    except Exception as exc:
+                        logger.warning("⚠️ IA não conseguiu extrair o post %s: %s", post_url, exc)
+
+                selected: Dict[str, Any] = {}
+                for candidate in ai_candidates:
+                    if not isinstance(candidate, dict):
+                        continue
+                    candidate_url = str(candidate.get("post_url") or "").rstrip("/")
+                    if candidate_url and candidate_url == post_url.rstrip("/"):
+                        selected = candidate
+                        break
+                if not selected and ai_candidates:
+                    first_candidate = next((c for c in ai_candidates if isinstance(c, dict)), None)
+                    if first_candidate:
+                        selected = first_candidate
+
+                recovered.append(self._normalize_post_item(selected, fallback_url=post_url))
+
+            return recovered[:max_posts]
+        except Exception as exc:
+            logger.warning("⚠️ Fallback via Browserless falhou: %s", exc)
+            return []
 
     def _recover_posts_from_raw_result(self, raw_result: str) -> List[Dict[str, Any]]:
         """
@@ -423,11 +634,44 @@ class InstagramScraper:
                         logger.info("✅ Recuperados %s posts do raw_result.", len(recovered))
                         posts_data = recovered
 
+            normalized_primary = [
+                self._normalize_post_item(post)
+                for post in posts_data
+                if isinstance(post, dict)
+            ]
+
+            if len(normalized_primary) < max_posts:
+                logger.warning(
+                    "⚠️ Browser Use retornou %s/%s posts. Tentando fallback via Browserless...",
+                    len(normalized_primary),
+                    max_posts,
+                )
+                fallback_posts = await self._fallback_scrape_posts_via_browserless(
+                    profile_url=profile_url,
+                    max_posts=max_posts,
+                    cookies=cookies,
+                    profile_html=profile_html,
+                )
+                if fallback_posts:
+                    logger.info("✅ Fallback recuperou %s posts.", len(fallback_posts))
+                posts_data = self._merge_posts_data(normalized_primary, fallback_posts, max_posts=max_posts)
+            else:
+                posts_data = normalized_primary
+
             logger.info(f"✅ {len(posts_data)} posts extraídos via Browser Use")
             return posts_data[:max_posts]
 
         except Exception as e:
             logger.exception("❌ Erro ao raspar posts: %s", e)
+            fallback_posts = await self._fallback_scrape_posts_via_browserless(
+                profile_url=profile_url,
+                max_posts=max_posts,
+                cookies=cookies,
+                profile_html=profile_html,
+            )
+            if fallback_posts:
+                logger.info("✅ Fallback recuperou %s posts após exceção.", len(fallback_posts))
+                return fallback_posts[:max_posts]
             return []
 
     async def _scrape_post_interactions(

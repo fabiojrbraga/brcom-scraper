@@ -913,25 +913,28 @@ class BrowserUseAgent:
                         logger.info("Usando CDP padrao com storage_state.")
 
                     task = f"""
-                    Você é um raspador de dados do Instagram. Sua tarefa é extrair informações de posts.
+                    Você é um raspador de dados do Instagram. Extraia os primeiros {max_posts} posts do perfil.
 
-                    INSTRUÇÕES:
-                    1. Acesse o perfil: {profile_url}
-                    2. Aguarde a página carregar completamente
-                    3. Faça scroll suave para carregar os primeiros {max_posts} posts (role a página lentamente 2-3 vezes)
-                    4. Para cada um dos primeiros {max_posts} posts visíveis no grid:
-                       a) Identifique a URL do post (formato: https://instagram.com/p/CODIGO/)
-                       b) Clique no post para abri-lo em modal/overlay
-                       c) Extraia as seguintes informações:
-                          - Caption/descrição completa do post
-                          - Número de curtidas (likes)
-                          - Número de comentários
-                          - Data de publicação (se visível)
-                       d) Feche o modal e volte para o grid
-                       e) Aguarde 1-2 segundos antes do próximo post
-                    5. Retorne os dados em formato JSON estruturado
+                    PERFIL:
+                    - URL: {profile_url}
 
-                    FORMATO DE SAÍDA (copie exatamente este formato):
+                    ESTRATÉGIA (obrigatória):
+                    1) Abra o perfil e aguarde carregar.
+                    2) Faça scroll suave 2-3 vezes para carregar o grid.
+                    3) Colete os primeiros {max_posts} links CANÔNICOS de posts a partir de anchors com href contendo "/p/".
+                       - Não clique em ícones SVG, overlays de "Clip" ou elementos decorativos.
+                       - Se precisar clicar, clique no link/anchor do post (href /p/...), não no ícone.
+                    4) Para cada URL coletada:
+                       a) Navegue para a URL do post na MESMA aba (new_tab: false).
+                       b) Aguarde carregar.
+                       c) Extraia:
+                          - caption completa (ou null)
+                          - like_count (inteiro ou null)
+                          - comment_count (inteiro ou null)
+                          - posted_at (texto visível ou null)
+                    5) Retorne JSON final com todos os posts coletados.
+
+                    FORMATO DE SAÍDA (JSON puro, sem texto extra):
                     {{
                       "posts": [
                         {{
@@ -942,15 +945,15 @@ class BrowserUseAgent:
                           "posted_at": "2 dias atrás" ou null
                         }}
                       ],
-                      "total_found": 5
+                      "total_found": {max_posts}
                     }}
 
-                    IMPORTANTE:
-                    - Se o perfil for privado, retorne: {{"posts": [], "total_found": 0, "error": "private_profile"}}
-                    - Use apenas a aba atual; nao abra nova aba ou janela.
-                    - Se não conseguir abrir um post, pule para o próximo
-                    - Sempre feche modais antes de abrir outro post
-                    - Simule comportamento humano (delays, scroll suave)
+                    REGRAS:
+                    - Se o perfil for privado: {{"posts": [], "total_found": 0, "error": "private_profile"}}
+                    - Use apenas a aba atual; não abra nova aba/janela.
+                    - Se não conseguir um campo, retorne null naquele campo.
+                    - Se não conseguir abrir um post, pule para o próximo.
+                    - Não invente dados.
                     """
 
                     browser_session = self._create_browser_session(cdp_url, storage_state=storage_state_for_session)
