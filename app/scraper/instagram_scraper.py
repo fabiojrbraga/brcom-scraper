@@ -328,6 +328,27 @@ class InstagramScraper:
 
         return False
 
+    def _coerce_posted_at_datetime(self, posted_at: Any) -> Optional[datetime]:
+        """
+        Converte posted_at para datetime quando possível.
+        Valores relativos como '1d', '2w' retornam None.
+        """
+        if posted_at is None:
+            return None
+        if isinstance(posted_at, datetime):
+            return posted_at
+
+        text = str(posted_at).strip()
+        if not text:
+            return None
+
+        iso_candidate = text.replace("Z", "+00:00").replace("z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(iso_candidate)
+            return parsed if parsed.tzinfo is None else parsed.replace(tzinfo=None)
+        except Exception:
+            return None
+
     async def _extract_like_user_profile(
         self,
         user_url: str,
@@ -579,6 +600,17 @@ class InstagramScraper:
                 },
             }
 
+            if db:
+                profile_payload = {
+                    "username": username,
+                    "bio": None,
+                    "is_private": False,
+                    "follower_count": None,
+                    "verified": False,
+                }
+                profile_db = await self._save_profile(db, profile_url, profile_payload)
+                await self._save_posts_and_interactions(db, profile_db.id, extracted_posts, [])
+
             logger.info(
                 "✅ Fluxo recent_likes concluído: posts=%s recentes=%s curtidores=%s",
                 len(extracted_posts),
@@ -821,7 +853,7 @@ class InstagramScraper:
                         caption=post_data.get("caption"),
                         like_count=post_data.get("like_count", 0),
                         comment_count=post_data.get("comment_count", 0),
-                        posted_at=post_data.get("posted_at"),
+                        posted_at=self._coerce_posted_at_datetime(post_data.get("posted_at")),
                     )
                     db.add(post)
                     db.flush()

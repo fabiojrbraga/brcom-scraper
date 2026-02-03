@@ -7,6 +7,7 @@ import logging
 from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -198,7 +199,8 @@ async def get_scraping_results(
             )
 
         metadata = job.metadata_json or {}
-        flow = metadata.get("flow")
+        request_payload = metadata.get("request", {}) if isinstance(metadata.get("request"), dict) else {}
+        flow = metadata.get("flow") or request_payload.get("flow")
         flow_result = metadata.get("result")
 
         if flow == "recent_likes" and isinstance(flow_result, dict):
@@ -553,11 +555,13 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
 
         job.posts_scraped = total_posts
         job.interactions_scraped = total_interactions
-        metadata = job.metadata_json or {}
+        base_metadata = job.metadata_json if isinstance(job.metadata_json, dict) else {}
+        metadata = dict(base_metadata)
         metadata["flow"] = flow
-        metadata["options"] = opts
+        metadata["options"] = dict(opts)
         metadata["result"] = result
         job.metadata_json = metadata
+        flag_modified(job, "metadata_json")
         db.commit()
 
         logger.info(f"✅ Job concluído: {job_id}")
