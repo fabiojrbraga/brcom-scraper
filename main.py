@@ -4,13 +4,17 @@ Ponto de entrada da aplicação Instagram Scraper.
 """
 
 import logging
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.openapi.utils import get_openapi
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 from config import settings
 from app.database import init_db, health_check
 from app.api.routes import router
+from app.api.auth import require_private_api_key
 from app.scraper.instagram_scraper import instagram_scraper
 
 logger = logging.getLogger(__name__)
@@ -52,6 +56,9 @@ app = FastAPI(
     description="API para raspagem de dados do Instagram usando IA e Browser Automation",
     version="1.0.0",
     lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 
@@ -68,7 +75,32 @@ app.add_middleware(
 
 # ==================== Routes ====================
 
-app.include_router(router)
+app.include_router(
+    router,
+    dependencies=[Depends(require_private_api_key)],
+)
+
+
+# ==================== Protected Docs ====================
+
+@app.get("/openapi.json", include_in_schema=False, dependencies=[Depends(require_private_api_key)])
+async def openapi_json():
+    return JSONResponse(
+        get_openapi(
+            title=app.title,
+            version=app.version,
+            description=app.description,
+            routes=app.routes,
+        )
+    )
+
+
+@app.get("/docs", include_in_schema=False, dependencies=[Depends(require_private_api_key)])
+async def swagger_ui():
+    return get_swagger_ui_html(
+        openapi_url="/openapi.json",
+        title=f"{app.title} - Docs",
+    )
 
 
 # ==================== Root ====================

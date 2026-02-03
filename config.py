@@ -51,6 +51,12 @@ class Settings(BaseSettings):
     max_retries: int = 3
     request_timeout: int = 30
 
+    # API Authentication
+    api_keys: Optional[str] = None  # comma-separated list
+    api_key: Optional[str] = None   # backward-compatible single key
+    api_auth_header_name: str = "X-API-Key"
+    api_auth_public_paths: str = "/api/health"
+
     class Config:
         env_file = ".env"
         case_sensitive = False
