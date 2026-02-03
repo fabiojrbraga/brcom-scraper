@@ -26,6 +26,7 @@ class Profile(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     instagram_username = Column(String(255), unique=True, nullable=False, index=True)
+    full_name = Column(String(255), nullable=True, index=True)
     instagram_url = Column(String(500), nullable=False)
     bio = Column(Text, nullable=True)
     is_private = Column(Boolean, default=False)
@@ -45,6 +46,7 @@ class Profile(Base):
 
     def __repr__(self):
         return f"<Profile(username={self.instagram_username}, private={self.is_private})>"
+
 
 
 class Post(Base):

@@ -518,6 +518,20 @@ class BrowserUseAgent:
                 return obj
         return None
 
+    def _extract_first_json_value(self, text: str) -> Optional[Any]:
+        if not text:
+            return None
+        decoder = json.JSONDecoder()
+        for idx, char in enumerate(text):
+            if char not in ("{", "["):
+                continue
+            try:
+                obj, _ = decoder.raw_decode(text[idx:])
+            except Exception:
+                continue
+            return obj
+        return None
+
     async def _send_cdp_command(
         self,
         browser_session: BrowserSession,
@@ -1355,6 +1369,7 @@ class BrowserUseAgent:
                     FORMATO (JSON puro):
                     {{
                       "username": "string ou null",
+                      "full_name": "string ou null",
                       "bio": "string ou null",
                       "is_private": true/false,
                       "follower_count": número inteiro ou null,
@@ -1447,6 +1462,80 @@ class BrowserUseAgent:
             return {"error": "all_retries_failed"}
         finally:
             self._cleanup_storage_state_temp_file(storage_state_file)
+
+    async def generic_scrape(
+        self,
+        url: str,
+        prompt: str,
+    ) -> Dict[str, Any]:
+        """
+        Scraping generico de qualquer site usando Browser Use + Browserless.
+        """
+        max_retries = getattr(settings, "browser_use_max_retries", 3)
+        retry_delay = 3
+
+        for attempt in range(1, max_retries + 1):
+            browser_session = None
+            restore_event_bus = None
+            try:
+                cdp_url = await self._resolve_browserless_cdp_url()
+                browser_session = self._create_browser_session(cdp_url)
+                llm = ChatOpenAI(model=self.model, api_key=self.api_key)
+
+                task = f"""
+                Voce e um agente de scraping generico.
+
+                URL alvo:
+                - {url}
+
+                Instrucoes do usuario (seguir literalmente):
+                {prompt}
+
+                Regras:
+                - Use apenas a aba atual.
+                - Nao invente dados.
+                - Se algo falhar, retorne um JSON com campo "error".
+                - Retorne no final APENAS o formato pedido pelo usuario.
+                """
+
+                agent = self._create_agent(
+                    task=task,
+                    llm=llm,
+                    browser_session=browser_session,
+                )
+
+                restore_event_bus = self._patch_event_bus_for_stop(browser_session)
+                history = await agent.run()
+                final_result = history.final_result() or ""
+
+                if (not history.is_successful()) and self._contains_protocol_error(final_result) and attempt < max_retries:
+                    await asyncio.sleep(retry_delay * attempt)
+                    continue
+
+                parsed = self._extract_first_json_value(final_result)
+                return {
+                    "status": "success",
+                    "url": url,
+                    "data": parsed,
+                    "raw_result": final_result,
+                    "error": None,
+                }
+            except Exception as exc:
+                if attempt < max_retries:
+                    await asyncio.sleep(retry_delay * attempt)
+                    continue
+                return {
+                    "status": "failed",
+                    "url": url,
+                    "data": None,
+                    "raw_result": None,
+                    "error": str(exc),
+                }
+            finally:
+                if callable(restore_event_bus):
+                    restore_event_bus()
+                if browser_session:
+                    await self._detach_browser_session(browser_session)
 
     async def scroll_and_load_more(
         self,

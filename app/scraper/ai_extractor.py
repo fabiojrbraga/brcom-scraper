@@ -52,16 +52,18 @@ class AIExtractor:
                             "text": """Analise esta página de perfil do Instagram e extraia:
                             
                             1. Username
-                            2. Bio (texto completo)
-                            3. Se é conta privada ou pública
-                            4. Número de seguidores (se visível)
-                            5. Número de seguindo (se visível)
-                            6. Número de posts (se visível)
-                            7. Se tem verificação azul
+                            2. Nome completo (full name, se visível)
+                            3. Bio (texto completo)
+                            4. Se é conta privada ou pública
+                            5. Número de seguidores (se visível)
+                            6. Número de seguindo (se visível)
+                            7. Número de posts (se visível)
+                            8. Se tem verificação azul
                             
                             Retorne APENAS um JSON válido com esta estrutura:
                             {
                                 "username": "string",
+                                "full_name": "string ou null",
                                 "bio": "string ou null",
                                 "is_private": boolean,
                                 "follower_count": number ou null,
@@ -104,6 +106,10 @@ class AIExtractor:
             # Extrair JSON da resposta
             response_text = response.choices[0].message.content
             profile_data = json.loads(response_text)
+
+            if isinstance(profile_data, dict):
+                if profile_data.get("full_name") is None:
+                    profile_data["full_name"] = profile_data.get("name")
 
             logger.info(f"✅ Informações do perfil extraídas: {profile_data.get('username')}")
             return profile_data

@@ -188,6 +188,14 @@ class InstagramScraper:
         elif username_hint:
             extracted["username"] = username_hint
 
+        full_name_match = re.search(r'"full_name":"((?:\\.|[^"])*)"', text)
+        if full_name_match:
+            raw_full_name = full_name_match.group(1)
+            try:
+                extracted["full_name"] = json.loads(f'"{raw_full_name}"')
+            except Exception:
+                extracted["full_name"] = raw_full_name.replace('\\"', '"').replace("\\n", "\n")
+
         bio_match = re.search(r'"biography":"((?:\\.|[^"])*)"', text)
         if bio_match:
             raw_bio = bio_match.group(1)
@@ -225,9 +233,23 @@ class InstagramScraper:
                     if bio_desc_match:
                         extracted["bio"] = bio_desc_match.group(1).strip()
 
+        if extracted.get("full_name") is None:
+            og_title_match = re.search(
+                r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+                text,
+                flags=re.IGNORECASE,
+            )
+            if og_title_match:
+                og_title = html_lib.unescape(og_title_match.group(1)).strip()
+                full_name = re.sub(r"\s*\(@[^)]+\).*", "", og_title).strip()
+                if full_name and full_name.lower() != "instagram":
+                    extracted["full_name"] = full_name
+
         # limpeza
         if isinstance(extracted.get("bio"), str):
             extracted["bio"] = extracted["bio"].strip() or None
+        if isinstance(extracted.get("full_name"), str):
+            extracted["full_name"] = extracted["full_name"].strip() or None
 
         return extracted
 
@@ -521,6 +543,7 @@ class InstagramScraper:
                 "flow": "default",
                 "profile": {
                     "username": profile_result.get("username") or username,
+                    "full_name": profile_result.get("full_name"),
                     "profile_url": profile_url,
                     "bio": profile_result.get("bio"),
                     "is_private": bool(profile_result.get("is_private", False)),
@@ -572,6 +595,7 @@ class InstagramScraper:
                     )
                     return {
                         "username": cached.instagram_username,
+                        "full_name": cached.full_name,
                         "profile_url": cached.instagram_url,
                         "bio": cached.bio,
                         "is_private": bool(cached.is_private),
@@ -659,6 +683,7 @@ class InstagramScraper:
 
             normalized = {
                 "username": (profile_info.get("username") or username_fallback).strip().lstrip("@").lower(),
+                "full_name": (str(profile_info.get("full_name")).strip() if profile_info.get("full_name") is not None else None),
                 "profile_url": profile_url,
                 "bio": profile_info.get("bio"),
                 "is_private": bool(profile_info.get("is_private", False)),
@@ -979,9 +1004,12 @@ class InstagramScraper:
                 | (Profile.instagram_url == normalized_profile_url)
             ).first()
 
+            full_name = profile_info.get("full_name")
+
             if existing:
                 existing.instagram_username = username
                 existing.instagram_url = normalized_profile_url
+                existing.full_name = full_name
                 existing.bio = profile_info.get("bio")
                 existing.is_private = profile_info.get("is_private", False)
                 existing.follower_count = profile_info.get("follower_count")
@@ -995,6 +1023,7 @@ class InstagramScraper:
 
             profile = Profile(
                 instagram_username=username,
+                full_name=full_name,
                 instagram_url=normalized_profile_url,
                 bio=profile_info.get("bio"),
                 is_private=profile_info.get("is_private", False),

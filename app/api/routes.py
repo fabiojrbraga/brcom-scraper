@@ -20,6 +20,9 @@ from app.schemas import (
     ScrapingCompleteResponse,
     ProfileScrapeRequest,
     ProfileScrapeResponse,
+    GenericScrapeRequest,
+    GenericScrapeResponse,
+    GenericScrapeJobResultResponse,
     ProfileResponse,
     PostResponse,
     InteractionResponse,
@@ -27,6 +30,7 @@ from app.schemas import (
 )
 from app.models import Profile, Post, Interaction, ScrapingJob
 from app.scraper.instagram_scraper import instagram_scraper
+from app.scraper.browser_use_agent import browser_use_agent
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -220,6 +224,7 @@ async def get_scraping_results(
                 flow="recent_likes",
                 profile={
                     "username": profile_payload.get("username") or "",
+                    "full_name": profile_payload.get("full_name"),
                     "profile_url": profile_payload.get("profile_url") or job.profile_url,
                     "bio": profile_payload.get("bio"),
                     "is_private": bool(profile_payload.get("is_private", False)),
@@ -274,6 +279,7 @@ async def get_scraping_results(
                 flow=flow or "default",
                 profile={
                     "username": profile_payload.get("username") or _extract_instagram_username(job.profile_url),
+                    "full_name": profile_payload.get("full_name"),
                     "profile_url": profile_payload.get("profile_url") or _normalize_profile_url(job.profile_url),
                     "bio": profile_payload.get("bio"),
                     "is_private": bool(profile_payload.get("is_private", False)),
@@ -308,6 +314,7 @@ async def get_scraping_results(
                 flow=flow or "default",
                 profile={
                     "username": _extract_instagram_username(job.profile_url),
+                    "full_name": None,
                     "profile_url": _normalize_profile_url(job.profile_url),
                     "bio": None,
                     "is_private": False,
@@ -334,6 +341,7 @@ async def get_scraping_results(
             flow="default",
             profile={
                 "username": profile.instagram_username,
+                "full_name": profile.full_name,
                 "profile_url": profile.instagram_url,
                 "bio": profile.bio,
                 "is_private": profile.is_private,
@@ -413,6 +421,121 @@ async def scrape_profile_info_get_not_allowed():
         status_code=405,
         detail="Use POST /api/profiles/scrape com body JSON (profile_url).",
     )
+
+
+@router.post("/generic_scrape", response_model=ScrapingJobResponse)
+async def generic_scrape(
+    request: GenericScrapeRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """
+    Scraping generico de qualquer site via Browser Use em Browserless.
+    """
+    try:
+        target_url = (request.url or "").strip()
+        instruction_prompt = (request.prompt or "").strip()
+        if not target_url:
+            raise HTTPException(status_code=400, detail="Campo 'url' e obrigatorio.")
+        if not instruction_prompt:
+            raise HTTPException(status_code=400, detail="Campo 'prompt' e obrigatorio.")
+
+        logger.info("🌐 Requisicao generic_scrape recebida: %s", target_url)
+
+        request_payload = request.model_dump(mode="json", exclude_unset=True)
+        request_payload["url"] = target_url
+
+        job = ScrapingJob(
+            profile_url=target_url,
+            status="pending",
+            metadata_json={
+                "flow": "generic",
+                "request": request_payload,
+            },
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        background_tasks.add_task(
+            _generic_scrape_background,
+            job.id,
+            target_url,
+            instruction_prompt,
+            bool(request.test_mode),
+            int(request.test_duration_seconds),
+        )
+
+        return ScrapingJobResponse(
+            id=job.id,
+            profile_url=job.profile_url,
+            status=job.status,
+            created_at=job.created_at,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("❌ Erro no generic_scrape para %s: %s", request.url, e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/generic_scrape/{job_id}", response_model=ScrapingJobResponse)
+async def get_generic_scrape_status(job_id: str, db: Session = Depends(get_db)):
+    try:
+        job = db.query(ScrapingJob).filter(ScrapingJob.id == job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job não encontrado")
+
+        return ScrapingJobResponse(
+            id=job.id,
+            profile_url=job.profile_url,
+            status=job.status,
+            started_at=job.started_at,
+            completed_at=job.completed_at,
+            error_message=job.error_message,
+            posts_scraped=job.posts_scraped,
+            interactions_scraped=job.interactions_scraped,
+            created_at=job.created_at,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("❌ Erro ao obter status do generic_scrape: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/generic_scrape/{job_id}/results", response_model=GenericScrapeJobResultResponse)
+async def get_generic_scrape_results(job_id: str, db: Session = Depends(get_db)):
+    try:
+        job = db.query(ScrapingJob).filter(ScrapingJob.id == job_id).first()
+        if not job:
+            raise HTTPException(status_code=404, detail="Job não encontrado")
+
+        if job.status not in ("completed", "failed"):
+            return JSONResponse(
+                status_code=200,
+                content={"detail": f"Job ainda não foi concluído. Status: {job.status}"},
+            )
+
+        metadata = job.metadata_json if isinstance(job.metadata_json, dict) else {}
+        request_payload = metadata.get("request") if isinstance(metadata.get("request"), dict) else {}
+        result_payload = metadata.get("result") if isinstance(metadata.get("result"), dict) else {}
+
+        return GenericScrapeJobResultResponse(
+            job_id=job.id,
+            status=job.status,
+            url=str(request_payload.get("url") or job.profile_url),
+            prompt=str(request_payload.get("prompt") or ""),
+            data=result_payload.get("data"),
+            raw_result=result_payload.get("raw_result"),
+            error_message=job.error_message or result_payload.get("error"),
+            completed_at=job.completed_at,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("❌ Erro ao obter resultado do generic_scrape: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/profiles/{username}", response_model=ProfileResponse)
@@ -723,6 +846,79 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
                 job.completed_at = datetime.utcnow()
                 db.commit()
 
+    finally:
+        if db:
+            db.close()
+
+
+async def _generic_scrape_background(
+    job_id: str,
+    target_url: str,
+    prompt: str,
+    test_mode: bool = False,
+    test_duration_seconds: int = 120,
+):
+    """
+    Executa generic scrape em background.
+    """
+    db = None
+    try:
+        db = next(get_db())
+        job = db.query(ScrapingJob).filter(ScrapingJob.id == job_id).first()
+        if not job:
+            logger.error("Job generic_scrape nao encontrado: %s", job_id)
+            return
+
+        job.status = "running"
+        job.started_at = datetime.utcnow()
+        db.commit()
+
+        if test_mode:
+            await asyncio.sleep(test_duration_seconds)
+            result = {
+                "status": "success",
+                "url": target_url,
+                "data": {
+                    "title": "Dummy Generic Scrape Result",
+                    "note": "Resultado ficticio de teste",
+                },
+                "raw_result": '{"title":"Dummy Generic Scrape Result","note":"Resultado ficticio de teste"}',
+                "error": None,
+            }
+        else:
+            result = await browser_use_agent.generic_scrape(
+                url=target_url,
+                prompt=prompt,
+            )
+
+        base_metadata = job.metadata_json if isinstance(job.metadata_json, dict) else {}
+        metadata = dict(base_metadata)
+        metadata["flow"] = "generic"
+        metadata["result"] = result
+        job.metadata_json = metadata
+        flag_modified(job, "metadata_json")
+
+        if result.get("error"):
+            job.status = "failed"
+            job.error_message = str(result.get("error"))
+        else:
+            job.status = "completed"
+            job.error_message = None
+
+        job.completed_at = datetime.utcnow()
+        job.posts_scraped = 0
+        job.interactions_scraped = 0
+        db.commit()
+        logger.info("✅ Generic scrape job concluido: %s", job_id)
+    except Exception as e:
+        logger.exception("❌ Erro no generic scrape em background: %s", e)
+        if db:
+            job = db.query(ScrapingJob).filter(ScrapingJob.id == job_id).first()
+            if job:
+                job.status = "failed"
+                job.error_message = str(e)
+                job.completed_at = datetime.utcnow()
+                db.commit()
     finally:
         if db:
             db.close()

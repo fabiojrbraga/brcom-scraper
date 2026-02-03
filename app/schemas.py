@@ -21,6 +21,7 @@ class InteractionTypeSchema(str, Enum):
 class ProfileBase(BaseModel):
     """Schema base para perfil."""
     instagram_username: str
+    full_name: Optional[str] = None
     instagram_url: str
     bio: Optional[str] = None
     is_private: bool = False
@@ -69,6 +70,7 @@ class ProfileScrapeRequest(BaseModel):
 class ProfileScrapeResponse(BaseModel):
     """Schema de resposta do scraping direto de perfil."""
     username: str
+    full_name: Optional[str] = None
     profile_url: str
     bio: Optional[str] = None
     is_private: bool = False
@@ -80,6 +82,46 @@ class ProfileScrapeResponse(BaseModel):
     profile_id: Optional[str] = None
     last_scraped_at: Optional[datetime] = None
     extracted_at: datetime
+
+
+# ==================== Generic Scrape Schemas ====================
+
+class GenericScrapeRequest(BaseModel):
+    """Schema para scraping generico de qualquer pagina web."""
+    url: str = Field(..., description="URL da pagina a ser raspada")
+    prompt: str = Field(..., description="Instrucoes de scraping e formato de retorno")
+    test_mode: bool = Field(
+        default=False,
+        description="Se true, nao executa scraping real; simula um job assincrono",
+    )
+    test_duration_seconds: int = Field(
+        default=120,
+        ge=1,
+        le=1800,
+        description="Duracao da simulacao em segundos quando test_mode=true",
+    )
+
+
+class GenericScrapeResponse(BaseModel):
+    """Resposta de scraping generico via Browser Use."""
+    status: str = "success"
+    url: str
+    data: Optional[Any] = None
+    raw_result: Optional[str] = None
+    error: Optional[str] = None
+    scraped_at: datetime
+
+
+class GenericScrapeJobResultResponse(BaseModel):
+    """Resultado completo de um job de generic scrape."""
+    job_id: str
+    status: str
+    url: str
+    prompt: str
+    data: Optional[Any] = None
+    raw_result: Optional[str] = None
+    error_message: Optional[str] = None
+    completed_at: Optional[datetime] = None
 
 
 # ==================== Post Schemas ====================
@@ -234,6 +276,7 @@ class ScrapingRecentPostResult(BaseModel):
 class ScrapingResultProfile(BaseModel):
     """Resultado completo de scraping de um perfil."""
     username: str
+    full_name: Optional[str] = None
     profile_url: str
     bio: Optional[str] = None
     is_private: bool = False

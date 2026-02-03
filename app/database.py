@@ -2,7 +2,7 @@
 Configuração de conexão com o banco de dados PostgreSQL.
 """
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import NullPool
 from config import settings
@@ -48,10 +48,35 @@ def init_db():
     
     try:
         Base.metadata.create_all(bind=engine)
+        _ensure_profiles_full_name_column()
         logger.info("✅ Banco de dados inicializado com sucesso")
     except Exception as e:
         logger.error(f"❌ Erro ao inicializar banco de dados: {e}")
         raise
+
+
+def _ensure_profiles_full_name_column() -> None:
+    """
+    Garante coluna full_name na tabela profiles para bases antigas.
+    """
+    try:
+        inspector = inspect(engine)
+        if "profiles" not in inspector.get_table_names():
+            return
+
+        column_names = {col["name"] for col in inspector.get_columns("profiles")}
+        if "full_name" in column_names:
+            return
+
+        dialect = engine.dialect.name
+        with engine.begin() as conn:
+            if dialect == "postgresql":
+                conn.execute(text("ALTER TABLE profiles ADD COLUMN IF NOT EXISTS full_name VARCHAR(255)"))
+            else:
+                conn.execute(text("ALTER TABLE profiles ADD COLUMN full_name VARCHAR(255)"))
+        logger.info("✅ Coluna profiles.full_name criada com sucesso")
+    except Exception as e:
+        logger.warning("⚠️ Não foi possível garantir coluna profiles.full_name: %s", e)
 
 
 def drop_db():
