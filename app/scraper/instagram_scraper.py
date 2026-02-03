@@ -307,24 +307,24 @@ class InstagramScraper:
         except Exception:
             pass
 
-        number_match = re.search(r"(\d+)", text)
-        value = int(number_match.group(1)) if number_match else None
-
-        minute_tokens = ("min", "minute", "minutes", "minuto", "minutos", "m")
-        hour_tokens = ("hour", "hours", "hora", "horas", "h")
-        day_tokens = ("day", "days", "dia", "dias", "d")
-        week_tokens = ("week", "weeks", "semana", "semanas", "w")
-
-        if any(token in text for token in minute_tokens):
+        if text in {"today", "hoje"}:
             return True
-        if any(token in text for token in hour_tokens):
-            if value is None:
-                return False
-            return value <= recent_hours
-        if any(token in text for token in day_tokens):
-            return False
-        if any(token in text for token in week_tokens):
-            return False
+        if text in {"yesterday", "ontem"}:
+            return recent_hours >= 24
+
+        relative_patterns = [
+            (r"(\d+)\s*(?:m|min|mins|minute|minutes|minuto|minutos)\b", 1 / 60),
+            (r"(\d+)\s*(?:h|hr|hrs|hour|hours|hora|horas)\b", 1),
+            (r"(\d+)\s*(?:d|day|days|dia|dias)\b", 24),
+            (r"(\d+)\s*(?:w|week|weeks|semana|semanas)\b", 24 * 7),
+        ]
+
+        for pattern, hour_multiplier in relative_patterns:
+            match = re.search(pattern, text)
+            if not match:
+                continue
+            value = int(match.group(1))
+            return (value * hour_multiplier) <= recent_hours
 
         return False
 
