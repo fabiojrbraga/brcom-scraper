@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     browserless_session_stealth: bool = False
     browserless_session_headless: bool = True
     browserless_reconnect_timeout_ms: int = 60000
+    browserless_max_concurrency: int = 2
+    browserless_request_retries: int = 3
+    browserless_retry_backoff_seconds: float = 1.0
     browser_use_max_retries: int = 3
     browser_use_retry_backoff: int = 2
     browser_use_ws_compression: str = "auto"  # auto | none | deflate

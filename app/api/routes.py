@@ -401,7 +401,8 @@ async def scrape_profile_info(
         return ProfileScrapeResponse(**result)
     except Exception as e:
         logger.error("❌ Erro ao raspar perfil %s: %s", request.profile_url, e)
-        raise HTTPException(status_code=500, detail=str(e))
+        detail = str(e).strip() or repr(e) or "Erro interno ao raspar perfil."
+        raise HTTPException(status_code=500, detail=detail)
 
 @router.get("/profiles/scrape")
 async def scrape_profile_info_get_not_allowed():

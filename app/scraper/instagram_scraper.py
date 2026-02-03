@@ -540,8 +540,31 @@ class InstagramScraper:
             storage_state = await browser_use_agent.ensure_instagram_session(db) if db else None
             cookies = browser_use_agent.get_cookies(storage_state)
 
-            profile_screenshot = await self.browserless.screenshot(profile_url, cookies=cookies)
-            profile_html = await self.browserless.get_html(profile_url, cookies=cookies)
+            profile_screenshot: Optional[str] = None
+            profile_html: Optional[str] = None
+            screenshot_error: Optional[str] = None
+            html_error: Optional[str] = None
+
+            try:
+                profile_screenshot = await self.browserless.screenshot(profile_url, cookies=cookies)
+            except Exception as exc:
+                screenshot_error = str(exc)
+                logger.warning("⚠️ Falha ao capturar screenshot do perfil %s: %s", profile_url, exc)
+
+            try:
+                profile_html = await self.browserless.get_html(profile_url, cookies=cookies)
+            except Exception as exc:
+                html_error = str(exc)
+                logger.warning("⚠️ Falha ao obter HTML do perfil %s: %s", profile_url, exc)
+
+            if not profile_screenshot and not profile_html:
+                details = " ; ".join(
+                    item for item in [screenshot_error, html_error] if item
+                )
+                raise RuntimeError(
+                    f"Falha ao obter dados do Browserless para {profile_url}. {details}".strip()
+                )
+
             profile_info = await self.ai_extractor.extract_profile_info(
                 screenshot_base64=profile_screenshot,
                 html_content=profile_html,
