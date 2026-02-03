@@ -405,14 +405,14 @@ async def get_profile(
     db: Session = Depends(get_db),
 ):
     """
-    Obtém informações de um perfil.
+    Obtem informacoes de um perfil.
 
     Args:
         username: Username do perfil
-        db: Sessão do banco de dados
+        db: Sessao do banco de dados
 
     Returns:
-        Informações do perfil
+        Informacoes do perfil
     """
     try:
         profile = db.query(Profile).filter(
@@ -420,14 +420,30 @@ async def get_profile(
         ).first()
 
         if not profile:
-            raise HTTPException(status_code=404, detail="Perfil não encontrado")
+            logger.info(
+                "Perfil %s nao encontrado no banco. Executando scrape sob demanda...",
+                username,
+            )
+            profile_url = _normalize_profile_url(f"https://www.instagram.com/{username}/")
+            await instagram_scraper.scrape_profile_info(
+                profile_url=profile_url,
+                db=db,
+                save_to_db=True,
+                cache_ttl_days=settings.profile_cache_ttl_days,
+            )
+            profile = db.query(Profile).filter(
+                Profile.instagram_username == username
+            ).first()
+
+        if not profile:
+            raise HTTPException(status_code=404, detail="Perfil nao encontrado")
 
         return ProfileResponse.from_orm(profile)
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"❌ Erro ao obter perfil: {e}")
+        logger.error(f"Erro ao obter perfil: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
