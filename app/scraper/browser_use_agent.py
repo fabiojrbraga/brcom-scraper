@@ -20,6 +20,7 @@ import websockets
 from config import settings
 from app.models import InstagramSession, InvestingSession
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 logger = logging.getLogger(__name__)
 
@@ -411,13 +412,16 @@ class BrowserUseAgent:
             allowed = possible_kwargs
         return Agent(**allowed)
 
-    def _get_latest_session(self, db: Session) -> Optional[InstagramSession]:
-        return (
-            db.query(InstagramSession)
-            .filter(InstagramSession.is_active.is_(True))
-            .order_by(InstagramSession.updated_at.desc())
-            .first()
-        )
+    def _get_latest_session(
+        self,
+        db: Session,
+        instagram_username: Optional[str] = None,
+    ) -> Optional[InstagramSession]:
+        query = db.query(InstagramSession).filter(InstagramSession.is_active.is_(True))
+        normalized_username = (instagram_username or "").strip().lstrip("@").lower()
+        if normalized_username:
+            query = query.filter(func.lower(InstagramSession.instagram_username) == normalized_username)
+        return query.order_by(InstagramSession.updated_at.desc()).first()
 
     def _get_latest_investing_session(self, db: Session) -> Optional[InvestingSession]:
         return (
@@ -637,6 +641,20 @@ class BrowserUseAgent:
             return []
         return self._extract_cookies(storage_state)
 
+    def get_user_agent(self, storage_state: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Retorna user-agent persistido junto da sessao (quando disponivel)."""
+        if not isinstance(storage_state, dict):
+            return None
+        meta = storage_state.get("_meta")
+        if isinstance(meta, dict):
+            ua = meta.get("user_agent")
+            if isinstance(ua, str) and ua.strip():
+                return ua.strip()
+        legacy_ua = storage_state.get("_user_agent")
+        if isinstance(legacy_ua, str) and legacy_ua.strip():
+            return legacy_ua.strip()
+        return None
+
     def _build_cookie_jar(self, cookies: List[Dict[str, Any]]) -> httpx.Cookies:
         jar = httpx.Cookies()
         for cookie in cookies:
@@ -757,7 +775,11 @@ class BrowserUseAgent:
             raise last_error
         return {}
 
-    async def ensure_instagram_session(self, db: Session) -> Optional[Dict[str, Any]]:
+    async def ensure_instagram_session(
+        self,
+        db: Session,
+        instagram_username: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Garante uma sess??o autenticada do Instagram salva no banco.
         Retorna storage_state quando dispon??vel.
@@ -766,7 +788,8 @@ class BrowserUseAgent:
             logger.warning("?????? Sess??o de banco n??o fornecida; login n??o ser?? persistido.")
             return None
 
-        existing = self._get_latest_session(db)
+        normalized_username = (instagram_username or "").strip().lstrip("@").lower()
+        existing = self._get_latest_session(db, instagram_username=normalized_username or None)
         if existing and existing.storage_state:
             if not settings.instagram_session_strict_validation:
                 self._touch_session(db, existing)
@@ -793,6 +816,16 @@ class BrowserUseAgent:
             existing.is_active = False
             db.commit()
             logger.info("Sessao do Instagram expirada; realizando novo login.")
+
+        configured_username = (settings.instagram_username or "").strip().lstrip("@").lower()
+        if normalized_username and configured_username and normalized_username != configured_username:
+            logger.warning(
+                "Sessao solicitada para @%s, mas INSTAGRAM_USERNAME configurado e @%s. "
+                "Login automatico sera ignorado para evitar usar conta errada.",
+                normalized_username,
+                configured_username,
+            )
+            return None
 
         if not settings.instagram_username or not settings.instagram_password:
             logger.warning(
@@ -916,15 +949,18 @@ class BrowserUseAgent:
             if session_info:
                 storage_state["_browserless_session"] = session_info
 
-            # Mantem apenas a sessao mais recente ativa para evitar ambiguidades de reuso.
-            (
-                db.query(InstagramSession)
-                .filter(InstagramSession.is_active.is_(True))
-                .update({InstagramSession.is_active: False}, synchronize_session=False)
-            )
+            configured_username = (settings.instagram_username or "").strip().lstrip("@").lower()
+            deactivate_query = db.query(InstagramSession).filter(InstagramSession.is_active.is_(True))
+            if configured_username:
+                deactivate_query = deactivate_query.filter(
+                    func.lower(InstagramSession.instagram_username) == configured_username
+                )
+            else:
+                deactivate_query = deactivate_query.filter(InstagramSession.instagram_username.is_(None))
+            deactivate_query.update({InstagramSession.is_active: False}, synchronize_session=False)
 
             session = InstagramSession(
-                instagram_username=settings.instagram_username,
+                instagram_username=configured_username or None,
                 storage_state=storage_state,
                 last_used_at=datetime.utcnow(),
                 is_active=True,

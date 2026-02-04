@@ -42,6 +42,18 @@ def _load_json_file(path: Path) -> dict[str, Any]:
     return data
 
 
+def _extract_user_agent(raw_state: dict[str, Any]) -> str | None:
+    meta = raw_state.get("_meta")
+    if isinstance(meta, dict):
+        user_agent = meta.get("user_agent")
+        if isinstance(user_agent, str) and user_agent.strip():
+            return user_agent.strip()
+    legacy_user_agent = raw_state.get("_user_agent")
+    if isinstance(legacy_user_agent, str) and legacy_user_agent.strip():
+        return legacy_user_agent.strip()
+    return None
+
+
 async def _validate_state(agent: Any, clean_state: dict[str, Any], skip_validation: bool) -> int:
     cookies = agent.get_cookies(clean_state)
     if not cookies:
@@ -66,11 +78,12 @@ def _persist_session(
 ) -> tuple[str, int]:
     db = session_factory()
     try:
-        deactivated = (
-            db.query(session_model)
-            .filter(session_model.is_active.is_(True))
-            .update({session_model.is_active: False}, synchronize_session=False)
-        )
+        deactivate_query = db.query(session_model).filter(session_model.is_active.is_(True))
+        if username:
+            deactivate_query = deactivate_query.filter(session_model.instagram_username == username)
+        else:
+            deactivate_query = deactivate_query.filter(session_model.instagram_username.is_(None))
+        deactivated = deactivate_query.update({session_model.is_active: False}, synchronize_session=False)
 
         session = session_model(
             instagram_username=username,
@@ -92,9 +105,12 @@ async def _run(args: argparse.Namespace) -> None:
     clean_state = agent._sanitize_storage_state(raw_state)
     if not isinstance(clean_state, dict):
         raise RuntimeError("storage_state invalido. Esperado JSON com cookies/origins.")
+    user_agent = _extract_user_agent(raw_state)
+    if user_agent:
+        clean_state["_meta"] = {"user_agent": user_agent}
 
     cookie_count = await _validate_state(agent, clean_state, args.skip_validation)
-    username = args.username.strip() if args.username else None
+    username = args.username.strip().lstrip("@").lower() if args.username else None
     session_id, deactivated = _persist_session(
         session_factory,
         session_model,
@@ -104,6 +120,8 @@ async def _run(args: argparse.Namespace) -> None:
 
     print(f"[ok] Sessao importada. session_id={session_id}")
     print(f"[ok] Cookies no storage_state: {cookie_count}")
+    if user_agent:
+        print(f"[ok] User-Agent preservado: {user_agent[:120]}")
     print(f"[ok] Sessoes antigas desativadas: {deactivated}")
 
 

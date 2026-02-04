@@ -120,6 +120,7 @@ class BrowserlessClient:
         wait_for: Optional[str] = None,
         timeout: int = 30000,
         cookies: Optional[list[dict]] = None,
+        user_agent: Optional[str] = None,
     ) -> str:
         """
         Captura screenshot de uma URL.
@@ -144,12 +145,14 @@ class BrowserlessClient:
                 payload["waitFor"] = wait_for
             if cookies:
                 payload["cookies"] = cookies
+            if user_agent:
+                payload["userAgent"] = user_agent
 
             response = await self._post_with_retry(
                 endpoint="/screenshot",
                 payload=payload,
                 url_for_log=url,
-                fallback_fields=["fullPage", "timeout", "cookies"],
+                fallback_fields=["fullPage", "timeout", "cookies", "userAgent"],
             )
 
             # Alguns Browserless retornam JSON com base64, outros retornam bytes da imagem.
@@ -171,6 +174,7 @@ class BrowserlessClient:
         wait_for: Optional[str] = None,
         timeout: int = 30000,
         cookies: Optional[list[dict]] = None,
+        user_agent: Optional[str] = None,
     ) -> str:
         """
         Obtém HTML de uma URL.
@@ -193,12 +197,14 @@ class BrowserlessClient:
                 payload["waitFor"] = wait_for
             if cookies:
                 payload["cookies"] = cookies
+            if user_agent:
+                payload["userAgent"] = user_agent
 
             response = await self._post_with_retry(
                 endpoint="/content",
                 payload=payload,
                 url_for_log=url,
-                fallback_fields=["timeout", "cookies"],
+                fallback_fields=["timeout", "cookies", "userAgent"],
             )
 
             content_type = response.headers.get("content-type", "").lower()

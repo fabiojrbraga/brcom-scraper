@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -78,9 +79,21 @@ async def _capture(mode: str, output: Path) -> None:
         input("Quando terminar e estiver logado, pressione ENTER para salvar a sessao...")
 
         storage_state = await context.storage_state()
+        user_agent = ""
+        try:
+            user_agent = str(await page.evaluate("() => navigator.userAgent")).strip()
+        except Exception:
+            user_agent = ""
+
+        payload = dict(storage_state)
+        payload["_meta"] = {
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "capture_mode": mode,
+            "user_agent": user_agent or None,
+        }
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(
-            json.dumps(storage_state, ensure_ascii=False, indent=2),
+            json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         print(f"[ok] Storage state salvo em: {output}")

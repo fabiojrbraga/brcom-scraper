@@ -308,6 +308,7 @@ class InstagramScraper:
         max_posts: int,
         cookies: Optional[list[dict]] = None,
         profile_html: Optional[str] = None,
+        user_agent: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Fallback sem Browser Use:
@@ -315,7 +316,11 @@ class InstagramScraper:
         - abre cada post diretamente e usa IA para extrair campos.
         """
         try:
-            html = profile_html or await self.browserless.get_html(profile_url, cookies=cookies)
+            html = profile_html or await self.browserless.get_html(
+                profile_url,
+                cookies=cookies,
+                user_agent=user_agent,
+            )
             post_urls = self._extract_post_urls_from_html(html, max_posts=max_posts)
             if not post_urls:
                 return []
@@ -325,11 +330,19 @@ class InstagramScraper:
                 screenshot_base64: Optional[str] = None
                 post_html: Optional[str] = None
                 try:
-                    screenshot_base64 = await self.browserless.screenshot(post_url, cookies=cookies)
+                    screenshot_base64 = await self.browserless.screenshot(
+                        post_url,
+                        cookies=cookies,
+                        user_agent=user_agent,
+                    )
                 except Exception as exc:
                     logger.warning("⚠️ Falha ao capturar screenshot do post %s: %s", post_url, exc)
                 try:
-                    post_html = await self.browserless.get_html(post_url, cookies=cookies)
+                    post_html = await self.browserless.get_html(
+                        post_url,
+                        cookies=cookies,
+                        user_agent=user_agent,
+                    )
                 except Exception as exc:
                     logger.warning("⚠️ Falha ao obter HTML do post %s: %s", post_url, exc)
 
@@ -455,14 +468,23 @@ class InstagramScraper:
         self,
         user_url: str,
         cookies: Optional[list[dict]] = None,
+        user_agent: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Captura screenshot + HTML e aplica IA para extrair dados do perfil curtidor.
         """
         username = self._extract_username_from_url(user_url)
         try:
-            screenshot = await self.browserless.screenshot(user_url, cookies=cookies)
-            html = await self.browserless.get_html(user_url, cookies=cookies)
+            screenshot = await self.browserless.screenshot(
+                user_url,
+                cookies=cookies,
+                user_agent=user_agent,
+            )
+            html = await self.browserless.get_html(
+                user_url,
+                cookies=cookies,
+                user_agent=user_agent,
+            )
             extracted = await self.ai_extractor.extract_user_info(
                 screenshot_base64=screenshot,
                 html_content=html,
@@ -490,6 +512,7 @@ class InstagramScraper:
         profile_url: str,
         max_posts: int = 5,
         db: Optional[Session] = None,
+        session_username: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Raspa um perfil completo do Instagram.
@@ -503,14 +526,27 @@ class InstagramScraper:
                 profile_url = f"{profile_url}/"
 
             username = self._extract_username_from_url(profile_url)
-            storage_state = await browser_use_agent.ensure_instagram_session(db) if db else None
+            storage_state = (
+                await browser_use_agent.ensure_instagram_session(
+                    db,
+                    instagram_username=session_username,
+                )
+                if db
+                else None
+            )
+            if session_username and not storage_state:
+                raise RuntimeError(
+                    f"Sessao Instagram '@{session_username}' nao encontrada ou invalida."
+                )
             cookies = browser_use_agent.get_cookies(storage_state)
+            user_agent = browser_use_agent.get_user_agent(storage_state)
 
             profile_result = await self.scrape_profile_info(
                 profile_url=profile_url,
                 db=db,
                 save_to_db=True,
                 cache_ttl_days=0,
+                session_username=session_username,
             )
 
             posts_data = await self._scrape_posts(
@@ -518,6 +554,7 @@ class InstagramScraper:
                 max_posts=max_posts,
                 cookies=cookies,
                 storage_state=storage_state,
+                user_agent=user_agent,
             )
 
             all_interactions: List[Dict[str, Any]] = []
@@ -529,6 +566,7 @@ class InstagramScraper:
                     post_url=post_url,
                     post_data=post_data,
                     cookies=cookies,
+                    user_agent=user_agent,
                 )
                 for interaction in interactions:
                     interaction["_post_url"] = post_url
@@ -568,6 +606,7 @@ class InstagramScraper:
         db: Optional[Session] = None,
         save_to_db: bool = True,
         cache_ttl_days: int = 0,
+        session_username: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Raspa somente os dados do perfil (sem posts/interacoes).
@@ -609,8 +648,20 @@ class InstagramScraper:
                         "extracted_at": datetime.utcnow(),
                     }
 
-            storage_state = await browser_use_agent.ensure_instagram_session(db) if db else None
+            storage_state = (
+                await browser_use_agent.ensure_instagram_session(
+                    db,
+                    instagram_username=session_username,
+                )
+                if db
+                else None
+            )
+            if session_username and not storage_state:
+                raise RuntimeError(
+                    f"Sessao Instagram '@{session_username}' nao encontrada ou invalida."
+                )
             cookies = browser_use_agent.get_cookies(storage_state)
+            user_agent = browser_use_agent.get_user_agent(storage_state)
 
             profile_info: Dict[str, Any] = {}
             browser_use_result: Dict[str, Any] = {}
@@ -638,7 +689,11 @@ class InstagramScraper:
 
             if need_more_data:
                 try:
-                    profile_html = await self.browserless.get_html(profile_url, cookies=cookies)
+                    profile_html = await self.browserless.get_html(
+                        profile_url,
+                        cookies=cookies,
+                        user_agent=user_agent,
+                    )
                     html_info = self._extract_profile_info_from_html(profile_html, username_hint=username_fallback)
                     for key, value in html_info.items():
                         if profile_info.get(key) is None and value is not None:
@@ -653,7 +708,11 @@ class InstagramScraper:
             )
             if still_poor:
                 try:
-                    profile_screenshot = await self.browserless.screenshot(profile_url, cookies=cookies)
+                    profile_screenshot = await self.browserless.screenshot(
+                        profile_url,
+                        cookies=cookies,
+                        user_agent=user_agent,
+                    )
                 except Exception as exc:
                     screenshot_error = str(exc)
                     logger.warning("Falha ao capturar screenshot do perfil %s: %s", profile_url, exc)
@@ -716,6 +775,7 @@ class InstagramScraper:
         max_like_users_per_post: int = 30,
         collect_like_user_profiles: bool = True,
         db: Optional[Session] = None,
+        session_username: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Fluxo avançado:
@@ -734,14 +794,27 @@ class InstagramScraper:
                 profile_url = f"https://instagram.com/{profile_url}"
 
             username = self._extract_username_from_url(profile_url)
-            storage_state = await browser_use_agent.ensure_instagram_session(db) if db else None
+            storage_state = (
+                await browser_use_agent.ensure_instagram_session(
+                    db,
+                    instagram_username=session_username,
+                )
+                if db
+                else None
+            )
+            if session_username and not storage_state:
+                raise RuntimeError(
+                    f"Sessao Instagram '@{session_username}' nao encontrada ou invalida."
+                )
             cookies = browser_use_agent.get_cookies(storage_state)
+            user_agent = browser_use_agent.get_user_agent(storage_state)
 
             posts_data = await self._scrape_posts(
                 profile_url=profile_url,
                 max_posts=max_posts,
                 cookies=cookies,
                 storage_state=storage_state,
+                user_agent=user_agent,
             )
 
             extracted_posts: List[Dict[str, Any]] = []
@@ -847,6 +920,7 @@ class InstagramScraper:
         profile_html: Optional[str] = None,
         cookies: Optional[list[dict]] = None,
         storage_state: Optional[Dict[str, Any]] = None,
+        user_agent: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Raspa posts de um perfil usando Browser Use Agent.
@@ -901,6 +975,7 @@ class InstagramScraper:
                     max_posts=max_posts,
                     cookies=cookies,
                     profile_html=profile_html,
+                    user_agent=user_agent,
                 )
                 if fallback_posts:
                     logger.info("✅ Fallback recuperou %s posts.", len(fallback_posts))
@@ -918,6 +993,7 @@ class InstagramScraper:
                 max_posts=max_posts,
                 cookies=cookies,
                 profile_html=profile_html,
+                user_agent=user_agent,
             )
             if fallback_posts:
                 logger.info("✅ Fallback recuperou %s posts após exceção.", len(fallback_posts))
@@ -929,6 +1005,7 @@ class InstagramScraper:
         post_url: str,
         post_data: Dict[str, Any],
         cookies: Optional[list[dict]] = None,
+        user_agent: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Raspa comentários e interações de um post.
@@ -946,7 +1023,11 @@ class InstagramScraper:
             await asyncio.sleep(self._get_random_delay(2, 5))
 
             # Capturar screenshot dos comentários
-            comments_screenshot = await self.browserless.screenshot(post_url, cookies=cookies)
+            comments_screenshot = await self.browserless.screenshot(
+                post_url,
+                cookies=cookies,
+                user_agent=user_agent,
+            )
 
             # Extrair comentários com IA
             comments = await self.ai_extractor.extract_comments(

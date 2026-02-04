@@ -91,6 +91,27 @@ python scripts/import_instagram_session.py --username seu_usuario
 
 Arquivo gerado: `.secrets/instagram_storage_state.json` (ignorado no git).
 
+Para escolher uma sessao especifica na API, envie `session_username` no body:
+
+```json
+{
+  "profile_url": "https://www.instagram.com/username/",
+  "session_username": "conta_logada"
+}
+```
+
+Endpoints administrativos de sessao:
+
+```bash
+# listar sessoes (ativas por padrao)
+GET /api/instagram_sessions?active_only=true&username=conta_logada
+
+# desativar sessao especifica
+POST /api/instagram_sessions/{session_id}/deactivate
+```
+
+Observacao: o script de captura salva tambem o `user_agent` da sessao e o scraper tenta reutilizar esse valor nos requests Browserless (`userAgent` no payload, com fallback automatico quando nao suportado).
+
 ### Desenvolvimento Local
 
 ```bash

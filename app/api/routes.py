@@ -30,7 +30,7 @@ from app.schemas import (
     InteractionResponse,
     ErrorResponse,
 )
-from app.models import Profile, Post, Interaction, ScrapingJob
+from app.models import Profile, Post, Interaction, ScrapingJob, InstagramSession
 from app.scraper.instagram_scraper import instagram_scraper
 from app.scraper.browser_use_agent import browser_use_agent
 from config import settings
@@ -68,6 +68,11 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _normalize_session_username(username: str | None) -> str | None:
+    normalized = (username or "").strip().lstrip("@").lower()
+    return normalized or None
 
 
 # ==================== Health Check ====================
@@ -407,6 +412,7 @@ async def scrape_profile_info(
             db=db,
             save_to_db=True,
             cache_ttl_days=settings.profile_cache_ttl_days,
+            session_username=request.session_username,
         )
         return ProfileScrapeResponse(**result)
     except Exception as e:
@@ -793,6 +799,95 @@ async def get_profile_interactions(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== Session Endpoints ====================
+
+@router.get("/instagram_sessions")
+async def list_instagram_sessions(
+    username: str | None = None,
+    active_only: bool = True,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+):
+    """
+    Lista sessões de Instagram importadas/salvas no banco.
+    """
+    try:
+        safe_limit = min(max(int(limit), 1), 500)
+        normalized_username = _normalize_session_username(username)
+        query = db.query(InstagramSession)
+        if active_only:
+            query = query.filter(InstagramSession.is_active.is_(True))
+        if normalized_username:
+            query = query.filter(InstagramSession.instagram_username == normalized_username)
+
+        sessions = query.order_by(InstagramSession.updated_at.desc()).limit(safe_limit).all()
+        items = []
+        for session in sessions:
+            storage_state = session.storage_state if isinstance(session.storage_state, dict) else {}
+            cookies = browser_use_agent.get_cookies(storage_state)
+            items.append(
+                {
+                    "id": session.id,
+                    "instagram_username": session.instagram_username,
+                    "is_active": bool(session.is_active),
+                    "cookies_count": len(cookies),
+                    "has_user_agent": bool(browser_use_agent.get_user_agent(storage_state)),
+                    "last_used_at": session.last_used_at,
+                    "created_at": session.created_at,
+                    "updated_at": session.updated_at,
+                }
+            )
+
+        return {
+            "total": len(items),
+            "filters": {
+                "username": normalized_username,
+                "active_only": bool(active_only),
+                "limit": safe_limit,
+            },
+            "items": items,
+        }
+    except Exception as e:
+        logger.error("❌ Erro ao listar sessões do Instagram: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/instagram_sessions/{session_id}/deactivate")
+async def deactivate_instagram_session(
+    session_id: str,
+    db: Session = Depends(get_db),
+):
+    """
+    Desativa uma sessão específica do Instagram.
+    """
+    try:
+        session = db.query(InstagramSession).filter(InstagramSession.id == session_id).first()
+        if not session:
+            raise HTTPException(status_code=404, detail="Sessao nao encontrada")
+
+        if not session.is_active:
+            return {
+                "id": session.id,
+                "instagram_username": session.instagram_username,
+                "is_active": False,
+                "message": "Sessao ja estava inativa.",
+            }
+
+        session.is_active = False
+        db.commit()
+        return {
+            "id": session.id,
+            "instagram_username": session.instagram_username,
+            "is_active": False,
+            "message": "Sessao desativada com sucesso.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("❌ Erro ao desativar sessao %s: %s", session_id, e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ==================== Background Tasks ====================
 
 async def _scrape_profile_background(job_id: str, profile_url: str, options: dict | None = None):
@@ -826,6 +921,7 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
         max_posts = int(opts.get("max_posts", default_max_posts))
         recent_hours = int(opts.get("recent_hours", 24))
         max_like_users_per_post = int(opts.get("max_like_users_per_post", 30))
+        session_username = str(opts.get("session_username") or "").strip() or None
         # Etapa de enriquecimento de perfis curtidores foi removida do /scrape.
         # Mesmo que venha true na request, forçamos false neste job.
         collect_like_user_profiles = False
@@ -920,12 +1016,14 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
                 max_like_users_per_post=max_like_users_per_post,
                 collect_like_user_profiles=collect_like_user_profiles,
                 db=db,
+                session_username=session_username,
             )
         else:
             result = await instagram_scraper.scrape_profile(
                 profile_url=profile_url,
                 max_posts=max_posts,
                 db=db,
+                session_username=session_username,
             )
 
         # Atualizar job com resultados

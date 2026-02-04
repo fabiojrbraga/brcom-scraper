@@ -61,6 +61,10 @@ class ProfileResponse(ProfileBase):
 class ProfileScrapeRequest(BaseModel):
     """Schema para scraping direto de um perfil por URL."""
     profile_url: str = Field(..., description="URL do perfil Instagram a ser extraido")
+    session_username: Optional[str] = Field(
+        default=None,
+        description="Username da sessao Instagram a reutilizar (opcional)",
+    )
     save_to_db: bool = Field(
         default=True,
         description="(Legado) Perfil sempre e atualizado na tabela profiles neste endpoint",
@@ -222,6 +226,10 @@ class InteractionResponse(InteractionBase):
 class ScrapingJobCreate(BaseModel):
     """Schema para criar job de scraping."""
     profile_url: str = Field(..., description="URL do perfil Instagram a ser raspado")
+    session_username: Optional[str] = Field(
+        default=None,
+        description="Username da sessao Instagram a reutilizar (opcional)",
+    )
     flow: str = Field(default="default", description="Fluxo: default ou recent_likes")
     max_posts: int = Field(default=5, ge=1, le=20, description="Quantidade maxima de posts")
     recent_hours: int = Field(default=24, ge=1, le=168, description="Janela de horas para considerar post recente")
