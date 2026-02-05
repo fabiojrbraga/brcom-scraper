@@ -236,16 +236,17 @@ class AIExtractor:
                     "content": [
                         {
                             "type": "text",
-                            "text": """Analise os comentários nesta imagem/HTML e extraia:
+                            "text": """Analise os coment?rios nesta imagem/HTML e extraia:
                             
-                            Para cada comentário:
+                            Para cada coment?rio:
                             1. Username de quem comentou
-                            2. Texto do comentário (completo)
-                            3. Número de likes no comentário
-                            4. Número de respostas (se houver)
-                            5. Link do perfil do usuário (se possível extrair)
+                            2. Texto do coment?rio (completo)
+                            3. N?mero de likes no coment?rio
+                            4. N?mero de respostas (se houver)
+                            5. Link do perfil do usu?rio (se poss?vel extrair)
+                            6. Tempo do coment?rio (ex: "3 h", "2d", "1 sem")
                             
-                            Retorne APENAS um JSON válido com esta estrutura:
+                            Retorne APENAS um JSON v?lido com esta estrutura:
                             {
                                 "comments": [
                                     {
@@ -254,6 +255,7 @@ class AIExtractor:
                                         "comment_text": "string",
                                         "comment_likes": number,
                                         "comment_replies": number,
+                                        "comment_posted_at": "string ou null",
                                         "confidence": number entre 0 e 1
                                     }
                                 ],

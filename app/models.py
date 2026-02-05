@@ -101,6 +101,7 @@ class Interaction(Base):
     comment_text = Column(Text, nullable=True)
     comment_likes = Column(Integer, default=0, nullable=True)
     comment_replies = Column(Integer, default=0, nullable=True)
+    comment_posted_at = Column(String(64), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     metadata_json = Column("metadata", JSON, nullable=True)

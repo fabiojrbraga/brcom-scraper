@@ -201,6 +201,7 @@ class InteractionBase(BaseModel):
     comment_text: Optional[str] = None
     comment_likes: Optional[int] = None
     comment_replies: Optional[int] = None
+    comment_posted_at: Optional[str] = None
 
 
 class InteractionCreate(InteractionBase):
@@ -232,7 +233,7 @@ class ScrapingJobCreate(BaseModel):
     )
     flow: str = Field(default="default", description="Fluxo: default ou recent_likes")
     max_posts: int = Field(default=5, ge=1, le=20, description="Quantidade maxima de posts")
-    recent_hours: int = Field(default=24, ge=1, le=168, description="Janela de horas para considerar post recente")
+    recent_days: int = Field(default=1, ge=1, le=30, description="Janela de dias para considerar post recente", validation_alias="recent_hours")
     max_like_users_per_post: int = Field(default=30, ge=1, le=200, description="Maximo de perfis curtidores por post")
     collect_like_user_profiles: bool = Field(
         default=False,

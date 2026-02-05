@@ -394,7 +394,54 @@ class InstagramScraper:
                 return obj.get("posts", [])
         return []
 
-    def _is_recent_post(self, posted_at: Any, recent_hours: int = 24) -> bool:
+    def _relative_time_to_hours(self, text: Optional[str]) -> Optional[float]:
+        """
+        Converte texto relativo (ex: "3 h", "2d", "1 sem") para horas.
+        Retorna None quando nao consegue interpretar.
+        """
+        if text is None:
+            return None
+
+        cleaned = str(text).strip().lower()
+        if not cleaned:
+            return None
+
+        cleaned = cleaned.replace("\u2022", " ").replace("\u00b7", " ")
+        cleaned = re.sub(r"\b(editado|editada|edited)\b", "", cleaned)
+        cleaned = re.sub(r"\bago\b", "", cleaned)
+        cleaned = re.sub(r"\bh[a\u00e1]\b", "", cleaned)
+        cleaned = cleaned.strip()
+
+        if cleaned in {"now", "just now", "agora", "agora mesmo"}:
+            return 0.0
+        if cleaned in {"today", "hoje"}:
+            return 0.0
+        if cleaned in {"yesterday", "ontem"}:
+            return 24.0
+
+        patterns = [
+            (r"(\d+(?:[.,]\d+)?)\s*(?:s|seg|segs|segundo|segundos|sec|secs|second|seconds)\b", 1 / 3600),
+            (r"(\d+(?:[.,]\d+)?)\s*(?:m|min|mins|minuto|minutos)\b", 1 / 60),
+            (r"(\d+(?:[.,]\d+)?)\s*(?:h|hr|hrs|hour|hours|hora|horas)\b", 1),
+            (r"(\d+(?:[.,]\d+)?)\s*(?:d|day|days|dia|dias)\b", 24),
+            (r"(\d+(?:[.,]\d+)?)\s*(?:w|wk|wks|week|weeks|sem|semana|semanas)\b", 24 * 7),
+            (r"(\d+(?:[.,]\d+)?)\s*(?:mo|month|months|mes|m[e\u00ea]s|meses)\b", 24 * 30),
+            (r"(\d+(?:[.,]\d+)?)\s*(?:y|yr|year|years|ano|anos)\b", 24 * 365),
+        ]
+
+        for pattern, hour_multiplier in patterns:
+            match = re.search(pattern, cleaned)
+            if not match:
+                continue
+            value = match.group(1).replace(",", ".")
+            try:
+                return float(value) * hour_multiplier
+            except ValueError:
+                return None
+
+        return None
+
+    def _is_recent_post(self, posted_at: Any, recent_days: int = 1) -> bool:
         """
         Determina se o post é recente baseado no texto/valor retornado pelo scraper.
         """
@@ -402,10 +449,11 @@ class InstagramScraper:
             return False
 
         now = datetime.now(timezone.utc)
+        limit_hours = max(1, int(recent_days)) * 24
 
         if isinstance(posted_at, datetime):
             post_dt = posted_at if posted_at.tzinfo else posted_at.replace(tzinfo=timezone.utc)
-            return (now - post_dt).total_seconds() <= recent_hours * 3600
+            return (now - post_dt).total_seconds() <= limit_hours * 3600
 
         text = str(posted_at).strip().lower()
         if not text:
@@ -418,28 +466,18 @@ class InstagramScraper:
         try:
             parsed = datetime.fromisoformat(iso_candidate)
             parsed = parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-            return (now - parsed).total_seconds() <= recent_hours * 3600
+            return (now - parsed).total_seconds() <= limit_hours * 3600
         except Exception:
             pass
 
         if text in {"today", "hoje"}:
             return True
         if text in {"yesterday", "ontem"}:
-            return recent_hours >= 24
+            return limit_hours >= 48
 
-        relative_patterns = [
-            (r"(\d+)\s*(?:m|min|mins|minute|minutes|minuto|minutos)\b", 1 / 60),
-            (r"(\d+)\s*(?:h|hr|hrs|hour|hours|hora|horas)\b", 1),
-            (r"(\d+)\s*(?:d|day|days|dia|dias)\b", 24),
-            (r"(\d+)\s*(?:w|week|weeks|semana|semanas)\b", 24 * 7),
-        ]
-
-        for pattern, hour_multiplier in relative_patterns:
-            match = re.search(pattern, text)
-            if not match:
-                continue
-            value = int(match.group(1))
-            return (value * hour_multiplier) <= recent_hours
+        hours = self._relative_time_to_hours(text)
+        if hours is not None:
+            return hours <= limit_hours
 
         return False
 
@@ -771,7 +809,7 @@ class InstagramScraper:
         self,
         profile_url: str,
         max_posts: int = 3,
-        recent_hours: int = 24,
+        recent_days: int = 1,
         max_like_users_per_post: int = 30,
         collect_like_user_profiles: bool = True,
         db: Optional[Session] = None,
@@ -828,7 +866,7 @@ class InstagramScraper:
                     continue
 
                 posted_at = post.get("posted_at")
-                is_recent = self._is_recent_post(posted_at, recent_hours=recent_hours)
+                is_recent = self._is_recent_post(posted_at, recent_days=recent_days)
                 if is_recent:
                     total_recent_posts += 1
 
@@ -877,6 +915,24 @@ class InstagramScraper:
                     post_payload["like_users"] = []
 
                 total_like_users += len(post_payload["like_users"])
+                if is_recent:
+                    try:
+                        comment_interactions = await self._scrape_post_interactions(
+                            post_url=post_url,
+                            post_data=post,
+                            cookies=cookies,
+                            user_agent=user_agent,
+                            recent_days=recent_days,
+                        )
+                        comment_interactions = [
+                            item for item in comment_interactions
+                            if item.get("type") == "comment"
+                        ]
+                        for interaction in comment_interactions:
+                            interaction["_post_url"] = post_url
+                        all_interactions.extend(comment_interactions)
+                    except Exception as exc:
+                        logger.warning("Falha ao extrair comentarios do post %s: %s", post_url, exc)
 
                 # Enriquecimento de perfis curtidores foi removido do /scrape.
                 # Mantemos like_users_data vazio por compatibilidade de contrato.
@@ -1014,6 +1070,8 @@ class InstagramScraper:
         post_data: Dict[str, Any],
         cookies: Optional[list[dict]] = None,
         user_agent: Optional[str] = None,
+        recent_days: Optional[int] = None,
+        max_comment_scrolls: int = 6,
     ) -> List[Dict[str, Any]]:
         """
         Raspa comentários e interações de um post.
@@ -1030,30 +1088,95 @@ class InstagramScraper:
 
             await asyncio.sleep(self._get_random_delay(2, 5))
 
-            # Capturar screenshot dos comentários
-            comments_screenshot = await self.browserless.screenshot(
-                post_url,
-                cookies=cookies,
-                user_agent=user_agent,
-            )
+            interactions: List[Dict[str, Any]] = []
+            seen_comment_keys: set[str] = set()
+            limit_hours = max(1, int(recent_days)) * 24 if recent_days is not None else None
+            max_scrolls = max(1, int(max_comment_scrolls)) if recent_days is not None else 1
 
-            # Extrair comentários com IA
-            comments = await self.ai_extractor.extract_comments(
-                screenshot_base64=comments_screenshot,
-            )
+            scroll_script = """
+(() => {
+  const keywords = [
+    "view more comments",
+    "load more comments",
+    "more comments",
+    "ver mais comentarios",
+    "ver comentarios anteriores",
+    "carregar mais comentarios",
+    "comentarios anteriores"
+  ];
+  const nodes = Array.from(document.querySelectorAll("button, a, span, div"));
+  for (const node of nodes) {
+    const raw = (node.innerText || "").trim();
+    if (!raw) continue;
+    const text = raw.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    if (keywords.some((k) => text.includes(k))) {
+      node.click();
+    }
+  }
+  const before = window.scrollY || 0;
+  window.scrollBy(0, Math.floor(window.innerHeight * 0.9));
+  return { before, after: window.scrollY || 0, height: document.body.scrollHeight || 0 };
+})();
+"""
 
-            # Processar comentários em interações
-            interactions = []
-            for comment in comments:
-                interaction = {
-                    "type": "comment",
-                    "user_url": comment.get("user_url"),
-                    "user_username": comment.get("user_username"),
-                    "comment_text": comment.get("comment_text"),
-                    "comment_likes": comment.get("comment_likes", 0),
-                    "comment_replies": comment.get("comment_replies", 0),
-                }
-                interactions.append(interaction)
+            for attempt in range(max_scrolls):
+                comments_screenshot = await self.browserless.screenshot(
+                    post_url,
+                    cookies=cookies,
+                    user_agent=user_agent,
+                )
+
+                comments = await self.ai_extractor.extract_comments(
+                    screenshot_base64=comments_screenshot,
+                )
+
+                has_within_window = False
+                for comment in comments:
+                    user_username = str(comment.get("user_username") or "").strip()
+                    user_url = str(comment.get("user_url") or "").strip()
+                    if not user_url and user_username:
+                        user_url = f"https://www.instagram.com/{user_username.lstrip('@').strip()}/"
+
+                    comment_posted_at = comment.get("comment_posted_at")
+                    hours = self._relative_time_to_hours(comment_posted_at)
+                    within_window = True
+                    if limit_hours is not None and hours is not None and hours > limit_hours:
+                        within_window = False
+                    if within_window:
+                        has_within_window = True
+                    if limit_hours is not None and not within_window:
+                        continue
+
+                    comment_text = comment.get("comment_text")
+                    comment_key = f"{user_url or user_username}|{comment_text}|{comment_posted_at}"
+                    if comment_key in seen_comment_keys:
+                        continue
+                    seen_comment_keys.add(comment_key)
+
+                    interactions.append({
+                        "type": "comment",
+                        "user_url": user_url or None,
+                        "user_username": user_username or None,
+                        "comment_text": comment_text,
+                        "comment_likes": comment.get("comment_likes", 0),
+                        "comment_replies": comment.get("comment_replies", 0),
+                        "comment_posted_at": comment_posted_at,
+                    })
+
+                if recent_days is None:
+                    break
+                if not has_within_window:
+                    break
+                if attempt >= max_scrolls - 1:
+                    break
+
+                await self.browserless.execute_script(
+                    post_url,
+                    scroll_script,
+                    cookies=cookies,
+                    user_agent=user_agent,
+                )
+                await asyncio.sleep(self._get_random_delay(1.5, 3.5))
 
             # Adicionar likes como interação (se houver contagem)
             if post_data.get("like_count", 0) > 0:
@@ -1224,6 +1347,7 @@ class InstagramScraper:
                             comment_text=(interaction_data.get("comment_text") if interaction_type == InteractionType.COMMENT else None),
                             comment_likes=(interaction_data.get("comment_likes", 0) if interaction_type == InteractionType.COMMENT else None),
                             comment_replies=(interaction_data.get("comment_replies", 0) if interaction_type == InteractionType.COMMENT else None),
+                            comment_posted_at=(interaction_data.get("comment_posted_at") if interaction_type == InteractionType.COMMENT else None),
                         )
                         db.add(interaction)
             db.commit()

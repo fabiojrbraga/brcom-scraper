@@ -919,7 +919,12 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
         test_duration_seconds = int(opts.get("test_duration_seconds", 120))
         default_max_posts = 3 if flow == "recent_likes" else 5
         max_posts = int(opts.get("max_posts", default_max_posts))
-        recent_hours = int(opts.get("recent_hours", 24))
+        recent_days = int(opts.get("recent_days", 1))
+        if "recent_hours" in opts and "recent_days" not in opts:
+            try:
+                recent_days = max(1, int((int(opts.get("recent_hours", 24)) + 23) / 24))
+            except Exception:
+                recent_days = int(opts.get("recent_days", 1))
         max_like_users_per_post = int(opts.get("max_like_users_per_post", 30))
         session_username = str(opts.get("session_username") or "").strip() or None
         # Etapa de enriquecimento de perfis curtidores foi removida do /scrape.
@@ -1012,7 +1017,7 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
             result = await instagram_scraper.scrape_recent_posts_like_users(
                 profile_url=profile_url,
                 max_posts=max_posts,
-                recent_hours=recent_hours,
+                recent_days=recent_days,
                 max_like_users_per_post=max_like_users_per_post,
                 collect_like_user_profiles=collect_like_user_profiles,
                 db=db,

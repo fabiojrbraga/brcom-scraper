@@ -227,6 +227,9 @@ class BrowserlessClient:
         url: str,
         script: str,
         timeout: int = 30000,
+        wait_for: Optional[str] = None,
+        cookies: Optional[list[dict]] = None,
+        user_agent: Optional[str] = None,
     ) -> Any:
         """
         Executa JavaScript em uma página.
@@ -246,11 +249,18 @@ class BrowserlessClient:
                 "timeout": timeout,
             }
 
+            if wait_for:
+                payload["waitFor"] = wait_for
+            if cookies:
+                payload["cookies"] = cookies
+            if user_agent:
+                payload["userAgent"] = user_agent
+
             response = await self._post_with_retry(
                 endpoint="/execute",
                 payload=payload,
                 url_for_log=url,
-                fallback_fields=["timeout"],
+                fallback_fields=["timeout", "waitFor", "cookies", "userAgent"],
             )
             result = response.json().get("data")
             logger.info(f"✅ Script executado em: {url}")

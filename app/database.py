@@ -99,6 +99,12 @@ def _ensure_interactions_post_url_column() -> None:
                 else:
                     conn.execute(text("ALTER TABLE interactions ADD COLUMN post_url VARCHAR(500)"))
 
+            if "comment_posted_at" not in column_names:
+                if dialect == "postgresql":
+                    conn.execute(text("ALTER TABLE interactions ADD COLUMN IF NOT EXISTS comment_posted_at VARCHAR(64)"))
+                else:
+                    conn.execute(text("ALTER TABLE interactions ADD COLUMN comment_posted_at VARCHAR(64)"))
+
             # índice simples por post_url
             try:
                 index_names = {idx["name"] for idx in inspector.get_indexes("interactions")}
