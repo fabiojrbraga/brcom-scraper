@@ -473,6 +473,10 @@ async def generic_scrape(
                 session.id,
                 session.instagram_username,
             )
+        else:
+            logger.info(
+                "generic_scrape sem session_username; usando a sessao ativa mais recente se existir."
+            )
 
         logger.info("🌐 Requisicao generic_scrape recebida: %s", target_url)
 

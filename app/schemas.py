@@ -97,6 +97,12 @@ class GenericScrapeRequest(BaseModel):
     session_username: Optional[str] = Field(
         default=None,
         description="Username da sessao Instagram a reutilizar (opcional)",
+        validation_alias=AliasChoices(
+            "session_username",
+            "sessionUsername",
+            "instagram_username",
+            "instagramUsername",
+        ),
     )
     test_mode: bool = Field(
         default=False,
