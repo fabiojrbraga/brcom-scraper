@@ -1114,12 +1114,21 @@ async def _generic_scrape_background(
         if not test_mode:
             session = _get_active_instagram_session(db, normalized_session_username)
             if normalized_session_username and not session:
+                logger.warning(
+                    "Sessao Instagram solicitada nao encontrada/ativa. username=%s",
+                    normalized_session_username,
+                )
                 raise RuntimeError(
                     f"Sessao Instagram '@{normalized_session_username}' nao encontrada ou inativa."
                 )
             if session and isinstance(session.storage_state, dict):
                 is_valid = await browser_use_agent.is_instagram_session_valid(session.storage_state)
                 if not is_valid:
+                    logger.warning(
+                        "Sessao Instagram invalida/expirada. id=%s username=%s",
+                        session.id,
+                        session.instagram_username,
+                    )
                     session.is_active = False
                     db.commit()
                     if normalized_session_username:
@@ -1127,9 +1136,16 @@ async def _generic_scrape_background(
                             f"Sessao Instagram '@{normalized_session_username}' expirada ou invalida."
                         )
                 else:
+                    logger.info(
+                        "Usando sessao Instagram. id=%s username=%s",
+                        session.id,
+                        session.instagram_username,
+                    )
                     session.last_used_at = datetime.utcnow()
                     db.commit()
                     storage_state = session.storage_state
+            elif not normalized_session_username:
+                logger.info("Nenhuma sessao Instagram ativa encontrada; seguindo sem autenticacao.")
 
         if test_mode:
             await asyncio.sleep(test_duration_seconds)
