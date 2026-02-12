@@ -1616,6 +1616,305 @@ class BrowserUseAgent:
         finally:
             self._cleanup_storage_state_temp_file(storage_state_file)
 
+    async def scrape_post_comments(
+        self,
+        post_url: str,
+        storage_state: Optional[Dict[str, Any]],
+        max_comments: int = 80,
+        max_scrolls: int = 6,
+    ) -> Dict[str, Any]:
+        """
+        Abre um post e tenta extrair comentarios visiveis usando Browser Use.
+
+        Returns:
+            {
+              "post_url": str,
+              "comments_accessible": bool,
+              "comments": [
+                {
+                  "user_url": str | None,
+                  "user_username": str | None,
+                  "comment_text": str | None,
+                  "comment_likes": int,
+                  "comment_replies": int,
+                  "comment_posted_at": str | None
+                }
+              ],
+              "total_collected": int,
+              "error": Optional[str]
+            }
+        """
+        max_retries = getattr(settings, "browser_use_max_retries", 3)
+        retry_delay = 5
+        safe_max_comments = max(1, int(max_comments))
+        safe_max_scrolls = max(1, int(max_scrolls))
+        reconnect_url = self._get_browserless_reconnect_url(storage_state)
+        session_info = self._get_browserless_session_info(storage_state)
+        session_connect_url = session_info.get("connect") if isinstance(session_info.get("connect"), str) else None
+        clean_storage_state = self._sanitize_storage_state(storage_state)
+        storage_state_file = self._write_storage_state_temp_file(storage_state)
+        storage_state_for_session: Optional[Union[Dict[str, Any], str]]
+        storage_state_for_session = storage_state_file or clean_storage_state
+
+        try:
+            for attempt in range(1, max_retries + 1):
+                browser_session = None
+                restore_event_bus = None
+                try:
+                    logger.info(
+                        "Browser Use: Coletando comentarios de %s (tentativa %s/%s)",
+                        post_url,
+                        attempt,
+                        max_retries,
+                    )
+
+                    if not self.api_key:
+                        raise ValueError("OPENAI_API_KEY is required for Browser Use.")
+
+                    use_reconnect = bool(reconnect_url and attempt == 1)
+                    use_session_connect = bool((not reconnect_url) and session_connect_url and attempt == 1)
+                    if use_reconnect:
+                        cdp_url = self._ensure_ws_token(reconnect_url)
+                    elif use_session_connect:
+                        cdp_url = self._ensure_ws_token(session_connect_url)
+                    else:
+                        cdp_url = await self._resolve_browserless_cdp_url()
+
+                    task = f"""
+                    Voce esta em um navegador autenticado no Instagram.
+                    Sua tarefa e extrair comentarios de um post.
+
+                    PASSOS:
+                    1) Acesse o post: {post_url}
+                    2) Aguarde a pagina carregar.
+                    3) Se houver modal de cookies, aceite.
+                    4) Abra a secao de comentarios (incluindo "view all comments", "view more comments", "ver comentarios").
+                    5) Role/carregue mais comentarios por no maximo {safe_max_scrolls} iteracoes.
+                    6) Colete ate {safe_max_comments} comentarios visiveis.
+
+                    FORMATO DE SAIDA (JSON):
+                    {{
+                      "post_url": "{post_url}",
+                      "comments_accessible": true,
+                      "comments": [
+                        {{
+                          "user_url": "https://www.instagram.com/usuario/",
+                          "user_username": "usuario",
+                          "comment_text": "texto do comentario",
+                          "comment_likes": 0,
+                          "comment_replies": 0,
+                          "comment_posted_at": "2 h"
+                        }}
+                      ],
+                      "total_collected": 1
+                    }}
+
+                    REGRAS:
+                    - Se nao for possivel abrir/carregar comentarios, retorne:
+                      {{
+                        "post_url": "{post_url}",
+                        "comments_accessible": false,
+                        "comments": [],
+                        "error": "comments_unavailable"
+                      }}
+                    - Nao abra nova aba.
+                    - Nao invente dados.
+                    - Se um campo nao estiver visivel, use null.
+                    - Retorne JSON puro no resultado final.
+                    """
+
+                    browser_session = self._create_browser_session(cdp_url, storage_state=storage_state_for_session)
+                    llm = ChatOpenAI(model=self.model, api_key=self.api_key)
+                    agent = self._create_agent(
+                        task=task,
+                        llm=llm,
+                        browser_session=browser_session,
+                    )
+
+                    restore_event_bus = self._patch_event_bus_for_stop(browser_session)
+                    history = await agent.run()
+                    final_result = history.final_result() or ""
+
+                    if (not history.is_successful()) and self._contains_protocol_error(final_result) and attempt < max_retries:
+                        wait_time = retry_delay * attempt
+                        logger.warning(
+                            "Sessao CDP instavel ao coletar comentarios (%s/%s). Retentando em %ss...",
+                            attempt,
+                            max_retries,
+                            wait_time,
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+
+                    data = self._extract_json_object_with_key(final_result, "comments_accessible")
+                    if data is None:
+                        logger.warning("Falha ao extrair JSON de comentarios: %s", final_result[:180])
+                        if self._contains_protocol_error(final_result) and attempt < max_retries:
+                            wait_time = retry_delay * attempt
+                            logger.warning(
+                                "Falha de protocolo detectada na coleta de comentarios (%s/%s). Retentando em %ss...",
+                                attempt,
+                                max_retries,
+                                wait_time,
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+                        failure_error = self._classify_agent_failure_error(
+                            final_result=final_result,
+                            history=history,
+                        )
+                        return {
+                            "post_url": post_url,
+                            "comments_accessible": False,
+                            "comments": [],
+                            "total_collected": 0,
+                            "error": failure_error,
+                            "raw_result": final_result or self._history_errors_text(history),
+                        }
+
+                    if data.get("error") == "login_required" and attempt < max_retries:
+                        wait_time = retry_delay * attempt
+                        logger.warning(
+                            "Agente retornou login_required ao coletar comentarios (%s/%s). Retentando em %ss...",
+                            attempt,
+                            max_retries,
+                            wait_time,
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+
+                    normalized_comments: List[Dict[str, Any]] = []
+                    seen_comment_keys: set[str] = set()
+
+                    for value in data.get("comments", []) or []:
+                        if not isinstance(value, dict):
+                            continue
+
+                        user_url = str(value.get("user_url") or "").strip()
+                        user_username = str(value.get("user_username") or "").strip().lstrip("@")
+                        if user_url.startswith("/"):
+                            user_url = f"https://www.instagram.com{user_url}"
+                        if not user_url and user_username:
+                            user_url = f"https://www.instagram.com/{user_username}/"
+
+                        if user_url and "instagram.com" in user_url:
+                            parsed_user = urlparse(user_url)
+                            path_parts = [part for part in parsed_user.path.split("/") if part]
+                            if path_parts:
+                                normalized_username = path_parts[0].strip().lstrip("@")
+                                if normalized_username:
+                                    user_username = user_username or normalized_username
+                                    user_url = f"https://www.instagram.com/{normalized_username}/"
+
+                        if not user_url and not user_username:
+                            continue
+
+                        comment_text = value.get("comment_text")
+                        if comment_text is not None:
+                            comment_text = str(comment_text).strip() or None
+
+                        comment_posted_at = value.get("comment_posted_at")
+                        if comment_posted_at is not None:
+                            comment_posted_at = str(comment_posted_at).strip() or None
+
+                        try:
+                            comment_likes = int(value.get("comment_likes", 0) or 0)
+                        except (TypeError, ValueError):
+                            comment_likes = 0
+
+                        try:
+                            comment_replies = int(value.get("comment_replies", 0) or 0)
+                        except (TypeError, ValueError):
+                            comment_replies = 0
+
+                        dedup_key = f"{user_url or user_username}|{comment_text}|{comment_posted_at}"
+                        if dedup_key in seen_comment_keys:
+                            continue
+                        seen_comment_keys.add(dedup_key)
+
+                        normalized_comments.append(
+                            {
+                                "user_url": user_url or None,
+                                "user_username": user_username or None,
+                                "comment_text": comment_text,
+                                "comment_likes": comment_likes,
+                                "comment_replies": comment_replies,
+                                "comment_posted_at": comment_posted_at,
+                            }
+                        )
+                        if len(normalized_comments) >= safe_max_comments:
+                            break
+
+                    comments_accessible = bool(data.get("comments_accessible"))
+                    if normalized_comments and not comments_accessible:
+                        comments_accessible = True
+
+                    return {
+                        "post_url": data.get("post_url") or post_url,
+                        "comments_accessible": comments_accessible,
+                        "comments": normalized_comments,
+                        "total_collected": len(normalized_comments),
+                        "error": data.get("error"),
+                    }
+
+                except Exception as exc:
+                    failure_error = self._classify_agent_failure_error(exc=exc)
+                    if failure_error == "rate_limit_exceeded":
+                        return {
+                            "post_url": post_url,
+                            "comments_accessible": False,
+                            "comments": [],
+                            "total_collected": 0,
+                            "error": failure_error,
+                        }
+                    error_msg = str(exc).lower()
+                    is_retryable = any(
+                        marker in error_msg
+                        for marker in (
+                            "http 500",
+                            "connection",
+                            "timeout",
+                            "websocket",
+                            "failed to establish",
+                            "protocol error",
+                            "reserved bits",
+                            "client is stopping",
+                        )
+                    )
+                    if is_retryable and attempt < max_retries:
+                        wait_time = retry_delay * attempt
+                        logger.warning(
+                            "Tentativa %s/%s falhou ao coletar comentarios: %s. Retentando em %ss...",
+                            attempt,
+                            max_retries,
+                            str(exc)[:120],
+                            wait_time,
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    return {
+                        "post_url": post_url,
+                        "comments_accessible": False,
+                        "comments": [],
+                        "total_collected": 0,
+                        "error": str(exc),
+                    }
+                finally:
+                    if callable(restore_event_bus):
+                        restore_event_bus()
+                    if browser_session:
+                        await self._detach_browser_session(browser_session)
+
+            return {
+                "post_url": post_url,
+                "comments_accessible": False,
+                "comments": [],
+                "total_collected": 0,
+                "error": "all_retries_failed",
+            }
+        finally:
+            self._cleanup_storage_state_temp_file(storage_state_file)
+
     async def scrape_profile_basic_info(
         self,
         profile_url: str,

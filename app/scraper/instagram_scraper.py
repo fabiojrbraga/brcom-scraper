@@ -734,8 +734,7 @@ class InstagramScraper:
                 interactions = await self._scrape_post_interactions(
                     post_url=post_url,
                     post_data=post_data,
-                    cookies=cookies,
-                    user_agent=user_agent,
+                    storage_state=storage_state,
                 )
                 for interaction in interactions:
                     interaction["_post_url"] = post_url
@@ -1051,8 +1050,7 @@ class InstagramScraper:
                         comment_interactions = await self._scrape_post_interactions(
                             post_url=post_url,
                             post_data=post,
-                            cookies=cookies,
-                            user_agent=user_agent,
+                            storage_state=storage_state,
                             recent_days=recent_days,
                         )
                         comment_interactions = [
@@ -1199,8 +1197,7 @@ class InstagramScraper:
         self,
         post_url: str,
         post_data: Dict[str, Any],
-        cookies: Optional[list[dict]] = None,
-        user_agent: Optional[str] = None,
+        storage_state: Optional[Dict[str, Any]] = None,
         recent_days: Optional[int] = None,
         max_comment_scrolls: int = 6,
     ) -> List[Dict[str, Any]]:
@@ -1215,153 +1212,85 @@ class InstagramScraper:
             Lista de interações extraídas
         """
         try:
-            logger.info(f"📍 Raspando interações do post: {post_url}")
+            logger.info("Raspando interacoes do post via Browser Use: %s", post_url)
 
-            await asyncio.sleep(self._get_random_delay(2, 5))
+            await asyncio.sleep(self._get_random_delay(1.0, 2.5))
 
             interactions: List[Dict[str, Any]] = []
             seen_comment_keys: set[str] = set()
             limit_hours = max(1, int(recent_days)) * 24 if recent_days is not None else None
-            max_scrolls = max(1, int(max_comment_scrolls)) if recent_days is not None else 1
+            max_scrolls = max(1, int(max_comment_scrolls))
 
-            open_comments_script = """
-(() => {
-  const normalize = (value) => (value || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\\u0300-\\u036f]/g, "");
+            comment_count_hint = self._to_int_or_none(post_data.get("comment_count")) or 0
+            target_comment_limit = max(20, max_scrolls * 20)
+            if comment_count_hint > 0:
+                target_comment_limit = max(target_comment_limit, min(comment_count_hint, 300))
+            target_comment_limit = min(target_comment_limit, 300)
 
-  let clicked = 0;
-  const iconTargets = Array.from(document.querySelectorAll("svg[aria-label]"));
-  for (const icon of iconTargets) {
-    const label = normalize(icon.getAttribute("aria-label"));
-    if (label.includes("comment") || label.includes("coment")) {
-      const clickable = icon.closest("button, a, div");
-      if (clickable) {
-        clickable.click();
-        clicked += 1;
-      }
-    }
-  }
-
-  const textTargets = Array.from(document.querySelectorAll("a, button, span, div"));
-  for (const node of textTargets) {
-    const text = normalize(node.innerText || "");
-    if (!text) continue;
-    const hasComment = text.includes("comment") || text.includes("coment");
-    const hasView = text.includes("view") || text.includes("ver") || text.includes("mostrar");
-    if (hasComment && hasView) {
-      node.click();
-      clicked += 1;
-    }
-  }
-
-  return { clicked };
-})();
-"""
-
-            scroll_script = """
-(() => {
-  const keywords = [
-    "view more comments",
-    "load more comments",
-    "more comments",
-    "ver mais comentarios",
-    "ver comentarios anteriores",
-    "carregar mais comentarios",
-    "comentarios anteriores"
-  ];
-  const nodes = Array.from(document.querySelectorAll("button, a, span, div"));
-  for (const node of nodes) {
-    const raw = (node.innerText || "").trim();
-    if (!raw) continue;
-    const text = raw.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-    if (keywords.some((k) => text.includes(k))) {
-      node.click();
-    }
-  }
-  const before = window.scrollY || 0;
-  window.scrollBy(0, Math.floor(window.innerHeight * 0.9));
-  return { before, after: window.scrollY || 0, height: document.body.scrollHeight || 0 };
-})();
-"""
-
-            if post_data.get("comment_count", 0) > 0:
-                await self.browserless.execute_script(
+            comments_result = await browser_use_agent.scrape_post_comments(
+                post_url=post_url,
+                storage_state=storage_state,
+                max_comments=target_comment_limit,
+                max_scrolls=max_scrolls,
+            )
+            if comments_result.get("error"):
+                logger.warning(
+                    "Browser Use retornou erro ao extrair comentarios do post %s: %s",
                     post_url,
-                    open_comments_script,
-                    cookies=cookies,
-                    user_agent=user_agent,
-                )
-                await asyncio.sleep(self._get_random_delay(1.0, 2.5))
-
-            for attempt in range(max_scrolls):
-                if post_data.get("comment_count", 0) > 0:
-                    await self.browserless.execute_script(
-                        post_url,
-                        open_comments_script,
-                        cookies=cookies,
-                        user_agent=user_agent,
-                    )
-                    await asyncio.sleep(self._get_random_delay(0.5, 1.5))
-
-                comments_screenshot = await self.browserless.screenshot(
-                    post_url,
-                    cookies=cookies,
-                    user_agent=user_agent,
+                    comments_result.get("error"),
                 )
 
-                comments = await self.ai_extractor.extract_comments(
-                    screenshot_base64=comments_screenshot,
-                )
+            comments_payload = comments_result.get("comments")
+            comments = comments_payload if isinstance(comments_payload, list) else []
 
-                has_within_window = False
-                for comment in comments:
-                    user_username = str(comment.get("user_username") or "").strip()
-                    user_url = str(comment.get("user_url") or "").strip()
-                    if not user_url and user_username:
-                        user_url = f"https://www.instagram.com/{user_username.lstrip('@').strip()}/"
+            for comment in comments:
+                if not isinstance(comment, dict):
+                    continue
 
-                    comment_posted_at = comment.get("comment_posted_at")
-                    hours = self._relative_time_to_hours(comment_posted_at)
-                    within_window = True
-                    if limit_hours is not None and hours is not None and hours > limit_hours:
-                        within_window = False
-                    if within_window:
-                        has_within_window = True
-                    if limit_hours is not None and not within_window:
-                        continue
+                user_username = str(comment.get("user_username") or "").strip().lstrip("@")
+                user_url = str(comment.get("user_url") or "").strip()
+                if not user_url and user_username:
+                    user_url = f"https://www.instagram.com/{user_username}/"
+                if user_url and "instagram.com" in user_url:
+                    parsed_user = urlparse(user_url)
+                    path_parts = [part for part in parsed_user.path.split("/") if part]
+                    if path_parts:
+                        normalized_username = path_parts[0].strip().lstrip("@")
+                        if normalized_username:
+                            user_username = user_username or normalized_username
+                            user_url = f"https://www.instagram.com/{normalized_username}/"
 
-                    comment_text = comment.get("comment_text")
-                    comment_key = f"{user_url or user_username}|{comment_text}|{comment_posted_at}"
-                    if comment_key in seen_comment_keys:
-                        continue
-                    seen_comment_keys.add(comment_key)
+                if not user_url and not user_username:
+                    continue
 
-                    interactions.append({
+                comment_posted_at = comment.get("comment_posted_at")
+                hours = self._relative_time_to_hours(comment_posted_at)
+                within_window = True
+                if limit_hours is not None and hours is not None and hours > limit_hours:
+                    within_window = False
+                if limit_hours is not None and not within_window:
+                    continue
+
+                comment_text = comment.get("comment_text")
+                if comment_text is not None:
+                    comment_text = str(comment_text).strip() or None
+
+                comment_key = f"{user_url or user_username}|{comment_text}|{comment_posted_at}"
+                if comment_key in seen_comment_keys:
+                    continue
+                seen_comment_keys.add(comment_key)
+
+                interactions.append(
+                    {
                         "type": "comment",
                         "user_url": user_url or None,
                         "user_username": user_username or None,
                         "comment_text": comment_text,
-                        "comment_likes": comment.get("comment_likes", 0),
-                        "comment_replies": comment.get("comment_replies", 0),
+                        "comment_likes": self._to_int_or_none(comment.get("comment_likes")) or 0,
+                        "comment_replies": self._to_int_or_none(comment.get("comment_replies")) or 0,
                         "comment_posted_at": comment_posted_at,
-                    })
-
-                if recent_days is None:
-                    break
-                if not has_within_window:
-                    break
-                if attempt >= max_scrolls - 1:
-                    break
-
-                await self.browserless.execute_script(
-                    post_url,
-                    scroll_script,
-                    cookies=cookies,
-                    user_agent=user_agent,
+                    }
                 )
-                await asyncio.sleep(self._get_random_delay(1.5, 3.5))
 
             # Adicionar likes como interação (se houver contagem)
             if post_data.get("like_count", 0) > 0:
