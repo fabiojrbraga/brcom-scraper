@@ -63,7 +63,7 @@ class ProfileScrapeRequest(BaseModel):
     profile_url: str = Field(..., description="URL do perfil Instagram a ser extraido")
     session_username: Optional[str] = Field(
         default=None,
-        description="Username da sessao Instagram a reutilizar (opcional)",
+        description="Username da sessao Instagram a reutilizar (obrigatorio para flow stories_interactions)",
     )
     save_to_db: bool = Field(
         default=True,
@@ -241,7 +241,10 @@ class ScrapingJobCreate(BaseModel):
         default=None,
         description="Username da sessao Instagram a reutilizar (opcional)",
     )
-    flow: str = Field(default="default", description="Fluxo: default ou recent_likes")
+    flow: str = Field(
+        default="default",
+        description="Fluxo: default, recent_likes ou stories_interactions",
+    )
     max_posts: int = Field(default=5, ge=1, le=20, description="Quantidade maxima de posts")
     recent_days: int = Field(
         default=1,
@@ -251,6 +254,12 @@ class ScrapingJobCreate(BaseModel):
         validation_alias=AliasChoices("recent_days", "recent_hours"),
     )
     max_like_users_per_post: int = Field(default=30, ge=1, le=200, description="Maximo de perfis curtidores por post")
+    max_story_interactions: int = Field(
+        default=300,
+        ge=1,
+        le=2000,
+        description="Maximo de interacoes de stories no fluxo stories_interactions",
+    )
     collect_like_user_profiles: bool = Field(
         default=False,
         description="(Deprecado no /scrape) Mantido por compatibilidade; atualmente ignorado neste endpoint",
@@ -293,6 +302,13 @@ class ScrapingResultInteraction(BaseModel):
     user_bio: Optional[str] = None
     is_private: bool = False
     comment_text: Optional[str] = None
+
+
+class ScrapingStoryInteraction(BaseModel):
+    """Interacao de story (usuario + tipo)."""
+    user_username: Optional[str] = None
+    user_url: Optional[str] = None
+    type: str
 
 
 class ScrapingResultPost(BaseModel):
@@ -348,6 +364,7 @@ class ScrapingCompleteResponse(BaseModel):
     flow: Optional[str] = None
     profile: Optional[ScrapingResultProfile] = None
     extracted_posts: List[ScrapingRecentPostResult] = []
+    story_interactions: List[ScrapingStoryInteraction] = []
     total_posts: int = 0
     total_interactions: int = 0
     raw_result: Optional[Dict[str, Any]] = None

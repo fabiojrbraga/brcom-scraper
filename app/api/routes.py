@@ -128,6 +128,33 @@ async def start_scraping(
         # Criar job de scraping
         request_payload = request.model_dump(mode="json", exclude_unset=True)
         request_payload["profile_url"] = normalized_profile_url
+        flow = str(request_payload.get("flow") or "default").strip().lower()
+        request_payload["flow"] = flow
+        session_username = _normalize_session_username(
+            str(request_payload.get("session_username") or "")
+        )
+        if session_username:
+            request_payload["session_username"] = session_username
+
+        if flow == "stories_interactions":
+            if not session_username:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Fluxo stories_interactions exige sessao autenticada. "
+                        "Informe session_username de uma sessao Instagram ativa."
+                    ),
+                )
+            session = _get_active_instagram_session(db, session_username)
+            if not session:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Sessao Instagram '@{session_username}' nao encontrada ou inativa. "
+                        "Login e obrigatorio para coletar interacoes de stories."
+                    ),
+                )
+
         job = ScrapingJob(
             profile_url=normalized_profile_url,
             status="pending",
@@ -154,6 +181,8 @@ async def start_scraping(
             created_at=job.created_at,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"❌ Erro ao criar job de scraping: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -215,6 +244,56 @@ async def get_scraping_results(
         Resultados do scraping
     """
     try:
+        def _normalize_story_interactions(items: Any) -> list[dict[str, str | None]]:
+            normalized: list[dict[str, str | None]] = []
+            if not isinstance(items, list):
+                return normalized
+
+            seen_keys: set[str] = set()
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+
+                interaction_type = str(item.get("type") or "").strip().lower()
+                if not interaction_type:
+                    continue
+
+                user_username = str(item.get("user_username") or "").strip().lstrip("@")
+                user_url = str(item.get("user_url") or "").strip()
+
+                if user_url.startswith("/"):
+                    user_url = f"https://www.instagram.com{user_url}"
+
+                if not user_url and user_username:
+                    user_url = f"https://www.instagram.com/{user_username}/"
+
+                if user_url and "instagram.com" in user_url:
+                    parsed_user = urlparse(user_url)
+                    path_parts = [part for part in parsed_user.path.split("/") if part]
+                    if path_parts:
+                        normalized_username = path_parts[0].strip().lstrip("@")
+                        if normalized_username:
+                            user_username = user_username or normalized_username
+                            user_url = f"https://www.instagram.com/{normalized_username}/"
+
+                if not user_url and not user_username:
+                    continue
+
+                dedupe_key = f"{user_url or user_username}|{interaction_type}"
+                if dedupe_key in seen_keys:
+                    continue
+                seen_keys.add(dedupe_key)
+
+                normalized.append(
+                    {
+                        "user_username": user_username or None,
+                        "user_url": user_url or None,
+                        "type": interaction_type,
+                    }
+                )
+
+            return normalized
+
         job = db.query(ScrapingJob).filter(ScrapingJob.id == job_id).first()
 
         if not job:
@@ -268,6 +347,40 @@ async def get_scraping_results(
                 completed_at=job.completed_at,
             )
 
+        if flow == "stories_interactions" and isinstance(flow_result, dict):
+            summary = flow_result.get("summary", {}) or {}
+            profile_payload = flow_result.get("profile", {}) or {}
+            story_interactions = _normalize_story_interactions(
+                flow_result.get("story_interactions", [])
+                or flow_result.get("interactions", [])
+            )
+            return ScrapingCompleteResponse(
+                job_id=job.id,
+                status=job.status,
+                flow="stories_interactions",
+                profile={
+                    "username": profile_payload.get("username") or "",
+                    "full_name": profile_payload.get("full_name"),
+                    "profile_url": profile_payload.get("profile_url") or job.profile_url,
+                    "bio": profile_payload.get("bio"),
+                    "is_private": bool(profile_payload.get("is_private", False)),
+                    "follower_count": profile_payload.get("follower_count"),
+                    "posts": [],
+                },
+                story_interactions=story_interactions,
+                total_posts=0,
+                total_interactions=_safe_int(
+                    summary.get(
+                        "total_story_interactions",
+                        summary.get("total_interactions", len(story_interactions)),
+                    )
+                    or 0
+                ),
+                raw_result=flow_result,
+                error_message=job.error_message,
+                completed_at=job.completed_at,
+            )
+
         # Buscar perfil associado
         profile = db.query(Profile).filter(
             Profile.instagram_url == job.profile_url
@@ -290,6 +403,11 @@ async def get_scraping_results(
         if not profile and isinstance(flow_result, dict):
             posts = flow_result.get("posts", []) or []
             interactions = flow_result.get("interactions", []) or []
+            story_interactions = (
+                _normalize_story_interactions(flow_result.get("story_interactions", []))
+                if flow == "stories_interactions"
+                else []
+            )
             summary = flow_result.get("summary", {}) or {}
             profile_payload = flow_result.get("profile", {}) or {}
             return ScrapingCompleteResponse(
@@ -316,7 +434,17 @@ async def get_scraping_results(
                     ],
                 },
                 total_posts=_safe_int(summary.get("total_posts", len(posts)) or 0),
-                total_interactions=_safe_int(summary.get("total_interactions", len(interactions)) or 0),
+                story_interactions=story_interactions,
+                total_interactions=_safe_int(
+                    summary.get(
+                        "total_interactions",
+                        summary.get(
+                            "total_story_interactions",
+                            len(interactions) if interactions else len(story_interactions),
+                        ),
+                    )
+                    or 0
+                ),
                 raw_result=flow_result,
                 error_message=job.error_message,
                 completed_at=job.completed_at,
@@ -326,6 +454,11 @@ async def get_scraping_results(
             logger.warning(
                 "Perfil não encontrado para job %s; retornando resultado baseado no metadata/job sem consulta de perfil.",
                 job.id,
+            )
+            story_interactions = (
+                _normalize_story_interactions(flow_result.get("story_interactions", []))
+                if flow == "stories_interactions" and isinstance(flow_result, dict)
+                else []
             )
             return ScrapingCompleteResponse(
                 job_id=job.id,
@@ -340,6 +473,7 @@ async def get_scraping_results(
                     "follower_count": None,
                     "posts": [],
                 },
+                story_interactions=story_interactions,
                 total_posts=_safe_int(job.posts_scraped, 0),
                 total_interactions=_safe_int(job.interactions_scraped, 0),
                 raw_result=flow_result if isinstance(flow_result, dict) else None,
@@ -979,10 +1113,26 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
             except Exception:
                 recent_days = int(opts.get("recent_days", 1))
         max_like_users_per_post = int(opts.get("max_like_users_per_post", 30))
-        session_username = str(opts.get("session_username") or "").strip() or None
+        max_story_interactions = int(opts.get("max_story_interactions", 300))
+        session_username = _normalize_session_username(
+            str(opts.get("session_username") or "")
+        )
         # Etapa de enriquecimento de perfis curtidores foi removida do /scrape.
         # Mesmo que venha true na request, forçamos false neste job.
         collect_like_user_profiles = False
+
+        if flow == "stories_interactions":
+            if not session_username:
+                raise RuntimeError(
+                    "Fluxo stories_interactions exige session_username ativo. "
+                    "Login no Instagram e obrigatorio para coletar interacoes de stories."
+                )
+            active_session = _get_active_instagram_session(db, session_username)
+            if not active_session:
+                raise RuntimeError(
+                    f"Sessao Instagram '@{session_username}' nao encontrada ou inativa. "
+                    "Login no Instagram e obrigatorio para coletar interacoes de stories."
+                )
 
         # Executar scraping de acordo com o fluxo.
         if test_mode:
@@ -1038,6 +1188,33 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
                         "scraped_at": datetime.utcnow().isoformat(),
                     },
                 }
+            elif flow == "stories_interactions":
+                result = {
+                    "status": "success",
+                    "flow": "stories_interactions",
+                    "profile": {
+                        "username": fake_username,
+                        "profile_url": fake_profile_url,
+                    },
+                    "story_interactions": [
+                        {
+                            "type": "view",
+                            "user_url": "https://www.instagram.com/dummy_viewer_1/",
+                            "user_username": "dummy_viewer_1",
+                        },
+                        {
+                            "type": "reaction",
+                            "user_url": "https://www.instagram.com/dummy_viewer_2/",
+                            "user_username": "dummy_viewer_2",
+                        },
+                    ],
+                    "summary": {
+                        "total_posts": 0,
+                        "total_story_interactions": 2,
+                        "total_interactions": 2,
+                        "scraped_at": datetime.utcnow().isoformat(),
+                    },
+                }
             else:
                 result = {
                     "status": "success",
@@ -1076,6 +1253,13 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
                 db=db,
                 session_username=session_username,
             )
+        elif flow == "stories_interactions":
+            result = await instagram_scraper.scrape_stories_interactions(
+                profile_url=profile_url,
+                db=db,
+                session_username=session_username,
+                max_interactions=max_story_interactions,
+            )
         else:
             result = await instagram_scraper.scrape_profile(
                 profile_url=profile_url,
@@ -1091,6 +1275,11 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
         total_posts = int(summary.get("total_posts", 0) or 0)
         if flow == "recent_likes":
             total_interactions = int(summary.get("total_like_users", 0) or 0)
+        elif flow == "stories_interactions":
+            total_interactions = int(
+                summary.get("total_story_interactions", summary.get("total_interactions", 0))
+                or 0
+            )
         else:
             total_interactions = int(summary.get("total_interactions", 0) or 0)
 

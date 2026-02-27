@@ -614,6 +614,52 @@ class BrowserUseAgent:
             return obj
         return None
 
+    def _normalize_story_interaction_type(self, value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        if not raw:
+            return ""
+
+        replacements = str.maketrans(
+            {
+                "á": "a",
+                "à": "a",
+                "â": "a",
+                "ã": "a",
+                "é": "e",
+                "ê": "e",
+                "í": "i",
+                "ó": "o",
+                "ô": "o",
+                "õ": "o",
+                "ú": "u",
+                "ç": "c",
+            }
+        )
+        normalized = raw.translate(replacements).replace("-", "_").replace(" ", "_")
+        normalized = normalized.replace("/", "_").replace("__", "_")
+
+        if any(token in normalized for token in ("view", "visual", "viewer", "seen", "watch")):
+            return "view"
+        if "like" in normalized or "curt" in normalized:
+            return "like"
+        if "reply" in normalized or "respost" in normalized:
+            return "reply"
+        if "reaction" in normalized or "react" in normalized or "emoji" in normalized:
+            return "reaction"
+        if "poll" in normalized or "enquete" in normalized:
+            return "poll_vote"
+        if "quiz" in normalized:
+            return "quiz_answer"
+        if "question" in normalized or "pergunta" in normalized:
+            return "question_reply"
+        if "mention" in normalized or "mencao" in normalized:
+            return "mention_tap"
+        if "link" in normalized:
+            return "link_click"
+        if "sticker" in normalized:
+            return "sticker_tap"
+        return normalized
+
     async def _send_cdp_command(
         self,
         browser_session: BrowserSession,
@@ -1909,6 +1955,312 @@ class BrowserUseAgent:
                 "post_url": post_url,
                 "comments_accessible": False,
                 "comments": [],
+                "total_collected": 0,
+                "error": "all_retries_failed",
+            }
+        finally:
+            self._cleanup_storage_state_temp_file(storage_state_file)
+
+    async def scrape_story_interactions(
+        self,
+        profile_url: str,
+        storage_state: Optional[Dict[str, Any]],
+        max_interactions: int = 300,
+    ) -> Dict[str, Any]:
+        """
+        Abre stories de um perfil e tenta extrair lista de usuarios + tipo de interacao.
+        """
+        max_retries = getattr(settings, "browser_use_max_retries", 3)
+        retry_delay = 5
+        safe_max_interactions = max(1, int(max_interactions))
+        reconnect_url = self._get_browserless_reconnect_url(storage_state)
+        session_info = self._get_browserless_session_info(storage_state)
+        session_connect_url = (
+            session_info.get("connect") if isinstance(session_info.get("connect"), str) else None
+        )
+        clean_storage_state = self._sanitize_storage_state(storage_state)
+        storage_state_file = self._write_storage_state_temp_file(storage_state)
+        storage_state_for_session: Optional[Union[Dict[str, Any], str]]
+        storage_state_for_session = storage_state_file or clean_storage_state
+
+        try:
+            if not storage_state:
+                return {
+                    "profile_url": profile_url,
+                    "stories_accessible": False,
+                    "story_interactions": [],
+                    "total_collected": 0,
+                    "error": "login_required",
+                }
+
+            for attempt in range(1, max_retries + 1):
+                browser_session = None
+                restore_event_bus = None
+                try:
+                    logger.info(
+                        "Browser Use: Coletando interacoes de stories de %s (tentativa %s/%s)",
+                        profile_url,
+                        attempt,
+                        max_retries,
+                    )
+
+                    if not self.api_key:
+                        raise ValueError("OPENAI_API_KEY is required for Browser Use.")
+
+                    use_reconnect = bool(reconnect_url and attempt == 1)
+                    use_session_connect = bool(
+                        (not reconnect_url) and session_connect_url and attempt == 1
+                    )
+                    if use_reconnect:
+                        cdp_url = self._ensure_ws_token(reconnect_url)
+                    elif use_session_connect:
+                        cdp_url = self._ensure_ws_token(session_connect_url)
+                    else:
+                        cdp_url = await self._resolve_browserless_cdp_url()
+
+                    task = f"""
+                    Voce esta em um navegador autenticado no Instagram.
+                    Sua tarefa e extrair interacoes de stories do perfil abaixo:
+                    - {profile_url}
+
+                    PASSOS:
+                    1) Acesse o perfil informado.
+                    2) Abra o story ativo (anel/foto de perfil com story).
+                    3) Percorra os stories ativos desse perfil.
+                    4) Para cada story, abra a lista de visualizacoes/interacoes quando disponivel.
+                    5) Colete ate {safe_max_interactions} pares unicos (usuario + tipo).
+
+                    TIPOS ACEITOS (use exatamente um por item quando possivel):
+                    - view
+                    - like
+                    - reply
+                    - reaction
+                    - poll_vote
+                    - quiz_answer
+                    - question_reply
+                    - mention_tap
+                    - link_click
+                    - sticker_tap
+                    - other
+
+                    FORMATO DE SAIDA (JSON puro):
+                    {{
+                      "profile_url": "{profile_url}",
+                      "stories_accessible": true,
+                      "story_interactions": [
+                        {{
+                          "user_url": "https://www.instagram.com/usuario/",
+                          "user_username": "usuario",
+                          "type": "view"
+                        }}
+                      ],
+                      "total_collected": 1
+                    }}
+
+                    REGRAS:
+                    - Nao abra nova aba.
+                    - Nao invente usuarios.
+                    - Se nao houver stories ativos ou se interacoes nao estiverem acessiveis:
+                      {{
+                        "profile_url": "{profile_url}",
+                        "stories_accessible": false,
+                        "story_interactions": [],
+                        "error": "no_active_stories"
+                      }}
+                    - Se o login expirar:
+                      {{
+                        "profile_url": "{profile_url}",
+                        "stories_accessible": false,
+                        "story_interactions": [],
+                        "error": "login_required"
+                      }}
+                    """
+
+                    browser_session = self._create_browser_session(
+                        cdp_url,
+                        storage_state=storage_state_for_session,
+                    )
+                    llm = ChatOpenAI(model=self.model, api_key=self.api_key)
+                    agent = self._create_agent(
+                        task=task,
+                        llm=llm,
+                        browser_session=browser_session,
+                    )
+
+                    restore_event_bus = self._patch_event_bus_for_stop(browser_session)
+                    history = await agent.run()
+                    final_result = history.final_result() or ""
+
+                    if (
+                        (not history.is_successful())
+                        and self._contains_protocol_error(final_result)
+                        and attempt < max_retries
+                    ):
+                        wait_time = retry_delay * attempt
+                        logger.warning(
+                            "Sessao CDP instavel ao coletar stories (%s/%s). Retentando em %ss...",
+                            attempt,
+                            max_retries,
+                            wait_time,
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+
+                    data = self._extract_json_object_with_key(
+                        final_result,
+                        "stories_accessible",
+                    )
+                    if data is None:
+                        logger.warning(
+                            "Falha ao extrair JSON de interacoes de stories: %s",
+                            final_result[:180],
+                        )
+                        if self._contains_protocol_error(final_result) and attempt < max_retries:
+                            wait_time = retry_delay * attempt
+                            logger.warning(
+                                "Falha de protocolo nas interacoes de stories (%s/%s). Retentando em %ss...",
+                                attempt,
+                                max_retries,
+                                wait_time,
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+                        failure_error = self._classify_agent_failure_error(
+                            final_result=final_result,
+                            history=history,
+                        )
+                        return {
+                            "profile_url": profile_url,
+                            "stories_accessible": False,
+                            "story_interactions": [],
+                            "total_collected": 0,
+                            "error": failure_error,
+                            "raw_result": final_result or self._history_errors_text(history),
+                        }
+
+                    if data.get("error") == "login_required" and attempt < max_retries:
+                        wait_time = retry_delay * attempt
+                        logger.warning(
+                            "Agente retornou login_required em stories (%s/%s). Retentando em %ss...",
+                            attempt,
+                            max_retries,
+                            wait_time,
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+
+                    normalized_items: List[Dict[str, str]] = []
+                    seen_keys: set[str] = set()
+
+                    for value in data.get("story_interactions", []) or []:
+                        if not isinstance(value, dict):
+                            continue
+
+                        interaction_type = self._normalize_story_interaction_type(
+                            value.get("type")
+                        )
+                        if not interaction_type:
+                            continue
+
+                        user_url = str(value.get("user_url") or "").strip()
+                        user_username = str(value.get("user_username") or "").strip().lstrip("@")
+
+                        if user_url.startswith("/"):
+                            user_url = f"https://www.instagram.com{user_url}"
+                        if not user_url and user_username:
+                            user_url = f"https://www.instagram.com/{user_username}/"
+
+                        if user_url and "instagram.com" in user_url:
+                            parsed_user = urlparse(user_url)
+                            path_parts = [part for part in parsed_user.path.split("/") if part]
+                            if path_parts:
+                                normalized_username = path_parts[0].strip().lstrip("@")
+                                if normalized_username:
+                                    user_username = user_username or normalized_username
+                                    user_url = f"https://www.instagram.com/{normalized_username}/"
+
+                        if not user_url and not user_username:
+                            continue
+
+                        dedupe_key = f"{user_url or user_username}|{interaction_type}"
+                        if dedupe_key in seen_keys:
+                            continue
+                        seen_keys.add(dedupe_key)
+
+                        normalized_items.append(
+                            {
+                                "user_url": user_url or "",
+                                "user_username": user_username or "",
+                                "type": interaction_type,
+                            }
+                        )
+                        if len(normalized_items) >= safe_max_interactions:
+                            break
+
+                    stories_accessible = bool(data.get("stories_accessible"))
+                    if normalized_items and not stories_accessible:
+                        stories_accessible = True
+
+                    return {
+                        "profile_url": data.get("profile_url") or profile_url,
+                        "stories_accessible": stories_accessible,
+                        "story_interactions": normalized_items,
+                        "total_collected": len(normalized_items),
+                        "error": data.get("error"),
+                    }
+
+                except Exception as exc:
+                    failure_error = self._classify_agent_failure_error(exc=exc)
+                    if failure_error == "rate_limit_exceeded":
+                        return {
+                            "profile_url": profile_url,
+                            "stories_accessible": False,
+                            "story_interactions": [],
+                            "total_collected": 0,
+                            "error": failure_error,
+                        }
+                    error_msg = str(exc).lower()
+                    is_retryable = any(
+                        marker in error_msg
+                        for marker in (
+                            "http 500",
+                            "connection",
+                            "timeout",
+                            "websocket",
+                            "failed to establish",
+                            "protocol error",
+                            "reserved bits",
+                            "client is stopping",
+                        )
+                    )
+                    if is_retryable and attempt < max_retries:
+                        wait_time = retry_delay * attempt
+                        logger.warning(
+                            "Tentativa %s/%s falhou ao coletar stories: %s. Retentando em %ss...",
+                            attempt,
+                            max_retries,
+                            str(exc)[:120],
+                            wait_time,
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    return {
+                        "profile_url": profile_url,
+                        "stories_accessible": False,
+                        "story_interactions": [],
+                        "total_collected": 0,
+                        "error": str(exc),
+                    }
+                finally:
+                    if callable(restore_event_bus):
+                        restore_event_bus()
+                    if browser_session:
+                        await self._detach_browser_session(browser_session)
+
+            return {
+                "profile_url": profile_url,
+                "stories_accessible": False,
+                "story_interactions": [],
                 "total_collected": 0,
                 "error": "all_retries_failed",
             }

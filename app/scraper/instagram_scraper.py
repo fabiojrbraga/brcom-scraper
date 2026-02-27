@@ -1106,6 +1106,136 @@ class InstagramScraper:
             logger.exception("❌ Erro no fluxo recent_likes para %s: %s", profile_url, exc)
             raise
 
+    async def scrape_stories_interactions(
+        self,
+        profile_url: str,
+        db: Optional[Session] = None,
+        session_username: Optional[str] = None,
+        max_interactions: int = 300,
+    ) -> Dict[str, Any]:
+        """
+        Coleta interacoes de stories (usuario + tipo) para o perfil informado.
+        Requer sessao autenticada valida do Instagram.
+        """
+        try:
+            logger.info("🚀 Iniciando fluxo stories_interactions para %s", profile_url)
+
+            if not profile_url.startswith("http"):
+                profile_url = f"https://instagram.com/{profile_url}"
+            if not profile_url.endswith("/"):
+                profile_url = f"{profile_url}/"
+
+            normalized_session_username = (
+                str(session_username or "").strip().lstrip("@").lower() or None
+            )
+            if not normalized_session_username:
+                raise RuntimeError(
+                    "session_username e obrigatorio no fluxo stories_interactions."
+                )
+
+            username = self._extract_username_from_url(profile_url)
+            safe_max_interactions = max(1, int(max_interactions or 300))
+
+            storage_state = (
+                await browser_use_agent.ensure_instagram_session(
+                    db,
+                    instagram_username=normalized_session_username,
+                )
+                if db
+                else None
+            )
+            if not storage_state:
+                raise RuntimeError(
+                    f"Sessao Instagram '@{normalized_session_username}' nao encontrada ou invalida. "
+                    "E necessario estar logado no Instagram para coletar interacoes de stories."
+                )
+
+            raw_result = await browser_use_agent.scrape_story_interactions(
+                profile_url=profile_url,
+                storage_state=storage_state,
+                max_interactions=safe_max_interactions,
+            )
+
+            raw_items = raw_result.get("story_interactions", [])
+            normalized_interactions: List[Dict[str, Any]] = []
+            seen_keys: set[str] = set()
+
+            if isinstance(raw_items, list):
+                for item in raw_items:
+                    if not isinstance(item, dict):
+                        continue
+
+                    interaction_type = str(item.get("type") or "").strip().lower()
+                    user_username = str(item.get("user_username") or "").strip().lstrip("@")
+                    user_url = str(item.get("user_url") or "").strip()
+
+                    if user_url.startswith("/"):
+                        user_url = f"https://www.instagram.com{user_url}"
+                    if not user_url and user_username:
+                        user_url = f"https://www.instagram.com/{user_username}/"
+
+                    if user_url and "instagram.com" in user_url:
+                        parsed_user = urlparse(user_url)
+                        path_parts = [part for part in parsed_user.path.split("/") if part]
+                        if path_parts:
+                            normalized_username = path_parts[0].strip().lstrip("@")
+                            if normalized_username:
+                                user_username = user_username or normalized_username
+                                user_url = f"https://www.instagram.com/{normalized_username}/"
+
+                    if not interaction_type:
+                        continue
+                    if not user_url and not user_username:
+                        continue
+
+                    dedupe_key = f"{user_url or user_username}|{interaction_type}"
+                    if dedupe_key in seen_keys:
+                        continue
+                    seen_keys.add(dedupe_key)
+
+                    normalized_interactions.append(
+                        {
+                            "user_url": user_url or None,
+                            "user_username": user_username or None,
+                            "type": interaction_type,
+                        }
+                    )
+                    if len(normalized_interactions) >= safe_max_interactions:
+                        break
+
+            result: Dict[str, Any] = {
+                "status": "success",
+                "flow": "stories_interactions",
+                "profile": {
+                    "username": username,
+                    "profile_url": profile_url,
+                },
+                "posts": [],
+                "story_interactions": normalized_interactions,
+                "summary": {
+                    "total_posts": 0,
+                    "total_story_interactions": len(normalized_interactions),
+                    "total_interactions": len(normalized_interactions),
+                    "scraped_at": datetime.utcnow().isoformat(),
+                },
+            }
+
+            if isinstance(raw_result, dict):
+                result["stories_accessible"] = bool(
+                    raw_result.get("stories_accessible", bool(normalized_interactions))
+                )
+                if raw_result.get("error"):
+                    result["error"] = raw_result.get("error")
+
+            logger.info(
+                "✅ Fluxo stories_interactions concluido: interacoes=%s",
+                len(normalized_interactions),
+            )
+            return result
+        except Exception as exc:
+            logger.exception("❌ Erro no fluxo stories_interactions para %s: %s", profile_url, exc)
+            raise
+
     async def _scrape_posts(
         self,
         profile_url: str,
