@@ -1973,6 +1973,14 @@ class BrowserUseAgent:
         max_retries = getattr(settings, "browser_use_max_retries", 3)
         retry_delay = 5
         safe_max_interactions = max(1, int(max_interactions))
+        parsed_profile_url = urlparse(profile_url or "")
+        path_parts = [part for part in parsed_profile_url.path.split("/") if part]
+        profile_username = (path_parts[0].strip().lstrip("@") if path_parts else "").lower()
+        story_url = (
+            f"https://www.instagram.com/stories/{profile_username}/"
+            if profile_username
+            else "https://www.instagram.com/stories/"
+        )
         reconnect_url = self._get_browserless_reconnect_url(storage_state)
         session_info = self._get_browserless_session_info(storage_state)
         session_connect_url = (
@@ -2024,8 +2032,10 @@ class BrowserUseAgent:
                     - {profile_url}
 
                     PASSOS:
-                    1) Acesse o perfil informado.
-                    2) Abra o story ativo (anel/foto de perfil com story).
+                    1) Primeiro tente abrir diretamente os stories em: {story_url}
+                    2) Se a URL acima nao abrir viewer de stories, acesse o perfil: {profile_url}
+                    3) No perfil, abra o story ativo clicando em elemento clicavel (link/botao) que leva a /stories/, evitando clicar apenas na tag img.
+                    4) Se houver banner/modal (ex.: botao Dismiss), feche antes de tentar abrir o story.
                     3) Percorra os stories ativos desse perfil.
                     4) Para cada story, abra a lista de visualizacoes/interacoes quando disponivel.
                     5) Colete ate {safe_max_interactions} pares unicos (usuario + tipo).
@@ -2060,7 +2070,15 @@ class BrowserUseAgent:
                     REGRAS:
                     - Nao abra nova aba.
                     - Nao invente usuarios.
-                    - Se nao houver stories ativos ou se interacoes nao estiverem acessiveis:
+                    - Retorne "no_active_stories" somente quando conseguir confirmar que nao existe story ativo.
+                    - Se houver indicio de story ativo (anel de story visivel) mas nao conseguir abrir o viewer/lista de interacoes, retorne:
+                      {{
+                        "profile_url": "{profile_url}",
+                        "stories_accessible": false,
+                        "story_interactions": [],
+                        "error": "story_open_failed"
+                      }}
+                    - Se nao houver stories ativos:
                       {{
                         "profile_url": "{profile_url}",
                         "stories_accessible": false,
@@ -2201,12 +2219,34 @@ class BrowserUseAgent:
                     if normalized_items and not stories_accessible:
                         stories_accessible = True
 
+                    reported_error = str(data.get("error") or "").strip().lower() or None
+                    judge_failed = not history.is_successful()
+                    likely_false_no_story = (
+                        judge_failed
+                        and not normalized_items
+                        and (reported_error in (None, "", "no_active_stories"))
+                    )
+                    if likely_false_no_story:
+                        if attempt < max_retries:
+                            wait_time = retry_delay * attempt
+                            logger.warning(
+                                "Judge marcou falha com no_active_stories em stories (%s/%s). Retentando em %ss...",
+                                attempt,
+                                max_retries,
+                                wait_time,
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+                        reported_error = "story_open_failed"
+                        stories_accessible = False
+
                     return {
                         "profile_url": data.get("profile_url") or profile_url,
                         "stories_accessible": stories_accessible,
                         "story_interactions": normalized_items,
                         "total_collected": len(normalized_items),
-                        "error": data.get("error"),
+                        "error": reported_error,
+                        "raw_result": final_result,
                     }
 
                 except Exception as exc:

@@ -1155,6 +1155,7 @@ class InstagramScraper:
                 storage_state=storage_state,
                 max_interactions=safe_max_interactions,
             )
+            raw_error = str(raw_result.get("error") or "").strip().lower()
 
             raw_items = raw_result.get("story_interactions", [])
             normalized_interactions: List[Dict[str, Any]] = []
@@ -1226,6 +1227,17 @@ class InstagramScraper:
                 )
                 if raw_result.get("error"):
                     result["error"] = raw_result.get("error")
+                if raw_result.get("raw_result"):
+                    result["raw_result"] = raw_result.get("raw_result")
+
+            if (
+                raw_error == "story_open_failed"
+                and not normalized_interactions
+            ):
+                logger.warning(
+                    "Falha ao abrir viewer de stories para %s; evitando falso no_active_stories.",
+                    profile_url,
+                )
 
             logger.info(
                 "✅ Fluxo stories_interactions concluido: interacoes=%s",

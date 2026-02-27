@@ -1268,6 +1268,13 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
                 session_username=session_username,
             )
 
+        if flow == "stories_interactions" and isinstance(result, dict):
+            story_error = str(result.get("error") or "").strip().lower()
+            if story_error == "story_open_failed":
+                raise RuntimeError(
+                    "Falha ao abrir viewer de stories; nao foi possivel confirmar as interacoes."
+                )
+
         # Atualizar job com resultados
         job.status = "completed"
         job.completed_at = datetime.utcnow()
