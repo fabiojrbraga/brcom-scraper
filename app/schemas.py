@@ -304,13 +304,6 @@ class ScrapingResultInteraction(BaseModel):
     comment_text: Optional[str] = None
 
 
-class ScrapingStoryInteraction(BaseModel):
-    """Interacao de story (usuario + tipo)."""
-    user_username: Optional[str] = None
-    user_url: Optional[str] = None
-    type: str
-
-
 class ScrapingStoryLikedUser(BaseModel):
     """Usuario que deu like no story."""
     user_username: Optional[str] = None
@@ -378,7 +371,6 @@ class ScrapingCompleteResponse(BaseModel):
     profile: Optional[ScrapingResultProfile] = None
     extracted_posts: List[ScrapingRecentPostResult] = []
     story_posts: List[ScrapingStoryPostResult] = []
-    story_interactions: List[ScrapingStoryInteraction] = []
     total_posts: int = 0
     total_interactions: int = 0
     raw_result: Optional[Dict[str, Any]] = None

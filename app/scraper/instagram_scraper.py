@@ -1163,7 +1163,6 @@ class InstagramScraper:
                 raw_story_posts = raw_result.get("stories") or []
 
             normalized_story_posts: List[Dict[str, Any]] = []
-            normalized_interactions: List[Dict[str, Any]] = []
             seen_story_keys: set[str] = set()
             seen_like_keys: set[str] = set()
 
@@ -1187,23 +1186,37 @@ class InstagramScraper:
                 except Exception:
                     return None
 
+            def _normalize_story_url(value: Any) -> str:
+                raw_url = str(value or "").strip()
+                if not raw_url:
+                    return ""
+                if raw_url.startswith("/"):
+                    raw_url = f"https://www.instagram.com{raw_url}"
+                parsed_story = urlparse(raw_url)
+                path_parts = [part for part in parsed_story.path.split("/") if part]
+                if len(path_parts) >= 3 and path_parts[0].lower() == "stories":
+                    username_part = path_parts[1].strip().lstrip("@")
+                    story_id_part = path_parts[2].strip()
+                    if username_part and story_id_part:
+                        return f"https://www.instagram.com/stories/{username_part}/{story_id_part}/"
+                if raw_url and "/stories/" in raw_url and not raw_url.endswith("/"):
+                    raw_url = f"{raw_url}/"
+                return raw_url
+
             if isinstance(raw_story_posts, list):
                 for story in raw_story_posts:
                     if not isinstance(story, dict):
                         continue
 
-                    story_url = str(
+                    story_url = _normalize_story_url(
                         story.get("story_url")
                         or story.get("url")
                         or story.get("post_url")
-                        or ""
-                    ).strip()
-                    if story_url.startswith("/"):
-                        story_url = f"https://www.instagram.com{story_url}"
-                    if story_url and "/stories/" in story_url and not story_url.endswith("/"):
-                        story_url = f"{story_url}/"
+                    )
+                    if not story_url:
+                        continue
 
-                    story_key = story_url or f"story::{len(normalized_story_posts)}"
+                    story_key = story_url
                     if story_key in seen_story_keys:
                         continue
                     seen_story_keys.add(story_key)
@@ -1267,18 +1280,11 @@ class InstagramScraper:
                         }
                         liked_users.append(liked_user_payload)
 
-                        global_like_key = f"{user_url or user_username}|like"
-                        if global_like_key not in seen_like_keys:
+                        global_like_key = user_url or user_username
+                        if global_like_key:
                             seen_like_keys.add(global_like_key)
-                            normalized_interactions.append(
-                                {
-                                    "user_url": user_url or None,
-                                    "user_username": user_username or None,
-                                    "type": "like",
-                                }
-                            )
-                            if len(normalized_interactions) >= safe_max_interactions:
-                                break
+                        if len(seen_like_keys) >= safe_max_interactions:
+                            break
 
                     normalized_story_posts.append(
                         {
@@ -1287,10 +1293,10 @@ class InstagramScraper:
                             "liked_users": liked_users,
                         }
                     )
-                    if len(normalized_interactions) >= safe_max_interactions:
+                    if len(seen_like_keys) >= safe_max_interactions:
                         break
 
-            total_liked_users = len(normalized_interactions)
+            total_liked_users = len(seen_like_keys)
             total_story_posts = len(normalized_story_posts)
 
             result: Dict[str, Any] = {
@@ -1302,7 +1308,6 @@ class InstagramScraper:
                 },
                 "posts": [],
                 "story_posts": normalized_story_posts,
-                "story_interactions": normalized_interactions,
                 "summary": {
                     "total_posts": total_story_posts,
                     "total_story_posts": total_story_posts,
@@ -1315,7 +1320,7 @@ class InstagramScraper:
 
             if isinstance(raw_result, dict):
                 result["stories_accessible"] = bool(
-                    raw_result.get("stories_accessible", bool(normalized_interactions))
+                    raw_result.get("stories_accessible", bool(normalized_story_posts))
                 )
                 if raw_result.get("error"):
                     result["error"] = raw_result.get("error")
@@ -1324,7 +1329,7 @@ class InstagramScraper:
 
             if (
                 raw_error == "story_open_failed"
-                and not normalized_interactions
+                and not normalized_story_posts
             ):
                 logger.warning(
                     "Falha ao abrir viewer de stories para %s; evitando falso no_active_stories.",
@@ -1332,8 +1337,9 @@ class InstagramScraper:
                 )
 
             logger.info(
-                "✅ Fluxo stories_interactions concluido: interacoes=%s",
-                len(normalized_interactions),
+                "✅ Fluxo stories_interactions concluido: story_posts=%s likes=%s",
+                total_story_posts,
+                total_liked_users,
             )
             return result
         except Exception as exc:
