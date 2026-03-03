@@ -2115,22 +2115,29 @@ class BrowserUseAgent:
                     PASSOS OBRIGATORIOS:
                     1) Abra primeiro: {story_url}
                     2) Se nao abrir o viewer, acesse {profile_url} e entre no story ativo por elemento clicavel que leve a /stories/.
-                    3) Em cada story aberto, leia a URL atual da barra (deve conter /stories/<perfil>/<story_id>/).
-                    4) No canto inferior do frame, localize o link de visualizacoes ("Visto por X"/"Seen by X") e capture o numero de views.
-                    5) Clique nesse link para abrir o popup/lista de visualizadores.
-                    6) Aguarde 10 segundos completos para carregamento total.
+                    3) Em cada iteracao, confirme que a URL atual contem /stories/<perfil>/<story_id>/.
+                       - Se sair para feed/perfil (URL sem /stories/), volte imediatamente para o ultimo story_url valido e continue.
+                    4) Em cada story aberto, leia e salve a URL atual da barra (story_url) e o story_id.
+                    5) No canto inferior do frame, localize o link de visualizacoes ("Visto por X"/"Seen by X") e capture o numero de views.
+                    6) Clique nesse link para abrir o popup/lista de visualizadores.
+                    7) Valide que o popup abriu de verdade (modal "Visualizadores"/"Viewers" visivel).
+                       - Se nao abrir, tente novamente no maximo 2 vezes no mesmo story.
+                       - Se ainda falhar, marque esse story como falha de abertura e avance para o proximo.
+                    8) Aguarde 10 segundos completos para carregamento total.
                        - Essa espera e obrigatoria em TODO story (sempre execute wait: seconds: 10, mesmo que a lista ja esteja visivel).
-                    7) Colete SOMENTE os usuarios com badge de coracao vermelho no avatar (usuarios que deram like no story).
+                    9) Colete SOMENTE os usuarios com badge de coracao vermelho no avatar (usuarios que deram like no story).
                        - O badge e um pequeno coracao vermelho sobreposto no avatar.
                        - Sem esse badge, o usuario e APENAS visualizador e nao deve ser incluido.
-                    8) Para cada usuario com like, extraia:
+                    10) Para cada usuario com like, extraia:
                        - user_username
                        - user_url no formato https://www.instagram.com/<username>/
                        - badge_heart_red: true
-                    9) Feche o popup clicando fora da janela/modal, retornando ao frame do story.
-                    10) Avance para o proximo story usando a seta lateral DIREITA do viewer.
-                    11) Depois de clicar na seta direita, confirme que a story_url mudou (novo story_id). Se nao mudar, tente novamente.
-                    12) Repita ate acabar stories ativos, detectar repeticao de story_url, ou atingir o limite.
+                    11) Feche o popup clicando fora da janela/modal, retornando ao frame do story.
+                    12) Avance para o proximo story usando a seta lateral DIREITA do viewer.
+                    13) Depois de clicar na seta direita, confirme que a story_url mudou (novo story_id).
+                        - Se nao mudar, tente no maximo 2 vezes.
+                        - Se repetir o mesmo story_id novamente, encerre para evitar loop.
+                    14) Repita ate acabar stories ativos, detectar repeticao de story_url/story_id, ou atingir o limite.
 
                     LIMITE:
                     - Nao ultrapasse {safe_max_interactions} usuarios curtidores no total.
@@ -2162,6 +2169,8 @@ class BrowserUseAgent:
                     - Nao inclua usuarios sem badge de coracao vermelho.
                     - O badge de coracao vermelho e obrigatorio para considerar like.
                     - Se nao conseguir confirmar visualmente o badge vermelho, nao inclua o usuario.
+                    - Nao mude para feed/home/explore durante a coleta. Se isso ocorrer, retorne imediatamente ao ultimo story_url valido.
+                    - So considere popup aberto quando o modal de visualizadores estiver visivel.
                     - Feche o popup clicando fora da janela antes de tentar navegar para o proximo story.
                     - Navegue para o proximo story pela seta direita e so prossiga quando a URL do story mudar.
                     - A espera de 10 segundos e obrigatoria: execute wait: seconds: 10 imediatamente apos abrir o popup e so depois colete usuarios.
