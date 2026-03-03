@@ -932,6 +932,153 @@ class BrowserUseAgent:
             return { popup_opened: false, liked_users: [] };
           }
 
+          const debug = {
+            passes: 0,
+            rows_scanned: 0,
+            heart_hits: 0
+          };
+
+          const usersMap = new Map();
+          const blocked = new Set(['stories', 'explore', 'accounts', 'p', 'reels']);
+
+          const parseRgb = (text) => {
+            const m = String(text || '').match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)/i);
+            if (!m) return null;
+            return { r: Number(m[1]), g: Number(m[2]), b: Number(m[3]) };
+          };
+
+          const isRedColor = (text) => {
+            const lowered = String(text || '').toLowerCase();
+            if (!lowered) return false;
+            if (
+              lowered.includes('#ed4956')
+              || lowered.includes('#ff3040')
+              || lowered.includes('#e0245e')
+              || lowered.includes('#f91880')
+            ) {
+              return true;
+            }
+            const rgb = parseRgb(lowered);
+            if (!rgb) return false;
+            return rgb.r >= 190 && rgb.g <= 130 && rgb.b <= 150;
+          };
+
+          const pickRow = (anchor) => {
+            let node = anchor;
+            let best = null;
+            while (node && node !== dialog) {
+              if (!(node instanceof HTMLElement)) {
+                node = node.parentElement;
+                continue;
+              }
+              const linkCount = node.querySelectorAll('a[href^="/"]').length;
+              const imgCount = node.querySelectorAll('img').length;
+              const rect = node.getBoundingClientRect();
+              const h = rect.height || node.clientHeight || 0;
+              const w = rect.width || node.clientWidth || 0;
+              if (h >= 24 && h <= 220 && w >= 90 && imgCount >= 1 && linkCount <= 6) {
+                best = node;
+              }
+              if (linkCount > 10 || h > (window.innerHeight * 0.9)) {
+                break;
+              }
+              node = node.parentElement;
+            }
+            return best || anchor.parentElement || anchor;
+          };
+
+          const rowHasHeartBadge = (row) => {
+            const rowRect = row.getBoundingClientRect();
+            const heartSelector = [
+              'svg[aria-label*="Liked"]',
+              'svg[aria-label*="Like"]',
+              'svg[aria-label*="Curt"]',
+              '[aria-label*="Liked"]',
+              '[aria-label*="Like"]',
+              '[aria-label*="Curti"]',
+              '[aria-label*="curti"]',
+              '[title*="Like"]',
+              '[title*="Curt"]'
+            ].join(',');
+            if (row.querySelector(heartSelector)) {
+              return true;
+            }
+
+            const elements = Array.from(row.querySelectorAll('*')).slice(0, 180);
+            for (const el of elements) {
+              const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+              const title = (el.getAttribute('title') || '').toLowerCase();
+              const dataTestId = (el.getAttribute('data-testid') || '').toLowerCase();
+              if (
+                aria.includes('liked') || aria.includes('curti')
+                || title.includes('liked') || title.includes('curti')
+                || dataTestId.includes('like') || dataTestId.includes('heart')
+              ) {
+                return true;
+              }
+
+              const fill = (el.getAttribute('fill') || '').toLowerCase();
+              const stroke = (el.getAttribute('stroke') || '').toLowerCase();
+              const styleAttr = (el.getAttribute('style') || '').toLowerCase();
+              const colorAttr = (el.getAttribute('color') || '').toLowerCase();
+              if (
+                isRedColor(fill) || isRedColor(stroke) || isRedColor(styleAttr) || isRedColor(colorAttr)
+              ) {
+                const rect = el.getBoundingClientRect();
+                const nearAvatar = rect.left <= rowRect.left + Math.min(140, rowRect.width * 0.45);
+                const smallIcon = rect.width <= 32 && rect.height <= 32;
+                if (nearAvatar && smallIcon) {
+                  return true;
+                }
+              }
+
+              try {
+                const cs = window.getComputedStyle(el);
+                if (isRedColor(cs.color) || isRedColor(cs.fill) || isRedColor(cs.stroke)) {
+                  const rect = el.getBoundingClientRect();
+                  const nearAvatar = rect.left <= rowRect.left + Math.min(140, rowRect.width * 0.45);
+                  const smallIcon = rect.width <= 32 && rect.height <= 32;
+                  if (nearAvatar && smallIcon) {
+                    return true;
+                  }
+                }
+              } catch (e) {}
+            }
+            return false;
+          };
+
+          const collectFromCurrentDom = () => {
+            debug.passes += 1;
+            const anchors = Array.from(dialog.querySelectorAll('a[href^="/"]'));
+            for (const anchor of anchors) {
+              const href = anchor.getAttribute('href') || '';
+              const m = href.match(/^\\/([^\\/?#\\.][^\\/?#]*)\\/?$/);
+              if (!m) continue;
+              const username = (m[1] || '').trim();
+              if (!username) continue;
+              if (blocked.has(username.toLowerCase())) continue;
+
+              const row = pickRow(anchor);
+              if (!row) continue;
+              debug.rows_scanned += 1;
+
+              if (!rowHasHeartBadge(row)) continue;
+              debug.heart_hits += 1;
+
+              if (!usersMap.has(username)) {
+                usersMap.set(username, {
+                  user_username: username,
+                  user_url: `https://www.instagram.com/${username}/`,
+                  badge_heart_red: true
+                });
+              }
+              if (usersMap.size >= maxUsers) break;
+            }
+          };
+
+          // Important: collect immediately before scrolling to avoid losing top rows in virtualized lists.
+          collectFromCurrentDom();
+
           let scrollable = null;
           const candidates = [dialog, ...Array.from(dialog.querySelectorAll('div,section,ul,ol'))];
           for (const el of candidates) {
@@ -944,80 +1091,35 @@ class BrowserUseAgent:
             } catch (e) {}
           }
 
-          if (scrollable) {
+          if (scrollable && usersMap.size < maxUsers) {
             let stagnantRounds = 0;
-            for (let i = 0; i < 60; i += 1) {
-              const before = scrollable.scrollHeight;
-              scrollable.scrollTop = before;
-              await sleep(250);
-              const after = scrollable.scrollHeight;
-              if (after <= before + 2) {
+            for (let i = 0; i < 80; i += 1) {
+              const beforeTop = scrollable.scrollTop;
+              const beforeHeight = scrollable.scrollHeight;
+              const step = Math.max(260, Math.floor(scrollable.clientHeight * 0.75));
+              scrollable.scrollTop = Math.min(beforeTop + step, scrollable.scrollHeight);
+              await sleep(280);
+
+              collectFromCurrentDom();
+              if (usersMap.size >= maxUsers) break;
+
+              const afterTop = scrollable.scrollTop;
+              const afterHeight = scrollable.scrollHeight;
+              const topUnchanged = Math.abs(afterTop - beforeTop) <= 2;
+              const heightUnchanged = Math.abs(afterHeight - beforeHeight) <= 2;
+              if (topUnchanged && heightUnchanged) {
                 stagnantRounds += 1;
               } else {
                 stagnantRounds = 0;
               }
-              if (stagnantRounds >= 3) {
-                break;
-              }
+              if (stagnantRounds >= 4) break;
             }
-          }
-
-          const heartSelector = [
-            'svg[aria-label*="Liked"]',
-            'svg[aria-label*="Like"]',
-            'svg[aria-label*="Curt"]',
-            '[aria-label*="Liked"]',
-            '[aria-label*="Like"]',
-            '[aria-label*="Curtiu"]',
-            '[aria-label*="curtiu"]'
-          ].join(',');
-
-          const usersMap = new Map();
-          const anchors = Array.from(dialog.querySelectorAll('a[href^="/"]'));
-          for (const anchor of anchors) {
-            const href = anchor.getAttribute('href') || '';
-            const m = href.match(/^\\/([^\\/?#\\.][^\\/?#]*)\\/?$/);
-            if (!m) continue;
-            const username = (m[1] || '').trim();
-            if (!username) continue;
-
-            const blocked = new Set(['stories', 'explore', 'accounts', 'p', 'reels']);
-            if (blocked.has(username.toLowerCase())) continue;
-
-            const row = anchor.closest('li,article,section,div') || anchor.parentElement;
-            if (!row) continue;
-
-            let hasHeart = false;
-            if (row.querySelector(heartSelector)) {
-              hasHeart = true;
-            }
-            if (!hasHeart) {
-              const maybeHeartSvg = Array.from(row.querySelectorAll('svg')).some((svg) => {
-                const label = (svg.getAttribute('aria-label') || '').toLowerCase();
-                if (label.includes('liked') || label.includes('like') || label.includes('curti')) {
-                  return true;
-                }
-                const fill = (svg.getAttribute('fill') || '').toLowerCase();
-                const style = (svg.getAttribute('style') || '').toLowerCase();
-                return fill === '#ed4956' || fill === '#ff3040' || style.includes('rgb(237, 73, 86)');
-              });
-              hasHeart = Boolean(maybeHeartSvg);
-            }
-
-            if (!hasHeart) continue;
-            if (!usersMap.has(username)) {
-              usersMap.set(username, {
-                user_username: username,
-                user_url: `https://www.instagram.com/${username}/`,
-                badge_heart_red: true
-              });
-            }
-            if (usersMap.size >= maxUsers) break;
           }
 
           return {
             popup_opened: true,
-            liked_users: Array.from(usersMap.values())
+            liked_users: Array.from(usersMap.values()),
+            debug
           };
         })()
         """
@@ -1260,6 +1362,7 @@ class BrowserUseAgent:
                 await asyncio.sleep(0.8)
 
             liked_users: List[Dict[str, str]] = []
+            extraction_debug: Dict[str, Any] = {}
             if popup_open:
                 max_remaining = max(1, safe_max_interactions - len(seen_like_keys))
                 extracted_raw = await self._evaluate_page_json(
@@ -1268,6 +1371,8 @@ class BrowserUseAgent:
                     max_remaining,
                 )
                 extracted_data = extracted_raw if isinstance(extracted_raw, dict) else {}
+                if isinstance(extracted_data.get("debug"), dict):
+                    extraction_debug = extracted_data.get("debug") or {}
                 raw_liked_users = extracted_data.get("liked_users") or []
                 if isinstance(raw_liked_users, list):
                     for raw_user in raw_liked_users:
@@ -1303,6 +1408,15 @@ class BrowserUseAgent:
                         )
                         if len(seen_like_keys) >= safe_max_interactions:
                             break
+
+            logger.info(
+                "Stories JS: story=%s views=%s popup_open=%s liked_users=%s debug=%s",
+                story_id,
+                view_count,
+                popup_open,
+                len(liked_users),
+                extraction_debug or None,
+            )
 
             story_posts.append(
                 {
