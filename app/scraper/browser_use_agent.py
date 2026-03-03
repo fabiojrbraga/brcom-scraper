@@ -554,6 +554,10 @@ class BrowserUseAgent:
             "connectionclosederror",
             "client is stopping",
             "sent 1002",
+            "browser not connected",
+            "cannot navigate - browser not connected",
+            "failed to establish cdp connection",
+            "root cdp client not initialized",
         )
         return any(marker in lowered for marker in markers)
 
@@ -765,6 +769,32 @@ class BrowserUseAgent:
             return story_id or None
         return None
 
+    async def _ensure_browser_session_connected(
+        self,
+        browser_session: BrowserSession,
+        timeout_ms: int = 15000,
+    ) -> None:
+        timeout_s = max(1.0, float(timeout_ms) / 1000.0)
+        errors: List[str] = []
+
+        for method_name in ("start", "connect"):
+            method = getattr(browser_session, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                await asyncio.wait_for(
+                    self._maybe_await(method()),
+                    timeout=timeout_s,
+                )
+                return
+            except Exception as exc:
+                errors.append(f"{method_name}: {exc}")
+
+        details = "; ".join(errors) if errors else "no start/connect method available"
+        raise RuntimeError(
+            f"failed to establish cdp connection (browser not connected): {details}"
+        )
+
     async def _navigate_to_url_with_timeout(
         self,
         browser_session: BrowserSession,
@@ -772,6 +802,7 @@ class BrowserUseAgent:
         timeout_ms: int = 15000,
         new_tab: bool = False,
     ) -> None:
+        await self._ensure_browser_session_connected(browser_session, timeout_ms=timeout_ms)
         try:
             from browser_use.browser.events import NavigateToUrlEvent
 
