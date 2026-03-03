@@ -1,6 +1,6 @@
-"""
-Integração com Browser Use para automação inteligente de navegador.
-Browser Use usa IA para tomar decisões autônomas durante a navegação.
+﻿"""
+IntegraÃ§Ã£o com Browser Use para automaÃ§Ã£o inteligente de navegador.
+Browser Use usa IA para tomar decisÃµes autÃ´nomas durante a navegaÃ§Ã£o.
 """
 
 import logging
@@ -29,8 +29,8 @@ class BrowserUseAgent:
     """
     Agente que usa Browser Use para navegar e interagir com o Instagram.
     
-    Browser Use é uma biblioteca que permite que um modelo de IA (Claude/GPT)
-    controle um navegador de forma autônoma, simulando comportamento humano.
+    Browser Use Ã© uma biblioteca que permite que um modelo de IA (Claude/GPT)
+    controle um navegador de forma autÃ´noma, simulando comportamento humano.
     """
 
     def __init__(self):
@@ -650,18 +650,18 @@ class BrowserUseAgent:
 
         replacements = str.maketrans(
             {
-                "á": "a",
-                "à": "a",
-                "â": "a",
-                "ã": "a",
-                "é": "e",
-                "ê": "e",
-                "í": "i",
-                "ó": "o",
-                "ô": "o",
-                "õ": "o",
-                "ú": "u",
-                "ç": "c",
+                "Ã¡": "a",
+                "Ã ": "a",
+                "Ã¢": "a",
+                "Ã£": "a",
+                "Ã©": "e",
+                "Ãª": "e",
+                "Ã­": "i",
+                "Ã³": "o",
+                "Ã´": "o",
+                "Ãµ": "o",
+                "Ãº": "u",
+                "Ã§": "c",
             }
         )
         normalized = raw.translate(replacements).replace("-", "_").replace(" ", "_")
@@ -1160,7 +1160,7 @@ class BrowserUseAgent:
             const aria = (el.getAttribute('aria-label') || '').toLowerCase();
             const txt = (el.textContent || '').trim().toLowerCase();
             return aria.includes('close') || aria.includes('dismiss') || aria.includes('fechar')
-              || txt === 'x' || txt === '×';
+              || txt === 'x' || txt === 'Ã—';
           });
           if (closeEl) {
             closeEl.click();
@@ -1187,6 +1187,19 @@ class BrowserUseAgent:
 
         click_next_story_script = """
         (...args) => {
+          const tryClick = (el, method) => {
+            if (!el) return null;
+            try {
+              el.scrollIntoView({ block: 'center', inline: 'center' });
+            } catch (e) {}
+            try {
+              el.click();
+              return { clicked: true, method };
+            } catch (e) {
+              return null;
+            }
+          };
+
           const candidates = Array.from(document.querySelectorAll('button,div[role="button"],a'));
           const rightSide = candidates
             .map((el) => ({ el, rect: el.getBoundingClientRect() }))
@@ -1195,20 +1208,36 @@ class BrowserUseAgent:
           const byLabel = rightSide.find((item) => {
             const aria = (item.el.getAttribute('aria-label') || '').toLowerCase();
             const txt = (item.el.textContent || '').toLowerCase();
-            return aria.includes('next') || aria.includes('próximo') || aria.includes('proximo')
-              || aria.includes('avanç') || aria.includes('seguinte')
-              || txt.includes('next') || txt.includes('próximo') || txt.includes('proximo');
+            return aria.includes('next') || aria.includes('next story')
+              || aria.includes('prÃ³ximo') || aria.includes('proximo')
+              || aria.includes('avanÃ§') || aria.includes('seguinte')
+              || txt.includes('next') || txt.includes('prÃ³ximo') || txt.includes('proximo');
           });
+          const byLabelResult = tryClick(byLabel ? byLabel.el : null, 'button_label');
+          if (byLabelResult) return byLabelResult;
 
-          const target = byLabel ? byLabel.el : (rightSide.length ? rightSide[rightSide.length - 1].el : null);
-          if (!target) {
-            return { clicked: false, reason: 'next_not_found' };
-          }
+          const genericTarget = rightSide.length ? rightSide[rightSide.length - 1].el : null;
+          const genericResult = tryClick(genericTarget, 'button_right');
+          if (genericResult) return genericResult;
+
           try {
-            target.scrollIntoView({ block: 'center', inline: 'center' });
+            const x = Math.max(2, Math.floor(window.innerWidth - 24));
+            const y = Math.max(2, Math.floor(window.innerHeight / 2));
+            const edgeTarget = document.elementFromPoint(x, y);
+            if (edgeTarget) {
+              edgeTarget.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+              return { clicked: true, method: 'edge_click' };
+            }
           } catch (e) {}
-          target.click();
-          return { clicked: true };
+
+          try {
+            const evt = new KeyboardEvent('keydown', { key: 'ArrowRight', code: 'ArrowRight', bubbles: true });
+            document.dispatchEvent(evt);
+            window.dispatchEvent(evt);
+            return { clicked: true, method: 'keyboard_arrow' };
+          } catch (e) {}
+
+          return { clicked: false, reason: 'next_not_found' };
         }
         """
 
@@ -1377,7 +1406,7 @@ class BrowserUseAgent:
                 view_count = None
 
             popup_open = False
-            for _popup_try in range(2):
+            for _popup_try in range(3):
                 click_raw = await self._evaluate_page_json(page, click_seen_by_script)
                 click_data = click_raw if isinstance(click_raw, dict) else {}
                 if not click_data.get("clicked"):
@@ -1395,7 +1424,7 @@ class BrowserUseAgent:
             liked_users: List[Dict[str, str]] = []
             extraction_debug: Dict[str, Any] = {}
             if popup_open:
-                max_remaining = max(1, safe_max_interactions - total_viewers_collected)
+                max_remaining = max(1, safe_max_interactions)
                 extracted_raw = await self._evaluate_page_json(
                     page,
                     extract_story_viewers_script,
@@ -1434,8 +1463,6 @@ class BrowserUseAgent:
                         viewer_key = user_url or username
                         if viewer_key in seen_story_viewer_keys:
                             continue
-                        if total_viewers_collected >= safe_max_interactions:
-                            break
                         seen_story_viewer_keys.add(viewer_key)
                         viewer_users.append(
                             {
@@ -1483,7 +1510,7 @@ class BrowserUseAgent:
                             continue
                         like_key = user_url or username
                         if like_key not in seen_story_viewer_keys:
-                            if total_viewers_collected >= safe_max_interactions:
+                            if len(viewer_users) >= safe_max_interactions:
                                 break
                             seen_story_viewer_keys.add(like_key)
                             viewer_users.append(
@@ -1503,7 +1530,7 @@ class BrowserUseAgent:
                                 "user_url": user_url or "",
                             }
                         )
-                        if total_viewers_collected >= safe_max_interactions:
+                        if len(viewer_users) >= safe_max_interactions:
                             break
 
             logger.info(
@@ -1525,22 +1552,23 @@ class BrowserUseAgent:
                 }
             )
 
-            await self._evaluate_page_json(page, close_modal_script)
-            await asyncio.sleep(0.8)
-
-            if total_viewers_collected >= safe_max_interactions:
-                break
+            for _close_try in range(3):
+                await self._evaluate_page_json(page, close_modal_script)
+                await asyncio.sleep(0.6)
+                modal_state_raw = await self._evaluate_page_json(page, state_script)
+                modal_state = modal_state_raw if isinstance(modal_state_raw, dict) else {}
+                if not bool(modal_state.get("viewers_modal_open")):
+                    break
 
             next_changed = False
-            for _next_try in range(2):
+            for _next_try in range(4):
                 next_raw = await self._evaluate_page_json(page, click_next_story_script)
                 next_data = next_raw if isinstance(next_raw, dict) else {}
                 if not next_data.get("clicked"):
                     await asyncio.sleep(0.8)
                     continue
-                await asyncio.sleep(1.6)
-                new_state_raw = await self._evaluate_page_json(page, state_script)
-                new_state = new_state_raw if isinstance(new_state_raw, dict) else {}
+                await asyncio.sleep(1.2)
+                _, new_state, _ = await _wait_for_story_url(max_wait_seconds=6.0)
                 next_story_url = self._normalize_story_url_value(
                     new_state.get("story_url") or new_state.get("current_url")
                 )
@@ -1644,7 +1672,7 @@ class BrowserUseAgent:
 
     def _has_valid_auth_cookie(self, storage_state: Dict[str, Any]) -> bool:
         """
-        Verifica se existe cookie de autenticação aparentemente válido.
+        Verifica se existe cookie de autenticaÃ§Ã£o aparentemente vÃ¡lido.
         """
         now_ts = datetime.utcnow().timestamp()
         for cookie in self._extract_cookies(storage_state):
@@ -1671,7 +1699,7 @@ class BrowserUseAgent:
         if not cookies:
             return False
 
-        # Modo padrão: reutilização otimista baseada no cookie de sessão.
+        # Modo padrÃ£o: reutilizaÃ§Ã£o otimista baseada no cookie de sessÃ£o.
         if not settings.instagram_session_strict_validation:
             if self._has_valid_auth_cookie(storage_state):
                 return True
@@ -2114,11 +2142,11 @@ class BrowserUseAgent:
 
         Args:
             profile_url: URL do perfil Instagram
-            storage_state: Estado de sessão autenticada (cookies)
-            max_posts: Número máximo de posts a raspar
+            storage_state: Estado de sessÃ£o autenticada (cookies)
+            max_posts: NÃºmero mÃ¡ximo de posts a raspar
 
         Returns:
-            Dicionário com posts extraídos
+            DicionÃ¡rio com posts extraÃ­dos
         """
         max_retries = getattr(settings, 'browser_use_max_retries', 3)
         retry_delay = 5  # segundos
@@ -2142,7 +2170,7 @@ class BrowserUseAgent:
                 restore_event_bus = None
 
                 try:
-                    logger.info(f"🤖 Browser Use: Raspando posts de {profile_url} (tentativa {attempt}/{max_retries})")
+                    logger.info(f"ðŸ¤– Browser Use: Raspando posts de {profile_url} (tentativa {attempt}/{max_retries})")
 
                     if not self.api_key:
                         raise ValueError("OPENAI_API_KEY is required for Browser Use.")
@@ -2160,17 +2188,17 @@ class BrowserUseAgent:
                         logger.info("Usando CDP padrao com storage_state.")
 
                     task = f"""
-                    Você é um raspador de dados do Instagram. Extraia os primeiros {max_posts} posts do perfil.
+                    VocÃª Ã© um raspador de dados do Instagram. Extraia os primeiros {max_posts} posts do perfil.
 
                     PERFIL:
                     - URL: {profile_url}
 
-                    ESTRATÉGIA (obrigatória):
+                    ESTRATÃ‰GIA (obrigatÃ³ria):
                     1) Abra o perfil e aguarde carregar.
-                    2) Faça scroll suave 2-3 vezes para carregar o grid.
-                    3) Colete os primeiros {max_posts} links CANÔNICOS de posts a partir de anchors com href contendo "/p/" ou "/reel/".
-                       - Não clique em ícones SVG, overlays de "Clip" ou elementos decorativos.
-                       - Se precisar clicar, clique no link/anchor do post (href /p/... ou /reel/...), não no ícone.
+                    2) FaÃ§a scroll suave 2-3 vezes para carregar o grid.
+                    3) Colete os primeiros {max_posts} links CANÃ”NICOS de posts a partir de anchors com href contendo "/p/" ou "/reel/".
+                       - NÃ£o clique em Ã­cones SVG, overlays de "Clip" ou elementos decorativos.
+                       - Se precisar clicar, clique no link/anchor do post (href /p/... ou /reel/...), nÃ£o no Ã­cone.
                     4) Para cada URL coletada:
                        a) Navegue para a URL do post na MESMA aba (new_tab: false).
                        b) Aguarde carregar.
@@ -2178,10 +2206,10 @@ class BrowserUseAgent:
                           - caption completa (ou null)
                           - like_count (inteiro ou null)
                           - comment_count (inteiro ou null)
-                          - posted_at (texto visível ou null)
+                          - posted_at (texto visÃ­vel ou null)
                     5) Retorne JSON final com todos os posts coletados.
 
-                    FORMATO DE SAÍDA (JSON puro, sem texto extra):
+                    FORMATO DE SAÃDA (JSON puro, sem texto extra):
                     {{
                       "posts": [
                         {{
@@ -2189,7 +2217,7 @@ class BrowserUseAgent:
                           "caption": "texto da caption",
                           "like_count": 123,
                           "comment_count": 45,
-                          "posted_at": "2 dias atrás" ou null
+                          "posted_at": "2 dias atrÃ¡s" ou null
                         }}
                       ],
                       "total_found": {max_posts}
@@ -2197,10 +2225,10 @@ class BrowserUseAgent:
 
                     REGRAS:
                     - Se o perfil for privado: {{"posts": [], "total_found": 0, "error": "private_profile"}}
-                    - Use apenas a aba atual; não abra nova aba/janela.
-                    - Se não conseguir um campo, retorne null naquele campo.
-                    - Se não conseguir abrir um post, pule para o próximo.
-                    - Não invente dados.
+                    - Use apenas a aba atual; nÃ£o abra nova aba/janela.
+                    - Se nÃ£o conseguir um campo, retorne null naquele campo.
+                    - Se nÃ£o conseguir abrir um post, pule para o prÃ³ximo.
+                    - NÃ£o invente dados.
                     """
 
                     browser_session = self._create_browser_session(cdp_url, storage_state=storage_state_for_session)
@@ -2215,8 +2243,8 @@ class BrowserUseAgent:
                     history = await agent.run()
 
                     if not history.is_done():
-                        logger.warning("⚠️ Browser Use não completou a tarefa")
-                        # Não fazer return aqui, deixar o except capturar
+                        logger.warning("âš ï¸ Browser Use nÃ£o completou a tarefa")
+                        # NÃ£o fazer return aqui, deixar o except capturar
 
                     final_result = history.final_result() or ""
 
@@ -2243,11 +2271,11 @@ class BrowserUseAgent:
                             )
                             await asyncio.sleep(wait_time)
                             continue
-                        logger.info(f"✅ Browser Use extraiu {len(data.get('posts', []))} posts")
+                        logger.info(f"âœ… Browser Use extraiu {len(data.get('posts', []))} posts")
                         return data  # Sucesso!
 
                     # Fallback: retornar resultado bruto
-                    logger.warning("⚠️ Não foi possível extrair JSON estruturado")
+                    logger.warning("âš ï¸ NÃ£o foi possÃ­vel extrair JSON estruturado")
                     if self._contains_protocol_error(final_result) and attempt < max_retries:
                         wait_time = retry_delay * attempt
                         logger.warning(
@@ -2285,14 +2313,14 @@ class BrowserUseAgent:
                     if is_retryable and attempt < max_retries:
                         wait_time = retry_delay * attempt
                         logger.warning(
-                            f"⚠️ Tentativa {attempt}/{max_retries} falhou: {error_msg[:100]}. "
+                            f"âš ï¸ Tentativa {attempt}/{max_retries} falhou: {error_msg[:100]}. "
                             f"Aguardando {wait_time}s antes de tentar novamente..."
                         )
                         await asyncio.sleep(wait_time)
-                        # Continue para próxima iteração
+                        # Continue para prÃ³xima iteraÃ§Ã£o
                     else:
-                        # Não é retryável ou última tentativa
-                        logger.error(f"❌ Erro no Browser Use Agent (tentativa {attempt}/{max_retries}): {e}")
+                        # NÃ£o Ã© retryÃ¡vel ou Ãºltima tentativa
+                        logger.error(f"âŒ Erro no Browser Use Agent (tentativa {attempt}/{max_retries}): {e}")
                         return {"posts": [], "total_found": 0, "error": str(e)}
 
                 finally:
@@ -2340,7 +2368,7 @@ class BrowserUseAgent:
                 restore_event_bus = None
                 try:
                     logger.info(
-                        "🤖 Browser Use: Coletando curtidores de %s (tentativa %s/%s)",
+                        "ðŸ¤– Browser Use: Coletando curtidores de %s (tentativa %s/%s)",
                         post_url,
                         attempt,
                         max_retries,
@@ -2359,18 +2387,18 @@ class BrowserUseAgent:
                         cdp_url = await self._resolve_browserless_cdp_url()
 
                     task = f"""
-                    Você está em um navegador autenticado no Instagram.
-                    Sua tarefa é extrair os links dos perfis que curtiram um post.
+                    VocÃª estÃ¡ em um navegador autenticado no Instagram.
+                    Sua tarefa Ã© extrair os links dos perfis que curtiram um post.
 
                     PASSOS:
                     1) Acesse o post: {post_url}
-                    2) Aguarde a página carregar.
+                    2) Aguarde a pÃ¡gina carregar.
                     3) Se houver modal de cookies, aceite.
-                    4) Localize e clique no link/botão de curtidas para abrir a lista de usuários.
-                    5) Se a lista abrir, role o modal/lista até coletar até {max_users} links únicos de perfis.
+                    4) Localize e clique no link/botÃ£o de curtidas para abrir a lista de usuÃ¡rios.
+                    5) Se a lista abrir, role o modal/lista atÃ© coletar atÃ© {max_users} links Ãºnicos de perfis.
                     6) Retorne os links no formato https://www.instagram.com/usuario/
 
-                    FORMATO DE SAÍDA (JSON):
+                    FORMATO DE SAÃDA (JSON):
                     {{
                       "post_url": "{post_url}",
                       "likes_accessible": true,
@@ -2379,15 +2407,15 @@ class BrowserUseAgent:
                     }}
 
                     REGRAS:
-                    - Se não for possível abrir a lista de curtidas, retorne:
+                    - Se nÃ£o for possÃ­vel abrir a lista de curtidas, retorne:
                       {{
                         "post_url": "{post_url}",
                         "likes_accessible": false,
                         "like_users": [],
                         "error": "likes_unavailable"
                       }}
-                    - Não abra nova aba.
-                    - Não invente links.
+                    - NÃ£o abra nova aba.
+                    - NÃ£o invente links.
                     """
 
                     browser_session = self._create_browser_session(cdp_url, storage_state=storage_state_for_session)
@@ -2496,7 +2524,7 @@ class BrowserUseAgent:
                     if is_retryable and attempt < max_retries:
                         wait_time = retry_delay * attempt
                         logger.warning(
-                            "⚠️ Tentativa %s/%s falhou ao coletar curtidores: %s. Retentando em %ss...",
+                            "âš ï¸ Tentativa %s/%s falhou ao coletar curtidores: %s. Retentando em %ss...",
                             attempt,
                             max_retries,
                             str(exc)[:120],
@@ -3415,16 +3443,11 @@ class BrowserUseAgent:
                         by_story_url[story_key] = normalized_story
                         normalized_story_posts.append(normalized_story)
 
-                    capped_story_posts: List[Dict[str, Any]] = []
-                    remaining_viewer_slots = max(1, safe_max_interactions)
                     for story_item in normalized_story_posts:
-                        if remaining_viewer_slots <= 0:
-                            break
                         raw_viewers = story_item.get("viewer_users", []) or []
                         if not isinstance(raw_viewers, list):
                             raw_viewers = []
-                        kept_viewers = raw_viewers[:remaining_viewer_slots]
-                        remaining_viewer_slots -= len(kept_viewers)
+                        kept_viewers = raw_viewers[:safe_max_interactions]
                         story_item["viewer_users"] = kept_viewers
                         story_item["liked_users"] = [
                             {
@@ -3434,9 +3457,7 @@ class BrowserUseAgent:
                             for viewer in kept_viewers
                             if isinstance(viewer, dict) and viewer.get("liked") is True
                         ]
-                        capped_story_posts.append(story_item)
 
-                    normalized_story_posts = capped_story_posts
                     total_story_viewers = sum(
                         len(story_item.get("viewer_users", []) or [])
                         for story_item in normalized_story_posts
@@ -3601,7 +3622,7 @@ class BrowserUseAgent:
         storage_state: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         """
-        Extrai dados básicos de um perfil Instagram usando o mesmo fluxo autenticado do Browser Use.
+        Extrai dados bÃ¡sicos de um perfil Instagram usando o mesmo fluxo autenticado do Browser Use.
         """
         max_retries = getattr(settings, "browser_use_max_retries", 3)
         retry_delay = 5
@@ -3619,7 +3640,7 @@ class BrowserUseAgent:
                 restore_event_bus = None
                 try:
                     logger.info(
-                        "🤖 Browser Use: Extraindo dados do perfil %s (tentativa %s/%s)",
+                        "ðŸ¤– Browser Use: Extraindo dados do perfil %s (tentativa %s/%s)",
                         profile_url,
                         attempt,
                         max_retries,
@@ -3635,7 +3656,7 @@ class BrowserUseAgent:
                         cdp_url = await self._resolve_browserless_cdp_url()
 
                     task = f"""
-                    Você está em um navegador autenticado no Instagram.
+                    VocÃª estÃ¡ em um navegador autenticado no Instagram.
                     Extraia os dados do perfil em JSON puro.
 
                     PERFIL:
@@ -3643,9 +3664,9 @@ class BrowserUseAgent:
 
                     PASSOS:
                     1) Navegue para a URL do perfil na aba atual.
-                    2) Aguarde a página carregar.
+                    2) Aguarde a pÃ¡gina carregar.
                     3) Se houver modal de cookies, aceite.
-                    4) Extraia os campos visíveis do perfil.
+                    4) Extraia os campos visÃ­veis do perfil.
 
                     FORMATO (JSON puro):
                     {{
@@ -3653,16 +3674,16 @@ class BrowserUseAgent:
                       "full_name": "string ou null",
                       "bio": "string ou null",
                       "is_private": true/false,
-                      "follower_count": número inteiro ou null,
-                      "following_count": número inteiro ou null,
-                      "post_count": número inteiro ou null,
+                      "follower_count": nÃºmero inteiro ou null,
+                      "following_count": nÃºmero inteiro ou null,
+                      "post_count": nÃºmero inteiro ou null,
                       "verified": true/false
                     }}
 
                     REGRAS:
-                    - Não abra nova aba.
-                    - Não invente dados.
-                    - Se não conseguir um campo, retorne null.
+                    - NÃ£o abra nova aba.
+                    - NÃ£o invente dados.
+                    - Se nÃ£o conseguir um campo, retorne null.
                     """
 
                     browser_session = self._create_browser_session(cdp_url, storage_state=storage_state_for_session)
@@ -3729,7 +3750,7 @@ class BrowserUseAgent:
                     if is_retryable and attempt < max_retries:
                         wait_time = retry_delay * attempt
                         logger.warning(
-                            "⚠️ Tentativa %s/%s falhou ao extrair perfil: %s. Retentando em %ss...",
+                            "âš ï¸ Tentativa %s/%s falhou ao extrair perfil: %s. Retentando em %ss...",
                             attempt,
                             max_retries,
                             str(exc)[:120],
@@ -3836,19 +3857,19 @@ class BrowserUseAgent:
         scroll_count: int = 5,
     ) -> Dict[str, Any]:
         """
-        Simula scroll infinito para carregar mais conteúdo.
+        Simula scroll infinito para carregar mais conteÃºdo.
 
         Args:
-            url: URL da página
-            scroll_count: Número de scrolls a realizar
+            url: URL da pÃ¡gina
+            scroll_count: NÃºmero de scrolls a realizar
 
         Returns:
-            Dados capturados após scrolls
+            Dados capturados apÃ³s scrolls
         """
         try:
-            logger.info(f"📜 Iniciando scroll em: {url}")
+            logger.info(f"ðŸ“œ Iniciando scroll em: {url}")
 
-            # Implementação será feita com Browserless + JavaScript
+            # ImplementaÃ§Ã£o serÃ¡ feita com Browserless + JavaScript
             result = {
                 "url": url,
                 "scroll_count": scroll_count,
@@ -3856,11 +3877,11 @@ class BrowserUseAgent:
                 "html_content": [],
             }
 
-            logger.info(f"✅ Scroll completado em: {url}")
+            logger.info(f"âœ… Scroll completado em: {url}")
             return result
 
         except Exception as e:
-            logger.error(f"❌ Erro ao fazer scroll: {e}")
+            logger.error(f"âŒ Erro ao fazer scroll: {e}")
             raise
 
     async def click_and_wait(
@@ -3873,15 +3894,15 @@ class BrowserUseAgent:
         Clica em um elemento e aguarda carregamento.
 
         Args:
-            url: URL da página
+            url: URL da pÃ¡gina
             selector: Seletor CSS do elemento a clicar
-            wait_for_selector: Seletor CSS para aguardar após clique
+            wait_for_selector: Seletor CSS para aguardar apÃ³s clique
 
         Returns:
-            Dados capturados após clique
+            Dados capturados apÃ³s clique
         """
         try:
-            logger.info(f"🖱️ Clicando em: {selector}")
+            logger.info(f"ðŸ–±ï¸ Clicando em: {selector}")
 
             result = {
                 "url": url,
@@ -3890,11 +3911,11 @@ class BrowserUseAgent:
                 "html_content": None,
             }
 
-            logger.info(f"✅ Clique executado")
+            logger.info(f"âœ… Clique executado")
             return result
 
         except Exception as e:
-            logger.error(f"❌ Erro ao clicar: {e}")
+            logger.error(f"âŒ Erro ao clicar: {e}")
             raise
 
     async def extract_visible_text(
@@ -3903,24 +3924,24 @@ class BrowserUseAgent:
         selector: str,
     ) -> str:
         """
-        Extrai texto visível de um elemento HTML.
+        Extrai texto visÃ­vel de um elemento HTML.
 
         Args:
-            html: Conteúdo HTML
+            html: ConteÃºdo HTML
             selector: Seletor CSS
 
         Returns:
-            Texto extraído
+            Texto extraÃ­do
         """
         try:
-            # Implementação com BeautifulSoup ou similar
-            logger.info(f"📝 Extraindo texto de: {selector}")
+            # ImplementaÃ§Ã£o com BeautifulSoup ou similar
+            logger.info(f"ðŸ“ Extraindo texto de: {selector}")
             return ""
 
         except Exception as e:
-            logger.error(f"❌ Erro ao extrair texto: {e}")
+            logger.error(f"âŒ Erro ao extrair texto: {e}")
             raise
 
 
-# Instância global do agente
+# InstÃ¢ncia global do agente
 browser_use_agent = BrowserUseAgent()
