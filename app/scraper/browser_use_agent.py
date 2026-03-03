@@ -142,6 +142,21 @@ class BrowserUseAgent:
             return {"compression": None}
         return {"compression": "deflate"}
 
+    def _toggle_ws_compression_mode(self, reason: Optional[str] = None) -> str:
+        current = self._normalize_ws_compression_mode(self.ws_compression_mode)
+        target = "deflate" if current == "none" else "none"
+        self.ws_compression_mode = target
+        self._patch_websocket_compression(target)
+        if reason:
+            logger.warning(
+                "Alternando WebSocket compression para %s (%s).",
+                target,
+                reason,
+            )
+        else:
+            logger.warning("Alternando WebSocket compression para %s.", target)
+        return target
+
     def _build_browserless_cdp_url(self) -> str:
         if not self.browserless_token:
             raise ValueError("BROWSERLESS_TOKEN is required for Browser Use.")
@@ -360,6 +375,7 @@ class BrowserUseAgent:
         """
         Cria BrowserSession com fallback de argumentos para diferentes versoes do browser-use.
         """
+        self._patch_websocket_compression(self.ws_compression_mode)
         clean_storage_state = self._sanitize_storage_state(storage_state)
         ws_connect_kwargs = self._get_ws_connect_kwargs()
         session = None
@@ -1989,6 +2005,9 @@ class BrowserUseAgent:
         session_connect_url = (
             session_info.get("connect") if isinstance(session_info.get("connect"), str) else None
         )
+        # Fluxo de stories tem mostrado mais instabilidade com reconnect reaproveitado.
+        # Mantemos flag para trocar para CDP fresh apos qualquer erro de protocolo.
+        force_fresh_cdp = False
         clean_storage_state = self._sanitize_storage_state(storage_state)
         storage_state_file = self._write_storage_state_temp_file(storage_state)
         storage_state_for_session: Optional[Union[Dict[str, Any], str]]
@@ -2075,9 +2094,9 @@ class BrowserUseAgent:
                     if not self.api_key:
                         raise ValueError("OPENAI_API_KEY is required for Browser Use.")
 
-                    use_reconnect = bool(reconnect_url and attempt == 1)
+                    use_reconnect = bool(reconnect_url and attempt == 1 and not force_fresh_cdp)
                     use_session_connect = bool(
-                        (not reconnect_url) and session_connect_url and attempt == 1
+                        (not reconnect_url) and session_connect_url and attempt == 1 and not force_fresh_cdp
                     )
                     if use_reconnect:
                         cdp_url = self._ensure_ws_token(reconnect_url)
@@ -2099,7 +2118,7 @@ class BrowserUseAgent:
                     3) Em cada story aberto, leia a URL atual da barra (deve conter /stories/<perfil>/<story_id>/).
                     4) No canto inferior do frame, localize o link de visualizacoes ("Visto por X"/"Seen by X") e capture o numero de views.
                     5) Clique nesse link para abrir o popup/lista de visualizadores.
-                    6) Assim que o popup abrir, aguarde 10 segundos completos para carregamento total.
+                    6) Aguarde 10 segundos completos para carregamento total.
                        - Essa espera e obrigatoria em TODO story (sempre execute wait: seconds: 10, mesmo que a lista ja esteja visivel).
                     7) Colete SOMENTE os usuarios com badge de coracao vermelho no avatar (usuarios que deram like no story).
                        - O badge e um pequeno coracao vermelho sobreposto no avatar.
@@ -2195,6 +2214,10 @@ class BrowserUseAgent:
                         and had_protocol_error
                         and attempt < max_retries
                     ):
+                        self._toggle_ws_compression_mode("protocol_error em stories")
+                        reconnect_url = None
+                        session_connect_url = None
+                        force_fresh_cdp = True
                         wait_time = retry_delay * attempt
                         logger.warning(
                             "Sessao CDP instavel ao coletar stories (%s/%s). Retentando em %ss...",
@@ -2215,6 +2238,10 @@ class BrowserUseAgent:
                             final_result[:180],
                         )
                         if had_protocol_error and attempt < max_retries:
+                            self._toggle_ws_compression_mode("falha de protocolo ao parsear resultado de stories")
+                            reconnect_url = None
+                            session_connect_url = None
+                            force_fresh_cdp = True
                             wait_time = retry_delay * attempt
                             logger.warning(
                                 "Falha de protocolo nas interacoes de stories (%s/%s). Retentando em %ss...",
@@ -2390,6 +2417,10 @@ class BrowserUseAgent:
                     likely_protocol_instability = had_protocol_error and not normalized_story_posts
                     if likely_protocol_instability:
                         if attempt < max_retries:
+                            self._toggle_ws_compression_mode("instabilidade CDP com DOM/popup em stories")
+                            reconnect_url = None
+                            session_connect_url = None
+                            force_fresh_cdp = True
                             wait_time = retry_delay * attempt
                             logger.warning(
                                 "Instabilidade CDP detectada em stories (%s/%s). Retentando em %ss...",
@@ -2462,6 +2493,11 @@ class BrowserUseAgent:
                         )
                     )
                     if is_retryable and attempt < max_retries:
+                        if self._contains_protocol_error(error_msg):
+                            self._toggle_ws_compression_mode("excecao retryable com protocol error em stories")
+                            reconnect_url = None
+                            session_connect_url = None
+                            force_fresh_cdp = True
                         wait_time = retry_delay * attempt
                         logger.warning(
                             "Tentativa %s/%s falhou ao coletar stories: %s. Retentando em %ss...",
