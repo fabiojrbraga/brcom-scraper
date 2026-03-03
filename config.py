@@ -35,7 +35,8 @@ class Settings(BaseSettings):
     browserless_retry_backoff_seconds: float = 1.0
     browser_use_max_retries: int = 3
     browser_use_retry_backoff: int = 2
-    browser_use_ws_compression: str = "auto"  # auto | none | deflate
+    # "none" evita erros intermitentes de websocket/CDP em alguns proxies/browserless.
+    browser_use_ws_compression: str = "none"  # auto | none | deflate
 
     # OpenAI
     openai_api_key: str

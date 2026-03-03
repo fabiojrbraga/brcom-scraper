@@ -1459,9 +1459,18 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
 
         if flow == "stories_interactions" and isinstance(result, dict):
             story_error = str(result.get("error") or "").strip().lower()
-            if story_error == "story_open_failed":
+            fatal_story_errors = {
+                "story_open_failed",
+                "protocol_error",
+                "all_retries_failed",
+                "parse_failed",
+            }
+            if story_error in fatal_story_errors:
                 raise RuntimeError(
-                    "Falha ao abrir viewer de stories; nao foi possivel confirmar as interacoes."
+                    (
+                        "Falha no fluxo stories_interactions "
+                        f"({story_error}); nao foi possivel confirmar as interacoes."
+                    )
                 )
 
         # Atualizar job com resultados

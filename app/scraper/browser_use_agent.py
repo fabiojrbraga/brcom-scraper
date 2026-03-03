@@ -45,7 +45,7 @@ class BrowserUseAgent:
         self.browserless_token = settings.browserless_token
         self.browserless_ws_url = settings.browserless_ws_url
         self.ws_compression_mode = self._normalize_ws_compression_mode(
-            getattr(settings, "browser_use_ws_compression", "auto")
+            getattr(settings, "browser_use_ws_compression", "none")
         )
         # Respect LOG_LEVEL from .env for browser_use logs.
         level = getattr(logging, settings.log_level, logging.INFO)
@@ -2141,10 +2141,15 @@ class BrowserUseAgent:
                     restore_event_bus = self._patch_event_bus_for_stop(browser_session)
                     history = await agent.run()
                     final_result = history.final_result() or ""
+                    history_errors = self._history_errors_text(history)
+                    combined_run_output = " | ".join(
+                        part for part in (final_result, history_errors) if part
+                    )
+                    had_protocol_error = self._contains_protocol_error(combined_run_output)
 
                     if (
                         (not history.is_successful())
-                        and self._contains_protocol_error(final_result)
+                        and had_protocol_error
                         and attempt < max_retries
                     ):
                         wait_time = retry_delay * attempt
@@ -2166,7 +2171,7 @@ class BrowserUseAgent:
                             "Falha ao extrair JSON de interacoes de stories: %s",
                             final_result[:180],
                         )
-                        if self._contains_protocol_error(final_result) and attempt < max_retries:
+                        if had_protocol_error and attempt < max_retries:
                             wait_time = retry_delay * attempt
                             logger.warning(
                                 "Falha de protocolo nas interacoes de stories (%s/%s). Retentando em %ss...",
@@ -2189,7 +2194,7 @@ class BrowserUseAgent:
                             "total_liked_users": 0,
                             "total_collected": 0,
                             "error": failure_error,
-                            "raw_result": final_result or self._history_errors_text(history),
+                            "raw_result": final_result or history_errors,
                         }
 
                     if data.get("error") == "login_required" and attempt < max_retries:
@@ -2345,6 +2350,23 @@ class BrowserUseAgent:
 
                     reported_error = str(data.get("error") or "").strip().lower() or None
                     judge_failed = not history.is_successful()
+
+                    likely_protocol_instability = had_protocol_error and not normalized_story_posts
+                    if likely_protocol_instability:
+                        if attempt < max_retries:
+                            wait_time = retry_delay * attempt
+                            logger.warning(
+                                "Instabilidade CDP detectada em stories (%s/%s). Retentando em %ss...",
+                                attempt,
+                                max_retries,
+                                wait_time,
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+                        stories_accessible = False
+                        if reported_error in (None, "", "no_active_stories"):
+                            reported_error = "protocol_error"
+
                     likely_false_no_story = (
                         judge_failed
                         and not normalized_story_posts
@@ -2373,7 +2395,7 @@ class BrowserUseAgent:
                         "total_liked_users": len(normalized_items),
                         "total_collected": len(normalized_items),
                         "error": reported_error,
-                        "raw_result": final_result,
+                        "raw_result": final_result or history_errors,
                     }
 
                 except Exception as exc:
@@ -2400,6 +2422,8 @@ class BrowserUseAgent:
                             "failed to establish",
                             "protocol error",
                             "reserved bits",
+                            "sent 1002",
+                            "connectionclosederror",
                             "client is stopping",
                         )
                     )
@@ -2414,6 +2438,7 @@ class BrowserUseAgent:
                         )
                         await asyncio.sleep(wait_time)
                         continue
+                    normalized_error = "protocol_error" if self._contains_protocol_error(error_msg) else str(exc)
                     return {
                         "profile_url": profile_url,
                         "stories_accessible": False,
@@ -2422,7 +2447,7 @@ class BrowserUseAgent:
                         "total_story_posts": 0,
                         "total_liked_users": 0,
                         "total_collected": 0,
-                        "error": str(exc),
+                        "error": normalized_error,
                     }
                 finally:
                     if callable(restore_event_bus):
