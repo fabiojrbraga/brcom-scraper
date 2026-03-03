@@ -310,10 +310,18 @@ class ScrapingStoryLikedUser(BaseModel):
     user_url: Optional[str] = None
 
 
+class ScrapingStoryViewerUser(BaseModel):
+    """Usuario visualizador do story com marcador de like."""
+    user_username: Optional[str] = None
+    user_url: Optional[str] = None
+    liked: bool = False
+
+
 class ScrapingStoryPostResult(BaseModel):
-    """Resultado por story: URL, views e usuarios que deram like."""
+    """Resultado por story: URL, views e primeiros visualizadores com flag de like."""
     story_url: str
     view_count: Optional[int] = None
+    viewer_users: List[ScrapingStoryViewerUser] = []
     liked_users: List[ScrapingStoryLikedUser] = []
 
 

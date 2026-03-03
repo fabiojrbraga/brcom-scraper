@@ -71,6 +71,10 @@ class Settings(BaseSettings):
     api_auth_header_name: str = "X-API-Key"
     api_auth_public_paths: str = "/api/health,/docs,/openapi.json"
     profile_cache_ttl_days: int = 2
+    scrape_job_stale_recovery_enabled: bool = True
+    scrape_job_recover_running_on_startup: bool = True
+    scrape_job_max_running_minutes: int = 30
+    scrape_job_max_pending_minutes: int = 15
 
     class Config:
         env_file = ".env"

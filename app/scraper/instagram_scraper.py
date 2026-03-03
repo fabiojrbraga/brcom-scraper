@@ -1227,6 +1227,14 @@ class InstagramScraper:
                     if view_count is None:
                         view_count = _to_int_or_none(story.get("viewers_count"))
 
+                    raw_viewer_users = (
+                        story.get("viewer_users")
+                        or story.get("viewers")
+                        or []
+                    )
+                    if not isinstance(raw_viewer_users, list):
+                        raw_viewer_users = []
+
                     raw_liked_users = (
                         story.get("liked_users")
                         or story.get("like_users")
@@ -1235,14 +1243,21 @@ class InstagramScraper:
                     if not isinstance(raw_liked_users, list):
                         raw_liked_users = []
 
-                    liked_users: List[Dict[str, Any]] = []
-                    seen_story_user_keys: set[str] = set()
-                    for raw_user in raw_liked_users:
+                    viewer_users: List[Dict[str, Any]] = []
+                    by_story_user_key: Dict[str, Dict[str, Any]] = {}
+
+                    def _normalize_story_user(raw_user: Any) -> Optional[Dict[str, Any]]:
                         user_url = ""
                         user_username = ""
+                        liked_flag = False
                         if isinstance(raw_user, dict):
                             user_url = str(raw_user.get("user_url") or "").strip()
                             user_username = str(raw_user.get("user_username") or "").strip().lstrip("@")
+                            liked_flag = bool(
+                                raw_user.get("liked") is True
+                                or raw_user.get("badge_heart_red") is True
+                                or str(raw_user.get("type") or "").strip().lower() == "like"
+                            )
                         elif isinstance(raw_user, str):
                             candidate = raw_user.strip()
                             if "instagram.com" in candidate:
@@ -1250,7 +1265,7 @@ class InstagramScraper:
                             else:
                                 user_username = candidate.lstrip("@")
                         else:
-                            continue
+                            return None
 
                         if user_url.startswith("/"):
                             user_url = f"https://www.instagram.com{user_url}"
@@ -1267,37 +1282,76 @@ class InstagramScraper:
                                     user_url = f"https://www.instagram.com/{normalized_username}/"
 
                         if not user_url and not user_username:
-                            continue
+                            return None
 
                         dedupe_story_user = user_url or user_username
-                        if dedupe_story_user in seen_story_user_keys:
-                            continue
-                        seen_story_user_keys.add(dedupe_story_user)
-
-                        liked_user_payload = {
+                        return {
                             "user_url": user_url or None,
                             "user_username": user_username or None,
+                            "liked": liked_flag,
+                            "_key": dedupe_story_user,
+                        }
+
+                    for raw_user in raw_viewer_users:
+                        normalized_user = _normalize_story_user(raw_user)
+                        if not normalized_user:
+                            continue
+                        dedupe_story_user = str(normalized_user.pop("_key"))
+                        existing = by_story_user_key.get(dedupe_story_user)
+                        if existing:
+                            if normalized_user.get("liked") is True:
+                                existing["liked"] = True
+                            continue
+                        by_story_user_key[dedupe_story_user] = normalized_user
+                        viewer_users.append(normalized_user)
+                        if len(viewer_users) >= safe_max_interactions:
+                            break
+
+                    for raw_user in raw_liked_users:
+                        normalized_user = _normalize_story_user(raw_user)
+                        if not normalized_user:
+                            continue
+                        normalized_user["liked"] = True
+                        dedupe_story_user = str(normalized_user.pop("_key"))
+                        existing = by_story_user_key.get(dedupe_story_user)
+                        if existing:
+                            existing["liked"] = True
+                            continue
+                        by_story_user_key[dedupe_story_user] = normalized_user
+                        if len(viewer_users) < safe_max_interactions:
+                            viewer_users.append(normalized_user)
+
+                    liked_users: List[Dict[str, Any]] = []
+                    for viewer_user in viewer_users:
+                        if viewer_user.get("liked") is not True:
+                            continue
+                        liked_user_payload = {
+                            "user_url": viewer_user.get("user_url"),
+                            "user_username": viewer_user.get("user_username"),
                         }
                         liked_users.append(liked_user_payload)
-
-                        global_like_key = user_url or user_username
+                        global_like_key = (
+                            str(viewer_user.get("user_url") or "").strip()
+                            or str(viewer_user.get("user_username") or "").strip().lstrip("@")
+                        )
                         if global_like_key:
                             seen_like_keys.add(global_like_key)
-                        if len(seen_like_keys) >= safe_max_interactions:
-                            break
 
                     normalized_story_posts.append(
                         {
                             "story_url": story_url or "",
                             "view_count": view_count,
+                            "viewer_users": viewer_users,
                             "liked_users": liked_users,
                         }
                     )
-                    if len(seen_like_keys) >= safe_max_interactions:
-                        break
 
             total_liked_users = len(seen_like_keys)
             total_story_posts = len(normalized_story_posts)
+            total_story_viewers = sum(
+                len(story_item.get("viewer_users", []) or [])
+                for story_item in normalized_story_posts
+            )
 
             result: Dict[str, Any] = {
                 "status": "success",
@@ -1311,9 +1365,10 @@ class InstagramScraper:
                 "summary": {
                     "total_posts": total_story_posts,
                     "total_story_posts": total_story_posts,
+                    "total_story_viewers": total_story_viewers,
                     "total_story_likes": total_liked_users,
-                    "total_story_interactions": total_liked_users,
-                    "total_interactions": total_liked_users,
+                    "total_story_interactions": total_story_viewers,
+                    "total_interactions": total_story_viewers,
                     "scraped_at": datetime.utcnow().isoformat(),
                 },
             }
@@ -1337,8 +1392,9 @@ class InstagramScraper:
                 )
 
             logger.info(
-                "✅ Fluxo stories_interactions concluido: story_posts=%s likes=%s",
+                "✅ Fluxo stories_interactions concluido: story_posts=%s viewers=%s likes=%s",
                 total_story_posts,
+                total_story_viewers,
                 total_liked_users,
             )
             return result

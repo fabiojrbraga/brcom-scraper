@@ -12,8 +12,8 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 from config import settings
-from app.database import init_db, health_check
-from app.api.routes import router
+from app.database import init_db, health_check, SessionLocal
+from app.api.routes import router, recover_stale_scraping_jobs
 from app.api.auth import require_private_api_key
 from app.scraper.instagram_scraper import instagram_scraper
 
@@ -40,6 +40,27 @@ async def lifespan(app: FastAPI):
 
     if not health_check():
         logger.warning("⚠️ Banco de dados não está acessível")
+
+    # Recovery de jobs em background órfãos após restart do processo.
+    db = SessionLocal()
+    try:
+        recovered = recover_stale_scraping_jobs(
+            db,
+            force_recover_running=bool(
+                getattr(settings, "scrape_job_recover_running_on_startup", True)
+            ),
+        )
+        if recovered.get("total", 0) > 0:
+            logger.warning(
+                "⚠️ Recovery de jobs stale: running=%s pending=%s total=%s",
+                recovered.get("running", 0),
+                recovered.get("pending", 0),
+                recovered.get("total", 0),
+            )
+    except Exception as exc:
+        logger.warning("⚠️ Falha no recovery de jobs stale no startup: %s", exc)
+    finally:
+        db.close()
 
     yield
 

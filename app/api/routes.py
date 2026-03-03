@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from sqlalchemy.orm.attributes import flag_modified
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 from app.database import get_db
@@ -85,6 +85,92 @@ def _get_active_instagram_session(
     if normalized_username:
         query = query.filter(func.lower(InstagramSession.instagram_username) == normalized_username)
     return query.order_by(InstagramSession.updated_at.desc()).first()
+
+
+def _build_stale_job_error_message(status: str) -> str:
+    if status == "running":
+        return "Job interrompido: processo reiniciado ou timeout excedido durante execucao em background."
+    if status == "pending":
+        return "Job interrompido: processo reiniciado antes de iniciar execucao em background."
+    return "Job interrompido por estado inconsistente."
+
+
+def _is_scraping_job_stale(job: ScrapingJob, now: datetime) -> bool:
+    max_running_minutes = max(1, int(getattr(settings, "scrape_job_max_running_minutes", 30)))
+    max_pending_minutes = max(1, int(getattr(settings, "scrape_job_max_pending_minutes", 15)))
+
+    if job.status == "running":
+        running_since = job.started_at or job.created_at
+        if running_since is None:
+            return True
+        cutoff = now - timedelta(minutes=max_running_minutes)
+        return running_since <= cutoff
+
+    if job.status == "pending":
+        created_at = job.created_at
+        if created_at is None:
+            return True
+        cutoff = now - timedelta(minutes=max_pending_minutes)
+        return created_at <= cutoff
+
+    return False
+
+
+def recover_stale_scraping_jobs(
+    db: Session,
+    force_recover_running: bool = False,
+) -> dict[str, int]:
+    if not bool(getattr(settings, "scrape_job_stale_recovery_enabled", True)):
+        return {"running": 0, "pending": 0, "total": 0}
+
+    now = datetime.utcnow()
+    updated_running = 0
+    updated_pending = 0
+
+    candidate_jobs = (
+        db.query(ScrapingJob)
+        .filter(ScrapingJob.status.in_(["running", "pending"]))
+        .all()
+    )
+
+    for job in candidate_jobs:
+        if not force_recover_running and not _is_scraping_job_stale(job, now):
+            continue
+        previous_status = str(job.status or "").strip().lower()
+        job.status = "failed"
+        job.completed_at = now
+        if not job.error_message:
+            job.error_message = _build_stale_job_error_message(previous_status)
+        if previous_status == "running":
+            updated_running += 1
+        elif previous_status == "pending":
+            updated_pending += 1
+
+    total = updated_running + updated_pending
+    if total:
+        db.commit()
+
+    return {"running": updated_running, "pending": updated_pending, "total": total}
+
+
+def mark_scraping_job_failed_if_stale(db: Session, job: ScrapingJob) -> bool:
+    if not bool(getattr(settings, "scrape_job_stale_recovery_enabled", True)):
+        return False
+    if job.status not in {"running", "pending"}:
+        return False
+
+    now = datetime.utcnow()
+    if not _is_scraping_job_stale(job, now):
+        return False
+
+    stale_status = str(job.status or "").strip().lower()
+    job.status = "failed"
+    job.completed_at = now
+    if not job.error_message:
+        job.error_message = _build_stale_job_error_message(stale_status)
+    db.commit()
+    db.refresh(job)
+    return True
 
 
 # ==================== Health Check ====================
@@ -209,6 +295,8 @@ async def get_scraping_status(
         if not job:
             raise HTTPException(status_code=404, detail="Job não encontrado")
 
+        mark_scraping_job_failed_if_stale(db, job)
+
         return ScrapingJobResponse(
             id=job.id,
             profile_url=job.profile_url,
@@ -310,18 +398,25 @@ async def get_scraping_results(
                 if view_count is None:
                     view_count = _to_int_or_none(item.get("viewers_count"))
 
+                raw_viewer_users = item.get("viewer_users") or item.get("viewers") or []
+                if not isinstance(raw_viewer_users, list):
+                    raw_viewer_users = []
+
                 raw_liked_users = item.get("liked_users") or item.get("like_users") or []
                 if not isinstance(raw_liked_users, list):
                     raw_liked_users = []
 
-                liked_users: list[dict[str, str | None]] = []
-                seen_user_keys: set[str] = set()
-                for raw_user in raw_liked_users:
+                viewer_users: list[dict[str, Any]] = []
+                by_user_key: dict[str, dict[str, Any]] = {}
+
+                def _normalize_story_user(raw_user: Any, force_liked: bool = False) -> dict[str, Any] | None:
                     user_url = ""
                     user_username = ""
+                    liked = bool(force_liked)
                     if isinstance(raw_user, dict):
                         user_url = str(raw_user.get("user_url") or "").strip()
                         user_username = str(raw_user.get("user_username") or "").strip().lstrip("@")
+                        liked = liked or bool(raw_user.get("liked") is True or raw_user.get("badge_heart_red") is True)
                     elif isinstance(raw_user, str):
                         candidate = raw_user.strip()
                         if "instagram.com" in candidate:
@@ -329,7 +424,7 @@ async def get_scraping_results(
                         else:
                             user_username = candidate.lstrip("@")
                     else:
-                        continue
+                        return None
 
                     if user_url.startswith("/"):
                         user_url = f"https://www.instagram.com{user_url}"
@@ -346,16 +441,49 @@ async def get_scraping_results(
                                 user_url = f"https://www.instagram.com/{normalized_username}/"
 
                     if not user_url and not user_username:
-                        continue
+                        return None
 
                     user_key = user_url or user_username
-                    if user_key in seen_user_keys:
+                    return {
+                        "user_key": user_key,
+                        "user_username": user_username or None,
+                        "user_url": user_url or None,
+                        "liked": liked,
+                    }
+
+                for raw_user in raw_viewer_users:
+                    normalized_user = _normalize_story_user(raw_user, force_liked=False)
+                    if not normalized_user:
                         continue
-                    seen_user_keys.add(user_key)
+                    user_key = str(normalized_user.pop("user_key"))
+                    existing = by_user_key.get(user_key)
+                    if existing:
+                        if normalized_user.get("liked") is True:
+                            existing["liked"] = True
+                        continue
+                    by_user_key[user_key] = normalized_user
+                    viewer_users.append(normalized_user)
+
+                for raw_user in raw_liked_users:
+                    normalized_user = _normalize_story_user(raw_user, force_liked=True)
+                    if not normalized_user:
+                        continue
+                    user_key = str(normalized_user.pop("user_key"))
+                    existing = by_user_key.get(user_key)
+                    if existing:
+                        existing["liked"] = True
+                        continue
+                    by_user_key[user_key] = normalized_user
+                    viewer_users.append(normalized_user)
+
+                liked_users: list[dict[str, str | None]] = []
+                for viewer_user in viewer_users:
+                    if viewer_user.get("liked") is not True:
+                        continue
                     liked_users.append(
                         {
-                            "user_username": user_username or None,
-                            "user_url": user_url or None,
+                            "user_username": viewer_user.get("user_username"),
+                            "user_url": viewer_user.get("user_url"),
                         }
                     )
 
@@ -363,6 +491,7 @@ async def get_scraping_results(
                     {
                         "story_url": story_url or "",
                         "view_count": view_count,
+                        "viewer_users": viewer_users,
                         "liked_users": liked_users,
                     }
                 )
@@ -382,10 +511,21 @@ async def get_scraping_results(
                     seen.add(user_url or user_username)
             return len(seen)
 
+        def _count_story_viewers(story_posts: list[dict[str, Any]]) -> int:
+            total = 0
+            for story_item in story_posts:
+                raw_viewers = story_item.get("viewer_users", []) or []
+                if not isinstance(raw_viewers, list):
+                    continue
+                total += len(raw_viewers)
+            return total
+
         job = db.query(ScrapingJob).filter(ScrapingJob.id == job_id).first()
 
         if not job:
             raise HTTPException(status_code=404, detail="Job não encontrado")
+
+        mark_scraping_job_failed_if_stale(db, job)
 
         if job.status != "completed":
             return JSONResponse(
@@ -459,10 +599,13 @@ async def get_scraping_results(
                 total_posts=_safe_int(summary.get("total_story_posts", len(story_posts)) or 0),
                 total_interactions=_safe_int(
                     summary.get(
-                        "total_story_likes",
+                        "total_story_interactions",
                         summary.get(
-                            "total_story_interactions",
-                            summary.get("total_interactions", _count_unique_story_likes(story_posts)),
+                            "total_story_viewers",
+                            summary.get(
+                                "total_interactions",
+                                summary.get("total_story_likes", _count_story_viewers(story_posts)),
+                            ),
                         ),
                     )
                     or 0
@@ -537,12 +680,12 @@ async def get_scraping_results(
                 story_posts=story_posts,
                 total_interactions=_safe_int(
                     summary.get(
-                        "total_story_likes",
+                        "total_story_interactions",
                         summary.get(
-                            "total_story_interactions",
+                            "total_story_viewers",
                             summary.get(
                                 "total_interactions",
-                                _count_unique_story_likes(story_posts),
+                                summary.get("total_story_likes", _count_story_viewers(story_posts)),
                             ),
                         ),
                     )
@@ -1306,6 +1449,23 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
                         {
                             "story_url": f"https://www.instagram.com/stories/{fake_username}/DUMMYSTORY001/",
                             "view_count": 1161,
+                            "viewer_users": [
+                                {
+                                    "user_url": "https://www.instagram.com/dummy_liker_1/",
+                                    "user_username": "dummy_liker_1",
+                                    "liked": True,
+                                },
+                                {
+                                    "user_url": "https://www.instagram.com/dummy_viewer_1/",
+                                    "user_username": "dummy_viewer_1",
+                                    "liked": False,
+                                },
+                                {
+                                    "user_url": "https://www.instagram.com/dummy_liker_2/",
+                                    "user_username": "dummy_liker_2",
+                                    "liked": True,
+                                },
+                            ],
                             "liked_users": [
                                 {
                                     "user_url": "https://www.instagram.com/dummy_liker_1/",
@@ -1321,9 +1481,10 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
                     "summary": {
                         "total_posts": 1,
                         "total_story_posts": 1,
+                        "total_story_viewers": 3,
                         "total_story_likes": 2,
-                        "total_story_interactions": 2,
-                        "total_interactions": 2,
+                        "total_story_interactions": 3,
+                        "total_interactions": 3,
                         "scraped_at": datetime.utcnow().isoformat(),
                     },
                 }
@@ -1406,8 +1567,11 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
         elif flow == "stories_interactions":
             total_interactions = int(
                 summary.get(
-                    "total_story_likes",
-                    summary.get("total_story_interactions", summary.get("total_interactions", 0)),
+                    "total_story_interactions",
+                    summary.get(
+                        "total_story_viewers",
+                        summary.get("total_interactions", summary.get("total_story_likes", 0)),
+                    ),
                 )
                 or 0
             )

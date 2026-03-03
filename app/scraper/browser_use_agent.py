@@ -919,17 +919,17 @@ class BrowserUseAgent:
         }
         """
 
-        extract_liked_users_script = """
+        extract_story_viewers_script = """
         (...args) => (async () => {
           const maxUsers = Math.max(1, Number(args[0] || 300));
           const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
           const dialog = document.querySelector('div[role="dialog"]');
           if (!dialog) {
-            return { popup_opened: false, liked_users: [] };
+            return { popup_opened: false, viewer_users: [], liked_users: [] };
           }
           const dialogText = (dialog.textContent || '').toLowerCase();
           if (!(dialogText.includes('visualizador') || dialogText.includes('viewer'))) {
-            return { popup_opened: false, liked_users: [] };
+            return { popup_opened: false, viewer_users: [], liked_users: [] };
           }
 
           const debug = {
@@ -1062,15 +1062,21 @@ class BrowserUseAgent:
               if (!row) continue;
               debug.rows_scanned += 1;
 
-              if (!rowHasHeartBadge(row)) continue;
-              debug.heart_hits += 1;
+              const liked = rowHasHeartBadge(row);
+              if (liked) {
+                debug.heart_hits += 1;
+              }
 
-              if (!usersMap.has(username)) {
+              const existing = usersMap.get(username);
+              if (!existing) {
                 usersMap.set(username, {
                   user_username: username,
                   user_url: `https://www.instagram.com/${username}/`,
-                  badge_heart_red: true
+                  liked
                 });
+              } else if (!existing.liked && liked) {
+                existing.liked = true;
+                usersMap.set(username, existing);
               }
               if (usersMap.size >= maxUsers) break;
             }
@@ -1116,10 +1122,28 @@ class BrowserUseAgent:
             }
           }
 
+          const viewerUsers = Array.from(usersMap.values()).map((item) => ({
+            user_username: item.user_username,
+            user_url: item.user_url,
+            liked: item.liked === true
+          }));
+          const likedUsers = viewerUsers
+            .filter((item) => item.liked === true)
+            .map((item) => ({
+              user_username: item.user_username,
+              user_url: item.user_url,
+              badge_heart_red: true
+            }));
+
           return {
             popup_opened: true,
-            liked_users: Array.from(usersMap.values()),
-            debug
+            viewer_users: viewerUsers,
+            liked_users: likedUsers,
+            debug: {
+              ...debug,
+              viewers_collected: viewerUsers.length,
+              liked_collected: likedUsers.length
+            }
           };
         })()
         """
@@ -1236,6 +1260,7 @@ class BrowserUseAgent:
                 "stories_accessible": False,
                 "story_posts": [],
                 "total_story_posts": 0,
+                "total_story_viewers": 0,
                 "total_liked_users": 0,
                 "total_collected": 0,
                 "error": "login_required",
@@ -1249,6 +1274,7 @@ class BrowserUseAgent:
         story_posts: List[Dict[str, Any]] = []
         seen_story_ids: set[str] = set()
         seen_like_keys: set[str] = set()
+        total_viewers_collected = 0
         last_valid_story_url = ""
         recover_attempts = 0
         max_story_steps = max(5, min(80, safe_max_interactions * 2))
@@ -1261,8 +1287,9 @@ class BrowserUseAgent:
                     "stories_accessible": False,
                     "story_posts": story_posts,
                     "total_story_posts": len(story_posts),
+                    "total_story_viewers": total_viewers_collected,
                     "total_liked_users": len(seen_like_keys),
-                    "total_collected": len(seen_like_keys),
+                    "total_collected": total_viewers_collected,
                     "error": "story_open_failed",
                 }
             if state.get("login_required"):
@@ -1271,6 +1298,7 @@ class BrowserUseAgent:
                     "stories_accessible": False,
                     "story_posts": [],
                     "total_story_posts": 0,
+                    "total_story_viewers": total_viewers_collected,
                     "total_liked_users": 0,
                     "total_collected": 0,
                     "error": "login_required",
@@ -1307,6 +1335,7 @@ class BrowserUseAgent:
                     "stories_accessible": False,
                     "story_posts": [],
                     "total_story_posts": 0,
+                    "total_story_viewers": total_viewers_collected,
                     "total_liked_users": 0,
                     "total_collected": 0,
                     "error": "story_open_failed",
@@ -1331,6 +1360,7 @@ class BrowserUseAgent:
                     "stories_accessible": False,
                     "story_posts": [],
                     "total_story_posts": 0,
+                    "total_story_viewers": total_viewers_collected,
                     "total_liked_users": 0,
                     "total_collected": 0,
                     "error": "story_open_failed",
@@ -1361,18 +1391,73 @@ class BrowserUseAgent:
                     break
                 await asyncio.sleep(0.8)
 
+            viewer_users: List[Dict[str, Any]] = []
             liked_users: List[Dict[str, str]] = []
             extraction_debug: Dict[str, Any] = {}
             if popup_open:
-                max_remaining = max(1, safe_max_interactions - len(seen_like_keys))
+                max_remaining = max(1, safe_max_interactions - total_viewers_collected)
                 extracted_raw = await self._evaluate_page_json(
                     page,
-                    extract_liked_users_script,
+                    extract_story_viewers_script,
                     max_remaining,
                 )
                 extracted_data = extracted_raw if isinstance(extracted_raw, dict) else {}
                 if isinstance(extracted_data.get("debug"), dict):
                     extraction_debug = extracted_data.get("debug") or {}
+                raw_viewer_users = (
+                    extracted_data.get("viewer_users")
+                    or extracted_data.get("viewers")
+                    or []
+                )
+                if isinstance(raw_viewer_users, list):
+                    seen_story_viewer_keys: set[str] = set()
+                    for raw_user in raw_viewer_users:
+                        if not isinstance(raw_user, dict):
+                            continue
+                        username = str(raw_user.get("user_username") or "").strip().lstrip("@")
+                        user_url = str(raw_user.get("user_url") or "").strip()
+                        if user_url.startswith("/"):
+                            user_url = f"https://www.instagram.com{user_url}"
+                        if not user_url and username:
+                            user_url = f"https://www.instagram.com/{username}/"
+                        if user_url and "instagram.com" in user_url:
+                            parsed_user = urlparse(user_url)
+                            user_path_parts = [part for part in parsed_user.path.split("/") if part]
+                            if user_path_parts:
+                                normalized_username = user_path_parts[0].strip().lstrip("@")
+                                if normalized_username:
+                                    username = username or normalized_username
+                                    user_url = f"https://www.instagram.com/{normalized_username}/"
+                        if not user_url and not username:
+                            continue
+                        liked_flag = bool(raw_user.get("liked") is True or raw_user.get("badge_heart_red") is True)
+                        viewer_key = user_url or username
+                        if viewer_key in seen_story_viewer_keys:
+                            continue
+                        if total_viewers_collected >= safe_max_interactions:
+                            break
+                        seen_story_viewer_keys.add(viewer_key)
+                        viewer_users.append(
+                            {
+                                "user_username": username or "",
+                                "user_url": user_url or "",
+                                "liked": liked_flag,
+                            }
+                        )
+                        total_viewers_collected += 1
+                        if liked_flag:
+                            like_key = viewer_key
+                            if like_key not in seen_like_keys:
+                                seen_like_keys.add(like_key)
+                                liked_users.append(
+                                    {
+                                        "user_username": username or "",
+                                        "user_url": user_url or "",
+                                    }
+                                )
+                        if len(viewer_users) >= safe_max_interactions:
+                            break
+
                 raw_liked_users = extracted_data.get("liked_users") or []
                 if isinstance(raw_liked_users, list):
                     for raw_user in raw_liked_users:
@@ -1397,6 +1482,18 @@ class BrowserUseAgent:
                         if not user_url and not username:
                             continue
                         like_key = user_url or username
+                        if like_key not in seen_story_viewer_keys:
+                            if total_viewers_collected >= safe_max_interactions:
+                                break
+                            seen_story_viewer_keys.add(like_key)
+                            viewer_users.append(
+                                {
+                                    "user_username": username or "",
+                                    "user_url": user_url or "",
+                                    "liked": True,
+                                }
+                            )
+                            total_viewers_collected += 1
                         if like_key in seen_like_keys:
                             continue
                         seen_like_keys.add(like_key)
@@ -1406,14 +1503,15 @@ class BrowserUseAgent:
                                 "user_url": user_url or "",
                             }
                         )
-                        if len(seen_like_keys) >= safe_max_interactions:
+                        if total_viewers_collected >= safe_max_interactions:
                             break
 
             logger.info(
-                "Stories JS: story=%s views=%s popup_open=%s liked_users=%s debug=%s",
+                "Stories JS: story=%s views=%s popup_open=%s viewers=%s liked_users=%s debug=%s",
                 story_id,
                 view_count,
                 popup_open,
+                len(viewer_users),
                 len(liked_users),
                 extraction_debug or None,
             )
@@ -1422,6 +1520,7 @@ class BrowserUseAgent:
                 {
                     "story_url": current_story_url,
                     "view_count": view_count,
+                    "viewer_users": viewer_users,
                     "liked_users": liked_users,
                 }
             )
@@ -1429,7 +1528,7 @@ class BrowserUseAgent:
             await self._evaluate_page_json(page, close_modal_script)
             await asyncio.sleep(0.8)
 
-            if len(seen_like_keys) >= safe_max_interactions:
+            if total_viewers_collected >= safe_max_interactions:
                 break
 
             next_changed = False
@@ -1459,8 +1558,9 @@ class BrowserUseAgent:
                 "stories_accessible": True,
                 "story_posts": story_posts,
                 "total_story_posts": len(story_posts),
+                "total_story_viewers": total_viewers_collected,
                 "total_liked_users": len(seen_like_keys),
-                "total_collected": len(seen_like_keys),
+                "total_collected": total_viewers_collected,
                 "error": None,
             }
 
@@ -1469,6 +1569,7 @@ class BrowserUseAgent:
             "stories_accessible": False,
             "story_posts": [],
             "total_story_posts": 0,
+            "total_story_viewers": 0,
             "total_liked_users": 0,
             "total_collected": 0,
             "error": "story_open_failed",
@@ -2821,6 +2922,7 @@ class BrowserUseAgent:
                     "stories_accessible": False,
                     "story_posts": [],
                     "total_story_posts": 0,
+                    "total_story_viewers": 0,
                     "total_liked_users": 0,
                     "total_collected": 0,
                     "error": "login_required",
@@ -2887,6 +2989,7 @@ class BrowserUseAgent:
                                 "stories_accessible": False,
                                 "story_posts": [],
                                 "total_story_posts": 0,
+                                "total_story_viewers": 0,
                                 "total_liked_users": 0,
                                 "total_collected": 0,
                                 "error": "protocol_error",
@@ -2947,13 +3050,14 @@ class BrowserUseAgent:
                        - Se ainda falhar, marque esse story como falha de abertura e avance para o proximo.
                     8) Aguarde 10 segundos completos para carregamento total.
                        - Essa espera e obrigatoria em TODO story (sempre execute wait: seconds: 10, mesmo que a lista ja esteja visivel).
-                    9) Colete SOMENTE os usuarios com badge de coracao vermelho no avatar (usuarios que deram like no story).
-                       - O badge e um pequeno coracao vermelho sobreposto no avatar.
-                       - Sem esse badge, o usuario e APENAS visualizador e nao deve ser incluido.
-                    10) Para cada usuario com like, extraia:
-                       - user_username
-                       - user_url no formato https://www.instagram.com/<username>/
-                       - badge_heart_red: true
+                    9) Colete os PRIMEIROS usuarios visiveis na lista de visualizadores (limitado por {safe_max_interactions} no total do fluxo).
+                       - Para cada usuario, marque se ele deu like no story:
+                         - liked=true quando houver badge de coracao vermelho no avatar.
+                         - liked=false quando nao houver esse badge.
+                    10) Para cada usuario visualizador, extraia:
+                        - user_username
+                        - user_url no formato https://www.instagram.com/<username>/
+                        - liked: true/false
                     11) Feche o popup clicando fora da janela/modal, retornando ao frame do story.
                     12) Avance para o proximo story usando a seta lateral DIREITA do viewer.
                     13) Depois de clicar na seta direita, confirme que a story_url mudou (novo story_id).
@@ -2962,7 +3066,7 @@ class BrowserUseAgent:
                     14) Repita ate acabar stories ativos, detectar repeticao de story_url/story_id, ou atingir o limite.
 
                     LIMITE:
-                    - Nao ultrapasse {safe_max_interactions} usuarios curtidores no total.
+                    - Nao ultrapasse {safe_max_interactions} usuarios visualizadores no total.
 
                     FORMATO DE SAIDA (JSON puro):
                     {{
@@ -2972,6 +3076,18 @@ class BrowserUseAgent:
                         {{
                           "story_url": "https://www.instagram.com/stories/{profile_username or 'perfil'}/1234567890123456789/",
                           "view_count": 1161,
+                          "viewer_users": [
+                            {{
+                              "user_username": "usuario1",
+                              "user_url": "https://www.instagram.com/usuario1/",
+                              "liked": true
+                            }},
+                            {{
+                              "user_username": "usuario2",
+                              "user_url": "https://www.instagram.com/usuario2/",
+                              "liked": false
+                            }}
+                          ],
                           "liked_users": [
                             {{
                               "user_username": "usuario1",
@@ -2982,15 +3098,16 @@ class BrowserUseAgent:
                         }}
                       ],
                       "total_story_posts": 1,
+                      "total_story_viewers": 2,
                       "total_liked_users": 1
                     }}
 
                     REGRAS:
                     - Nao abra nova aba.
                     - Nao invente usuarios.
-                    - Nao inclua usuarios sem badge de coracao vermelho.
-                    - O badge de coracao vermelho e obrigatorio para considerar like.
-                    - Se nao conseguir confirmar visualmente o badge vermelho, nao inclua o usuario.
+                    - Inclua visualizadores com e sem like; marque corretamente no campo liked.
+                    - O badge de coracao vermelho e obrigatorio para marcar liked=true.
+                    - Se nao conseguir confirmar visualmente o badge vermelho, marque liked=false.
                     - Nao mude para feed/home/explore durante a coleta. Se isso ocorrer, retorne imediatamente ao ultimo story_url valido.
                     - So considere popup aberto quando o modal de visualizadores estiver visivel.
                     - Feche o popup clicando fora da janela antes de tentar navegar para o proximo story.
@@ -3086,6 +3203,7 @@ class BrowserUseAgent:
                             "stories_accessible": False,
                             "story_posts": [],
                             "total_story_posts": 0,
+                            "total_story_viewers": 0,
                             "total_liked_users": 0,
                             "total_collected": 0,
                             "error": failure_error,
@@ -3131,6 +3249,14 @@ class BrowserUseAgent:
                         if view_count is None:
                             view_count = _to_int_or_none(story_item.get("viewers_count"))
 
+                        raw_viewer_users = (
+                            story_item.get("viewer_users")
+                            or story_item.get("viewers")
+                            or []
+                        )
+                        if not isinstance(raw_viewer_users, list):
+                            raw_viewer_users = []
+
                         raw_liked_users = (
                             story_item.get("liked_users")
                             or story_item.get("like_users")
@@ -3139,18 +3265,33 @@ class BrowserUseAgent:
                         if not isinstance(raw_liked_users, list):
                             raw_liked_users = []
 
+                        viewer_users: List[Dict[str, Any]] = []
                         liked_users: List[Dict[str, str]] = []
-                        seen_liked_keys: set[str] = set()
-                        for raw_user in raw_liked_users:
+                        by_story_user_key: Dict[str, Dict[str, Any]] = {}
+
+                        def _normalize_story_user(raw_user: Any, force_liked: bool = False) -> Optional[Dict[str, Any]]:
                             user_url = ""
                             user_username = ""
+                            liked_flag = bool(force_liked)
+
                             if isinstance(raw_user, dict):
-                                if not _is_explicit_liked_user(raw_user):
-                                    continue
                                 user_url = str(raw_user.get("user_url") or "").strip()
                                 user_username = str(raw_user.get("user_username") or "").strip().lstrip("@")
+                                liked_flag = liked_flag or bool(
+                                    raw_user.get("liked") is True
+                                    or raw_user.get("badge_heart_red") is True
+                                    or self._normalize_story_interaction_type(raw_user.get("type")) == "like"
+                                )
+                            elif isinstance(raw_user, str):
+                                candidate = raw_user.strip()
+                                if not candidate:
+                                    return None
+                                if "instagram.com" in candidate:
+                                    user_url = candidate
+                                else:
+                                    user_username = candidate.lstrip("@")
                             else:
-                                continue
+                                return None
 
                             if user_url.startswith("/"):
                                 user_url = f"https://www.instagram.com{user_url}"
@@ -3167,23 +3308,87 @@ class BrowserUseAgent:
                                         user_url = f"https://www.instagram.com/{normalized_username}/"
 
                             if not user_url and not user_username:
-                                continue
+                                return None
 
                             dedupe_user = user_url or user_username
-                            if dedupe_user in seen_liked_keys:
-                                continue
-                            seen_liked_keys.add(dedupe_user)
+                            return {
+                                "user_username": user_username or "",
+                                "user_url": user_url or "",
+                                "liked": liked_flag,
+                                "_key": dedupe_user,
+                            }
 
+                        for raw_user in raw_viewer_users:
+                            normalized_user = _normalize_story_user(raw_user, force_liked=False)
+                            if not normalized_user:
+                                continue
+                            dedupe_user = str(normalized_user.pop("_key"))
+                            existing = by_story_user_key.get(dedupe_user)
+                            if existing:
+                                if normalized_user.get("liked") is True:
+                                    existing["liked"] = True
+                                continue
+                            by_story_user_key[dedupe_user] = normalized_user
+                            viewer_users.append(normalized_user)
+
+                        for raw_user in raw_liked_users:
+                            if isinstance(raw_user, dict) and not _is_explicit_liked_user(raw_user):
+                                continue
+                            normalized_user = _normalize_story_user(raw_user, force_liked=True)
+                            if not normalized_user:
+                                continue
+                            normalized_user["liked"] = True
+                            dedupe_user = str(normalized_user.pop("_key"))
+                            existing = by_story_user_key.get(dedupe_user)
+                            if existing:
+                                existing["liked"] = True
+                                continue
+                            by_story_user_key[dedupe_user] = normalized_user
+                            viewer_users.append(normalized_user)
+
+                        if safe_max_interactions > 0:
+                            viewer_users = viewer_users[:safe_max_interactions]
+
+                        for viewer_user in viewer_users:
+                            if viewer_user.get("liked") is not True:
+                                continue
                             liked_users.append(
                                 {
-                                    "user_username": user_username or "",
-                                    "user_url": user_url or "",
+                                    "user_username": str(viewer_user.get("user_username") or "").strip(),
+                                    "user_url": str(viewer_user.get("user_url") or "").strip(),
                                 }
                             )
 
                         story_key = story_url_text
                         if story_key in by_story_url:
                             existing_story = by_story_url[story_key]
+                            existing_viewers: List[Dict[str, Any]] = existing_story.get("viewer_users", [])
+                            existing_viewer_keys = {
+                                (str(item.get("user_url") or "").strip() or str(item.get("user_username") or "").strip().lstrip("@"))
+                                for item in existing_viewers
+                                if isinstance(item, dict)
+                            }
+                            for viewer_user in viewer_users:
+                                dedupe_user = (
+                                    str(viewer_user.get("user_url") or "").strip()
+                                    or str(viewer_user.get("user_username") or "").strip().lstrip("@")
+                                )
+                                if not dedupe_user:
+                                    continue
+                                if dedupe_user in existing_viewer_keys:
+                                    if viewer_user.get("liked") is True:
+                                        for existing_viewer in existing_viewers:
+                                            existing_key = (
+                                                str(existing_viewer.get("user_url") or "").strip()
+                                                or str(existing_viewer.get("user_username") or "").strip().lstrip("@")
+                                            )
+                                            if existing_key == dedupe_user:
+                                                existing_viewer["liked"] = bool(existing_viewer.get("liked")) or True
+                                                break
+                                    continue
+                                existing_viewer_keys.add(dedupe_user)
+                                existing_viewers.append(viewer_user)
+                            existing_story["viewer_users"] = existing_viewers[:safe_max_interactions]
                             existing_likes: List[Dict[str, str]] = existing_story.get("liked_users", [])
                             existing_like_keys = {
                                 item.get("user_url") or item.get("user_username")
@@ -3204,10 +3409,38 @@ class BrowserUseAgent:
                         normalized_story = {
                             "story_url": story_url_text or "",
                             "view_count": view_count,
+                            "viewer_users": viewer_users[:safe_max_interactions],
                             "liked_users": liked_users[:safe_max_interactions],
                         }
                         by_story_url[story_key] = normalized_story
                         normalized_story_posts.append(normalized_story)
+
+                    capped_story_posts: List[Dict[str, Any]] = []
+                    remaining_viewer_slots = max(1, safe_max_interactions)
+                    for story_item in normalized_story_posts:
+                        if remaining_viewer_slots <= 0:
+                            break
+                        raw_viewers = story_item.get("viewer_users", []) or []
+                        if not isinstance(raw_viewers, list):
+                            raw_viewers = []
+                        kept_viewers = raw_viewers[:remaining_viewer_slots]
+                        remaining_viewer_slots -= len(kept_viewers)
+                        story_item["viewer_users"] = kept_viewers
+                        story_item["liked_users"] = [
+                            {
+                                "user_username": str(viewer.get("user_username") or "").strip(),
+                                "user_url": str(viewer.get("user_url") or "").strip(),
+                            }
+                            for viewer in kept_viewers
+                            if isinstance(viewer, dict) and viewer.get("liked") is True
+                        ]
+                        capped_story_posts.append(story_item)
+
+                    normalized_story_posts = capped_story_posts
+                    total_story_viewers = sum(
+                        len(story_item.get("viewer_users", []) or [])
+                        for story_item in normalized_story_posts
+                    )
 
                     normalized_items: List[Dict[str, str]] = []
                     seen_keys: set[str] = set()
@@ -3228,10 +3461,6 @@ class BrowserUseAgent:
                                     "type": "like",
                                 }
                             )
-                            if len(normalized_items) >= safe_max_interactions:
-                                break
-                        if len(normalized_items) >= safe_max_interactions:
-                            break
 
                     stories_accessible = bool(data.get("stories_accessible"))
                     if normalized_story_posts and not stories_accessible:
@@ -3284,8 +3513,9 @@ class BrowserUseAgent:
                         "stories_accessible": stories_accessible,
                         "story_posts": normalized_story_posts,
                         "total_story_posts": len(normalized_story_posts),
+                        "total_story_viewers": total_story_viewers,
                         "total_liked_users": len(normalized_items),
-                        "total_collected": len(normalized_items),
+                        "total_collected": total_story_viewers,
                         "error": reported_error,
                         "raw_result": final_result or history_errors,
                     }
@@ -3298,6 +3528,7 @@ class BrowserUseAgent:
                             "stories_accessible": False,
                             "story_posts": [],
                             "total_story_posts": 0,
+                            "total_story_viewers": 0,
                             "total_liked_users": 0,
                             "total_collected": 0,
                             "error": failure_error,
@@ -3340,6 +3571,7 @@ class BrowserUseAgent:
                         "stories_accessible": False,
                         "story_posts": [],
                         "total_story_posts": 0,
+                        "total_story_viewers": 0,
                         "total_liked_users": 0,
                         "total_collected": 0,
                         "error": normalized_error,
@@ -3355,6 +3587,7 @@ class BrowserUseAgent:
                 "stories_accessible": False,
                 "story_posts": [],
                 "total_story_posts": 0,
+                "total_story_viewers": 0,
                 "total_liked_users": 0,
                 "total_collected": 0,
                 "error": "all_retries_failed",
