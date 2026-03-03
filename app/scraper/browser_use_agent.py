@@ -378,8 +378,17 @@ class BrowserUseAgent:
         self._patch_websocket_compression(self.ws_compression_mode)
         clean_storage_state = self._sanitize_storage_state(storage_state)
         ws_connect_kwargs = self._get_ws_connect_kwargs()
+        min_page_load_wait = float(getattr(settings, "browser_use_min_page_load_wait_s", 1.0))
+        network_idle_wait = float(getattr(settings, "browser_use_network_idle_wait_s", 8.0))
+        wait_between_actions = float(getattr(settings, "browser_use_wait_between_actions_s", 0.2))
         session = None
-        base_kwargs = dict(cdp_url=cdp_url, storage_state=clean_storage_state)
+        base_kwargs = dict(
+            cdp_url=cdp_url,
+            storage_state=clean_storage_state,
+            minimum_wait_page_load_time=min_page_load_wait,
+            wait_for_network_idle_page_load_time=network_idle_wait,
+            wait_between_actions=wait_between_actions,
+        )
         ctor_attempts = []
         if ws_connect_kwargs is not None:
             ctor_attempts.append({**base_kwargs, "ws_connect_kwargs": ws_connect_kwargs, "keep_alive": True})
@@ -727,6 +736,542 @@ class BrowserUseAgent:
         if not reconnect_url:
             return None
         return self._ensure_ws_token(reconnect_url)
+
+    def _normalize_story_url_value(self, value: Any) -> str:
+        raw_url = str(value or "").strip()
+        if not raw_url:
+            return ""
+        if raw_url.startswith("/"):
+            raw_url = f"https://www.instagram.com{raw_url}"
+        parsed = urlparse(raw_url)
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if len(path_parts) >= 3 and path_parts[0].lower() == "stories":
+            username_part = path_parts[1].strip().lstrip("@")
+            story_id_part = path_parts[2].strip()
+            if username_part and story_id_part:
+                return f"https://www.instagram.com/stories/{username_part}/{story_id_part}/"
+        if raw_url and "/stories/" in raw_url and not raw_url.endswith("/"):
+            raw_url = f"{raw_url}/"
+        return raw_url
+
+    def _extract_story_id_from_url(self, story_url: str) -> Optional[str]:
+        normalized_url = self._normalize_story_url_value(story_url)
+        if not normalized_url:
+            return None
+        parsed = urlparse(normalized_url)
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if len(path_parts) >= 3 and path_parts[0].lower() == "stories":
+            story_id = path_parts[2].strip()
+            return story_id or None
+        return None
+
+    async def _navigate_to_url_with_timeout(
+        self,
+        browser_session: BrowserSession,
+        url: str,
+        timeout_ms: int = 15000,
+        new_tab: bool = False,
+    ) -> None:
+        try:
+            from browser_use.browser.events import NavigateToUrlEvent
+
+            event = browser_session.event_bus.dispatch(
+                NavigateToUrlEvent(
+                    url=url,
+                    new_tab=new_tab,
+                    timeout_ms=int(timeout_ms),
+                )
+            )
+            await event
+            await event.event_result(raise_if_any=True, raise_if_none=False)
+            return
+        except Exception:
+            await browser_session.navigate_to(url, new_tab=new_tab)
+
+    def _parse_evaluate_payload(self, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, (dict, list, bool, int, float)):
+            return value
+        if not isinstance(value, str):
+            return value
+        text = value.strip()
+        if not text:
+            return None
+        lowered = text.lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+        parsed = self._extract_first_json_value(text)
+        if parsed is not None:
+            return parsed
+        return text
+
+    async def _evaluate_page_json(
+        self,
+        page: Any,
+        script: str,
+        *args: Any,
+    ) -> Any:
+        raw = await page.evaluate(script, *args)
+        return self._parse_evaluate_payload(raw)
+
+    async def _scrape_story_interactions_via_js(
+        self,
+        browser_session: BrowserSession,
+        profile_url: str,
+        story_url: str,
+        safe_max_interactions: int,
+    ) -> Dict[str, Any]:
+        state_script = """
+        (...args) => {
+          const href = window.location.href || '';
+          const storyMatch = href.match(/\\/stories\\/([^\\/?#]+)\\/(\\d+)(?:\\/|$)/i);
+          const storyUrl = storyMatch ? `https://www.instagram.com/stories/${storyMatch[1]}/${storyMatch[2]}/` : '';
+          const isStoryUrl = Boolean(storyMatch);
+          const pageText = (document.body && document.body.innerText) ? document.body.innerText : '';
+          const loginRequired = /\\/accounts\\/login/i.test(window.location.pathname || '')
+            || /log in|entrar/i.test(pageText.slice(0, 2000));
+
+          let viewCount = null;
+          const controls = Array.from(document.querySelectorAll('button,div[role="button"],a,span'));
+          const seenControl = controls.find((el) => /^(seen by|visto por)\\s*\\d+/i.test((el.textContent || '').trim()));
+          const readDigits = (text) => {
+            if (!text) return null;
+            const match = text.match(/(seen by|visto por)\\s*([\\d\\.,]+)/i);
+            if (!match) return null;
+            const digits = (match[2] || '').replace(/\\D/g, '');
+            return digits ? Number(digits) : null;
+          };
+          viewCount = readDigits(seenControl ? (seenControl.textContent || '') : '');
+          if (viewCount === null) {
+            viewCount = readDigits(pageText);
+          }
+
+          const dialog = document.querySelector('div[role="dialog"]');
+          const dialogText = dialog ? ((dialog.textContent || '').toLowerCase()) : '';
+          const viewersModalOpen = Boolean(
+            dialog && (
+              dialogText.includes('visualizador')
+              || dialogText.includes('viewer')
+            )
+          );
+
+          return {
+            current_url: href,
+            story_url: storyUrl,
+            is_story_url: isStoryUrl,
+            view_count: Number.isFinite(viewCount) ? viewCount : null,
+            viewers_modal_open: viewersModalOpen,
+            login_required: loginRequired
+          };
+        }
+        """
+
+        click_seen_by_script = """
+        (...args) => {
+          const controls = Array.from(document.querySelectorAll('button,div[role="button"],a,span'));
+          const target = controls.find((el) => /^(seen by|visto por)\\s*\\d+/i.test((el.textContent || '').trim()));
+          if (!target) {
+            return { clicked: false, reason: 'seen_by_not_found' };
+          }
+          try {
+            target.scrollIntoView({ block: 'center', inline: 'center' });
+          } catch (e) {}
+          const rect = target.getBoundingClientRect();
+          const fullyVisible = rect.top >= 0 && rect.left >= 0
+            && rect.bottom <= (window.innerHeight || document.documentElement.clientHeight)
+            && rect.right <= (window.innerWidth || document.documentElement.clientWidth);
+          target.click();
+          return { clicked: true, fully_visible: fullyVisible };
+        }
+        """
+
+        extract_liked_users_script = """
+        (...args) => (async () => {
+          const maxUsers = Math.max(1, Number(args[0] || 300));
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          const dialog = document.querySelector('div[role="dialog"]');
+          if (!dialog) {
+            return { popup_opened: false, liked_users: [] };
+          }
+          const dialogText = (dialog.textContent || '').toLowerCase();
+          if (!(dialogText.includes('visualizador') || dialogText.includes('viewer'))) {
+            return { popup_opened: false, liked_users: [] };
+          }
+
+          let scrollable = null;
+          const candidates = [dialog, ...Array.from(dialog.querySelectorAll('div,section,ul,ol'))];
+          for (const el of candidates) {
+            try {
+              if (el.scrollHeight > el.clientHeight + 24) {
+                if (!scrollable || el.scrollHeight > scrollable.scrollHeight) {
+                  scrollable = el;
+                }
+              }
+            } catch (e) {}
+          }
+
+          if (scrollable) {
+            let stagnantRounds = 0;
+            for (let i = 0; i < 60; i += 1) {
+              const before = scrollable.scrollHeight;
+              scrollable.scrollTop = before;
+              await sleep(250);
+              const after = scrollable.scrollHeight;
+              if (after <= before + 2) {
+                stagnantRounds += 1;
+              } else {
+                stagnantRounds = 0;
+              }
+              if (stagnantRounds >= 3) {
+                break;
+              }
+            }
+          }
+
+          const heartSelector = [
+            'svg[aria-label*="Liked"]',
+            'svg[aria-label*="Like"]',
+            'svg[aria-label*="Curt"]',
+            '[aria-label*="Liked"]',
+            '[aria-label*="Like"]',
+            '[aria-label*="Curtiu"]',
+            '[aria-label*="curtiu"]'
+          ].join(',');
+
+          const usersMap = new Map();
+          const anchors = Array.from(dialog.querySelectorAll('a[href^="/"]'));
+          for (const anchor of anchors) {
+            const href = anchor.getAttribute('href') || '';
+            const m = href.match(/^\\/([^\\/?#\\.][^\\/?#]*)\\/?$/);
+            if (!m) continue;
+            const username = (m[1] || '').trim();
+            if (!username) continue;
+
+            const blocked = new Set(['stories', 'explore', 'accounts', 'p', 'reels']);
+            if (blocked.has(username.toLowerCase())) continue;
+
+            const row = anchor.closest('li,article,section,div') || anchor.parentElement;
+            if (!row) continue;
+
+            let hasHeart = false;
+            if (row.querySelector(heartSelector)) {
+              hasHeart = true;
+            }
+            if (!hasHeart) {
+              const maybeHeartSvg = Array.from(row.querySelectorAll('svg')).some((svg) => {
+                const label = (svg.getAttribute('aria-label') || '').toLowerCase();
+                if (label.includes('liked') || label.includes('like') || label.includes('curti')) {
+                  return true;
+                }
+                const fill = (svg.getAttribute('fill') || '').toLowerCase();
+                const style = (svg.getAttribute('style') || '').toLowerCase();
+                return fill === '#ed4956' || fill === '#ff3040' || style.includes('rgb(237, 73, 86)');
+              });
+              hasHeart = Boolean(maybeHeartSvg);
+            }
+
+            if (!hasHeart) continue;
+            if (!usersMap.has(username)) {
+              usersMap.set(username, {
+                user_username: username,
+                user_url: `https://www.instagram.com/${username}/`,
+                badge_heart_red: true
+              });
+            }
+            if (usersMap.size >= maxUsers) break;
+          }
+
+          return {
+            popup_opened: true,
+            liked_users: Array.from(usersMap.values())
+          };
+        })()
+        """
+
+        close_modal_script = """
+        (...args) => {
+          const dialog = document.querySelector('div[role="dialog"]');
+          if (!dialog) return { closed: true, reason: 'already_closed' };
+
+          const clickables = Array.from(
+            dialog.querySelectorAll('button,div[role="button"],svg,[aria-label]')
+          );
+          const closeEl = clickables.find((el) => {
+            const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+            const txt = (el.textContent || '').trim().toLowerCase();
+            return aria.includes('close') || aria.includes('dismiss') || aria.includes('fechar')
+              || txt === 'x' || txt === '×';
+          });
+          if (closeEl) {
+            closeEl.click();
+            return { closed: true, reason: 'close_button' };
+          }
+
+          try {
+            const rect = dialog.getBoundingClientRect();
+            const x = Math.max(2, rect.left - 10);
+            const y = Math.max(2, rect.top + 10);
+            const target = document.elementFromPoint(x, y);
+            if (target) {
+              target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            }
+          } catch (e) {}
+
+          try {
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          } catch (e) {}
+
+          return { closed: true, reason: 'outside_or_escape' };
+        }
+        """
+
+        click_next_story_script = """
+        (...args) => {
+          const candidates = Array.from(document.querySelectorAll('button,div[role="button"],a'));
+          const rightSide = candidates
+            .map((el) => ({ el, rect: el.getBoundingClientRect() }))
+            .filter((item) => item.rect.width > 10 && item.rect.height > 10 && item.rect.left > (window.innerWidth * 0.55));
+
+          const byLabel = rightSide.find((item) => {
+            const aria = (item.el.getAttribute('aria-label') || '').toLowerCase();
+            const txt = (item.el.textContent || '').toLowerCase();
+            return aria.includes('next') || aria.includes('próximo') || aria.includes('proximo')
+              || aria.includes('avanç') || aria.includes('seguinte')
+              || txt.includes('next') || txt.includes('próximo') || txt.includes('proximo');
+          });
+
+          const target = byLabel ? byLabel.el : (rightSide.length ? rightSide[rightSide.length - 1].el : null);
+          if (!target) {
+            return { clicked: false, reason: 'next_not_found' };
+          }
+          try {
+            target.scrollIntoView({ block: 'center', inline: 'center' });
+          } catch (e) {}
+          target.click();
+          return { clicked: true };
+        }
+        """
+
+        await self._navigate_to_url_with_timeout(
+            browser_session,
+            story_url,
+            timeout_ms=15000,
+            new_tab=False,
+        )
+        await asyncio.sleep(2.0)
+
+        story_posts: List[Dict[str, Any]] = []
+        seen_story_ids: set[str] = set()
+        seen_like_keys: set[str] = set()
+        last_valid_story_url = ""
+        recover_attempts = 0
+        max_story_steps = max(5, min(80, safe_max_interactions * 2))
+
+        for _ in range(max_story_steps):
+            page = await browser_session.get_current_page()
+            if page is None:
+                return {
+                    "profile_url": profile_url,
+                    "stories_accessible": False,
+                    "story_posts": story_posts,
+                    "total_story_posts": len(story_posts),
+                    "total_liked_users": len(seen_like_keys),
+                    "total_collected": len(seen_like_keys),
+                    "error": "story_open_failed",
+                }
+
+            state_raw = await self._evaluate_page_json(page, state_script)
+            state = state_raw if isinstance(state_raw, dict) else {}
+            if state.get("login_required"):
+                return {
+                    "profile_url": profile_url,
+                    "stories_accessible": False,
+                    "story_posts": [],
+                    "total_story_posts": 0,
+                    "total_liked_users": 0,
+                    "total_collected": 0,
+                    "error": "login_required",
+                }
+
+            current_story_url = self._normalize_story_url_value(
+                state.get("story_url") or state.get("current_url")
+            )
+            if not current_story_url:
+                if last_valid_story_url and recover_attempts < 2:
+                    recover_attempts += 1
+                    await self._navigate_to_url_with_timeout(
+                        browser_session,
+                        last_valid_story_url,
+                        timeout_ms=15000,
+                        new_tab=False,
+                    )
+                    await asyncio.sleep(1.5)
+                    continue
+                if recover_attempts < 4:
+                    recover_attempts += 1
+                    await self._navigate_to_url_with_timeout(
+                        browser_session,
+                        story_url,
+                        timeout_ms=15000,
+                        new_tab=False,
+                    )
+                    await asyncio.sleep(2.0)
+                    continue
+                if story_posts:
+                    break
+                return {
+                    "profile_url": profile_url,
+                    "stories_accessible": False,
+                    "story_posts": [],
+                    "total_story_posts": 0,
+                    "total_liked_users": 0,
+                    "total_collected": 0,
+                    "error": "no_active_stories",
+                }
+
+            recover_attempts = 0
+            last_valid_story_url = current_story_url
+            story_id = self._extract_story_id_from_url(current_story_url)
+            if not story_id:
+                if story_posts:
+                    break
+                return {
+                    "profile_url": profile_url,
+                    "stories_accessible": False,
+                    "story_posts": [],
+                    "total_story_posts": 0,
+                    "total_liked_users": 0,
+                    "total_collected": 0,
+                    "error": "story_open_failed",
+                }
+            if story_id in seen_story_ids:
+                break
+            seen_story_ids.add(story_id)
+
+            view_count = None
+            try:
+                view_count = int(state.get("view_count")) if state.get("view_count") is not None else None
+            except Exception:
+                view_count = None
+
+            popup_open = False
+            for _popup_try in range(2):
+                click_raw = await self._evaluate_page_json(page, click_seen_by_script)
+                click_data = click_raw if isinstance(click_raw, dict) else {}
+                if not click_data.get("clicked"):
+                    await asyncio.sleep(0.8)
+                    continue
+                await asyncio.sleep(10.0)
+                modal_state_raw = await self._evaluate_page_json(page, state_script)
+                modal_state = modal_state_raw if isinstance(modal_state_raw, dict) else {}
+                popup_open = bool(modal_state.get("viewers_modal_open"))
+                if popup_open:
+                    break
+                await asyncio.sleep(0.8)
+
+            liked_users: List[Dict[str, str]] = []
+            if popup_open:
+                max_remaining = max(1, safe_max_interactions - len(seen_like_keys))
+                extracted_raw = await self._evaluate_page_json(
+                    page,
+                    extract_liked_users_script,
+                    max_remaining,
+                )
+                extracted_data = extracted_raw if isinstance(extracted_raw, dict) else {}
+                raw_liked_users = extracted_data.get("liked_users") or []
+                if isinstance(raw_liked_users, list):
+                    for raw_user in raw_liked_users:
+                        if not isinstance(raw_user, dict):
+                            continue
+                        if raw_user.get("badge_heart_red") is not True:
+                            continue
+                        username = str(raw_user.get("user_username") or "").strip().lstrip("@")
+                        user_url = str(raw_user.get("user_url") or "").strip()
+                        if user_url.startswith("/"):
+                            user_url = f"https://www.instagram.com{user_url}"
+                        if not user_url and username:
+                            user_url = f"https://www.instagram.com/{username}/"
+                        if user_url and "instagram.com" in user_url:
+                            parsed_user = urlparse(user_url)
+                            user_path_parts = [part for part in parsed_user.path.split("/") if part]
+                            if user_path_parts:
+                                normalized_username = user_path_parts[0].strip().lstrip("@")
+                                if normalized_username:
+                                    username = username or normalized_username
+                                    user_url = f"https://www.instagram.com/{normalized_username}/"
+                        if not user_url and not username:
+                            continue
+                        like_key = user_url or username
+                        if like_key in seen_like_keys:
+                            continue
+                        seen_like_keys.add(like_key)
+                        liked_users.append(
+                            {
+                                "user_username": username or "",
+                                "user_url": user_url or "",
+                            }
+                        )
+                        if len(seen_like_keys) >= safe_max_interactions:
+                            break
+
+            story_posts.append(
+                {
+                    "story_url": current_story_url,
+                    "view_count": view_count,
+                    "liked_users": liked_users,
+                }
+            )
+
+            await self._evaluate_page_json(page, close_modal_script)
+            await asyncio.sleep(0.8)
+
+            if len(seen_like_keys) >= safe_max_interactions:
+                break
+
+            next_changed = False
+            for _next_try in range(2):
+                next_raw = await self._evaluate_page_json(page, click_next_story_script)
+                next_data = next_raw if isinstance(next_raw, dict) else {}
+                if not next_data.get("clicked"):
+                    await asyncio.sleep(0.8)
+                    continue
+                await asyncio.sleep(1.6)
+                new_state_raw = await self._evaluate_page_json(page, state_script)
+                new_state = new_state_raw if isinstance(new_state_raw, dict) else {}
+                next_story_url = self._normalize_story_url_value(
+                    new_state.get("story_url") or new_state.get("current_url")
+                )
+                next_story_id = self._extract_story_id_from_url(next_story_url)
+                if next_story_id and next_story_id != story_id:
+                    next_changed = True
+                    break
+
+            if not next_changed:
+                break
+
+        if story_posts:
+            return {
+                "profile_url": profile_url,
+                "stories_accessible": True,
+                "story_posts": story_posts,
+                "total_story_posts": len(story_posts),
+                "total_liked_users": len(seen_like_keys),
+                "total_collected": len(seen_like_keys),
+                "error": None,
+            }
+
+        return {
+            "profile_url": profile_url,
+            "stories_accessible": False,
+            "story_posts": [],
+            "total_story_posts": 0,
+            "total_liked_users": 0,
+            "total_collected": 0,
+            "error": "story_open_failed",
+        }
 
     async def _refresh_session_via_reconnect(
         self,
@@ -2105,6 +2650,82 @@ class BrowserUseAgent:
                     else:
                         cdp_url = await self._resolve_browserless_cdp_url()
 
+                    browser_session = self._create_browser_session(
+                        cdp_url,
+                        storage_state=storage_state_for_session,
+                    )
+                    restore_event_bus = self._patch_event_bus_for_stop(browser_session)
+
+                    js_result: Optional[Dict[str, Any]] = None
+                    try:
+                        js_result = await self._scrape_story_interactions_via_js(
+                            browser_session=browser_session,
+                            profile_url=profile_url,
+                            story_url=story_url,
+                            safe_max_interactions=safe_max_interactions,
+                        )
+                    except Exception as js_exc:
+                        js_error_text = str(js_exc or "")
+                        if self._contains_protocol_error(js_error_text):
+                            if attempt < max_retries:
+                                self._toggle_ws_compression_mode("protocol_error no fluxo JS de stories")
+                                reconnect_url = None
+                                session_connect_url = None
+                                force_fresh_cdp = True
+                                wait_time = retry_delay * attempt
+                                logger.warning(
+                                    "Fluxo JS com protocolo instavel em stories (%s/%s). Retentando em %ss...",
+                                    attempt,
+                                    max_retries,
+                                    wait_time,
+                                )
+                                await asyncio.sleep(wait_time)
+                                continue
+                            return {
+                                "profile_url": profile_url,
+                                "stories_accessible": False,
+                                "story_posts": [],
+                                "total_story_posts": 0,
+                                "total_liked_users": 0,
+                                "total_collected": 0,
+                                "error": "protocol_error",
+                            }
+                        logger.warning(
+                            "Fluxo JS de stories falhou; fallback para LLM (%s/%s): %s",
+                            attempt,
+                            max_retries,
+                            str(js_exc)[:180],
+                        )
+                        js_result = None
+
+                    if isinstance(js_result, dict):
+                        js_error = str(js_result.get("error") or "").strip().lower()
+                        if js_error == "protocol_error" and attempt < max_retries:
+                            self._toggle_ws_compression_mode("protocol_error no fluxo JS de stories")
+                            reconnect_url = None
+                            session_connect_url = None
+                            force_fresh_cdp = True
+                            wait_time = retry_delay * attempt
+                            logger.warning(
+                                "Fluxo JS com protocolo instavel em stories (%s/%s). Retentando em %ss...",
+                                attempt,
+                                max_retries,
+                                wait_time,
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+                        if js_error == "story_open_failed" and attempt < max_retries:
+                            wait_time = retry_delay * attempt
+                            logger.warning(
+                                "Fluxo JS nao conseguiu abrir viewer de stories (%s/%s). Retentando em %ss...",
+                                attempt,
+                                max_retries,
+                                wait_time,
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+                        return js_result
+
                     task = f"""
                     Voce esta em um navegador autenticado no Instagram e deve coletar likes dos stories.
 
@@ -2198,10 +2819,6 @@ class BrowserUseAgent:
                       }}
                     """
 
-                    browser_session = self._create_browser_session(
-                        cdp_url,
-                        storage_state=storage_state_for_session,
-                    )
                     llm = ChatOpenAI(model=self.model, api_key=self.api_key)
                     agent = self._create_agent(
                         task=task,
@@ -2209,7 +2826,6 @@ class BrowserUseAgent:
                         browser_session=browser_session,
                     )
 
-                    restore_event_bus = self._patch_event_bus_for_stop(browser_session)
                     history = await agent.run()
                     final_result = history.final_result() or ""
                     history_errors = self._history_errors_text(history)
