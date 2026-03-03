@@ -1156,53 +1156,142 @@ class InstagramScraper:
                 max_interactions=safe_max_interactions,
             )
             raw_error = str(raw_result.get("error") or "").strip().lower()
+            raw_story_posts = []
+            if isinstance(raw_result.get("story_posts"), list):
+                raw_story_posts = raw_result.get("story_posts") or []
+            elif isinstance(raw_result.get("stories"), list):
+                raw_story_posts = raw_result.get("stories") or []
 
-            raw_items = raw_result.get("story_interactions", [])
+            normalized_story_posts: List[Dict[str, Any]] = []
             normalized_interactions: List[Dict[str, Any]] = []
-            seen_keys: set[str] = set()
+            seen_story_keys: set[str] = set()
+            seen_like_keys: set[str] = set()
 
-            if isinstance(raw_items, list):
-                for item in raw_items:
-                    if not isinstance(item, dict):
+            def _to_int_or_none(value: Any) -> Optional[int]:
+                if value is None:
+                    return None
+                if isinstance(value, bool):
+                    return None
+                if isinstance(value, int):
+                    return value
+                if isinstance(value, float):
+                    return int(value)
+                text = str(value).strip()
+                if not text:
+                    return None
+                digits = "".join(ch for ch in text if ch.isdigit())
+                if not digits:
+                    return None
+                try:
+                    return int(digits)
+                except Exception:
+                    return None
+
+            if isinstance(raw_story_posts, list):
+                for story in raw_story_posts:
+                    if not isinstance(story, dict):
                         continue
 
-                    interaction_type = str(item.get("type") or "").strip().lower()
-                    user_username = str(item.get("user_username") or "").strip().lstrip("@")
-                    user_url = str(item.get("user_url") or "").strip()
+                    story_url = str(
+                        story.get("story_url")
+                        or story.get("url")
+                        or story.get("post_url")
+                        or ""
+                    ).strip()
+                    if story_url.startswith("/"):
+                        story_url = f"https://www.instagram.com{story_url}"
+                    if story_url and "/stories/" in story_url and not story_url.endswith("/"):
+                        story_url = f"{story_url}/"
 
-                    if user_url.startswith("/"):
-                        user_url = f"https://www.instagram.com{user_url}"
-                    if not user_url and user_username:
-                        user_url = f"https://www.instagram.com/{user_username}/"
-
-                    if user_url and "instagram.com" in user_url:
-                        parsed_user = urlparse(user_url)
-                        path_parts = [part for part in parsed_user.path.split("/") if part]
-                        if path_parts:
-                            normalized_username = path_parts[0].strip().lstrip("@")
-                            if normalized_username:
-                                user_username = user_username or normalized_username
-                                user_url = f"https://www.instagram.com/{normalized_username}/"
-
-                    if not interaction_type:
+                    story_key = story_url or f"story::{len(normalized_story_posts)}"
+                    if story_key in seen_story_keys:
                         continue
-                    if not user_url and not user_username:
-                        continue
+                    seen_story_keys.add(story_key)
 
-                    dedupe_key = f"{user_url or user_username}|{interaction_type}"
-                    if dedupe_key in seen_keys:
-                        continue
-                    seen_keys.add(dedupe_key)
+                    view_count = _to_int_or_none(story.get("view_count"))
+                    if view_count is None:
+                        view_count = _to_int_or_none(story.get("views"))
+                    if view_count is None:
+                        view_count = _to_int_or_none(story.get("viewers_count"))
 
-                    normalized_interactions.append(
-                        {
+                    raw_liked_users = (
+                        story.get("liked_users")
+                        or story.get("like_users")
+                        or []
+                    )
+                    if not isinstance(raw_liked_users, list):
+                        raw_liked_users = []
+
+                    liked_users: List[Dict[str, Any]] = []
+                    seen_story_user_keys: set[str] = set()
+                    for raw_user in raw_liked_users:
+                        user_url = ""
+                        user_username = ""
+                        if isinstance(raw_user, dict):
+                            user_url = str(raw_user.get("user_url") or "").strip()
+                            user_username = str(raw_user.get("user_username") or "").strip().lstrip("@")
+                        elif isinstance(raw_user, str):
+                            candidate = raw_user.strip()
+                            if "instagram.com" in candidate:
+                                user_url = candidate
+                            else:
+                                user_username = candidate.lstrip("@")
+                        else:
+                            continue
+
+                        if user_url.startswith("/"):
+                            user_url = f"https://www.instagram.com{user_url}"
+                        if not user_url and user_username:
+                            user_url = f"https://www.instagram.com/{user_username}/"
+
+                        if user_url and "instagram.com" in user_url:
+                            parsed_user = urlparse(user_url)
+                            path_parts = [part for part in parsed_user.path.split("/") if part]
+                            if path_parts:
+                                normalized_username = path_parts[0].strip().lstrip("@")
+                                if normalized_username:
+                                    user_username = user_username or normalized_username
+                                    user_url = f"https://www.instagram.com/{normalized_username}/"
+
+                        if not user_url and not user_username:
+                            continue
+
+                        dedupe_story_user = user_url or user_username
+                        if dedupe_story_user in seen_story_user_keys:
+                            continue
+                        seen_story_user_keys.add(dedupe_story_user)
+
+                        liked_user_payload = {
                             "user_url": user_url or None,
                             "user_username": user_username or None,
-                            "type": interaction_type,
+                        }
+                        liked_users.append(liked_user_payload)
+
+                        global_like_key = f"{user_url or user_username}|like"
+                        if global_like_key not in seen_like_keys:
+                            seen_like_keys.add(global_like_key)
+                            normalized_interactions.append(
+                                {
+                                    "user_url": user_url or None,
+                                    "user_username": user_username or None,
+                                    "type": "like",
+                                }
+                            )
+                            if len(normalized_interactions) >= safe_max_interactions:
+                                break
+
+                    normalized_story_posts.append(
+                        {
+                            "story_url": story_url or "",
+                            "view_count": view_count,
+                            "liked_users": liked_users,
                         }
                     )
                     if len(normalized_interactions) >= safe_max_interactions:
                         break
+
+            total_liked_users = len(normalized_interactions)
+            total_story_posts = len(normalized_story_posts)
 
             result: Dict[str, Any] = {
                 "status": "success",
@@ -1212,11 +1301,14 @@ class InstagramScraper:
                     "profile_url": profile_url,
                 },
                 "posts": [],
+                "story_posts": normalized_story_posts,
                 "story_interactions": normalized_interactions,
                 "summary": {
-                    "total_posts": 0,
-                    "total_story_interactions": len(normalized_interactions),
-                    "total_interactions": len(normalized_interactions),
+                    "total_posts": total_story_posts,
+                    "total_story_posts": total_story_posts,
+                    "total_story_likes": total_liked_users,
+                    "total_story_interactions": total_liked_users,
+                    "total_interactions": total_liked_users,
                     "scraped_at": datetime.utcnow().isoformat(),
                 },
             }

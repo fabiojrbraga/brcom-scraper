@@ -1968,7 +1968,10 @@ class BrowserUseAgent:
         max_interactions: int = 300,
     ) -> Dict[str, Any]:
         """
-        Abre stories de um perfil e tenta extrair lista de usuarios + tipo de interacao.
+        Abre stories de um perfil e extrai por story:
+        - URL do story
+        - numero de visualizacoes
+        - usuarios que deram like (username + url)
         """
         max_retries = getattr(settings, "browser_use_max_retries", 3)
         retry_delay = 5
@@ -1991,12 +1994,35 @@ class BrowserUseAgent:
         storage_state_for_session: Optional[Union[Dict[str, Any], str]]
         storage_state_for_session = storage_state_file or clean_storage_state
 
+        def _to_int_or_none(value: Any) -> Optional[int]:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+            text = str(value).strip()
+            if not text:
+                return None
+            digits = "".join(ch for ch in text if ch.isdigit())
+            if not digits:
+                return None
+            try:
+                return int(digits)
+            except Exception:
+                return None
+
         try:
             if not storage_state:
                 return {
                     "profile_url": profile_url,
                     "stories_accessible": False,
+                    "story_posts": [],
                     "story_interactions": [],
+                    "total_story_posts": 0,
+                    "total_liked_users": 0,
                     "total_collected": 0,
                     "error": "login_required",
                 }
@@ -2027,69 +2053,76 @@ class BrowserUseAgent:
                         cdp_url = await self._resolve_browserless_cdp_url()
 
                     task = f"""
-                    Voce esta em um navegador autenticado no Instagram.
-                    Sua tarefa e extrair interacoes de stories do perfil abaixo:
-                    - {profile_url}
+                    Voce esta em um navegador autenticado no Instagram e deve coletar likes dos stories.
 
-                    PASSOS:
-                    1) Primeiro tente abrir diretamente os stories em: {story_url}
-                    2) Se a URL acima nao abrir viewer de stories, acesse o perfil: {profile_url}
-                    3) No perfil, abra o story ativo clicando em elemento clicavel (link/botao) que leva a /stories/, evitando clicar apenas na tag img.
-                    4) Se houver banner/modal (ex.: botao Dismiss), feche antes de tentar abrir o story.
-                    3) Percorra os stories ativos desse perfil.
-                    4) Para cada story, abra a lista de visualizacoes/interacoes quando disponivel.
-                    5) Colete ate {safe_max_interactions} pares unicos (usuario + tipo).
+                    ALVO:
+                    - Perfil: {profile_url}
+                    - URL direta de stories: {story_url}
 
-                    TIPOS ACEITOS (use exatamente um por item quando possivel):
-                    - view
-                    - like
-                    - reply
-                    - reaction
-                    - poll_vote
-                    - quiz_answer
-                    - question_reply
-                    - mention_tap
-                    - link_click
-                    - sticker_tap
-                    - other
+                    PASSOS OBRIGATORIOS:
+                    1) Abra primeiro: {story_url}
+                    2) Se nao abrir o viewer, acesse {profile_url} e entre no story ativo por elemento clicavel que leve a /stories/.
+                    3) Em cada story aberto, leia a URL atual da barra (deve conter /stories/<perfil>/<story_id>/).
+                    4) No canto inferior do frame, localize o link de visualizacoes ("Visto por X"/"Seen by X") e capture o numero de views.
+                    5) Clique nesse link para abrir o popup/lista de visualizadores.
+                    6) Assim que o popup abrir, aguarde 10 segundos completos para carregamento total.
+                       - Essa espera e obrigatoria em TODO story (sempre execute wait: seconds: 10, mesmo que a lista ja esteja visivel).
+                    7) Colete SOMENTE os usuarios com badge de coracao vermelho no avatar (usuarios que deram like no story).
+                    8) Para cada usuario com like, extraia:
+                       - user_username
+                       - user_url no formato https://www.instagram.com/<username>/
+                    9) Feche o popup.
+                    10) Avance para o proximo story usando a seta lateral do viewer (esquerda/direita conforme a interface).
+                    11) Repita ate acabar stories ativos, detectar repeticao de story_url, ou atingir o limite.
+
+                    LIMITE:
+                    - Nao ultrapasse {safe_max_interactions} usuarios curtidores no total.
 
                     FORMATO DE SAIDA (JSON puro):
                     {{
                       "profile_url": "{profile_url}",
                       "stories_accessible": true,
-                      "story_interactions": [
+                      "story_posts": [
                         {{
-                          "user_url": "https://www.instagram.com/usuario/",
-                          "user_username": "usuario",
-                          "type": "view"
+                          "story_url": "https://www.instagram.com/stories/{profile_username or 'perfil'}/1234567890123456789/",
+                          "view_count": 1161,
+                          "liked_users": [
+                            {{
+                              "user_username": "usuario1",
+                              "user_url": "https://www.instagram.com/usuario1/"
+                            }}
+                          ]
                         }}
                       ],
-                      "total_collected": 1
+                      "total_story_posts": 1,
+                      "total_liked_users": 1
                     }}
 
                     REGRAS:
                     - Nao abra nova aba.
                     - Nao invente usuarios.
-                    - Retorne "no_active_stories" somente quando conseguir confirmar que nao existe story ativo.
-                    - Se houver indicio de story ativo (anel de story visivel) mas nao conseguir abrir o viewer/lista de interacoes, retorne:
+                    - Nao inclua usuarios sem badge de coracao vermelho.
+                    - A espera de 10 segundos e obrigatoria: execute wait: seconds: 10 imediatamente apos abrir o popup e so depois colete usuarios.
+                    - Retorne "no_active_stories" somente quando confirmar que nao existe story ativo.
+                    - Se houver indicio de story ativo mas falhar ao abrir viewer/lista de visualizadores:
                       {{
                         "profile_url": "{profile_url}",
                         "stories_accessible": false,
-                        "story_interactions": [],
+                        "story_posts": [],
                         "error": "story_open_failed"
                       }}
                     - Se nao houver stories ativos:
                       {{
                         "profile_url": "{profile_url}",
                         "stories_accessible": false,
-                        "story_interactions": [],
+                        "story_posts": [],
                         "error": "no_active_stories"
                       }}
                     - Se o login expirar:
                       {{
                         "profile_url": "{profile_url}",
                         "stories_accessible": false,
-                        "story_interactions": [],
+                        "story_posts": [],
                         "error": "login_required"
                       }}
                     """
@@ -2150,7 +2183,10 @@ class BrowserUseAgent:
                         return {
                             "profile_url": profile_url,
                             "stories_accessible": False,
+                            "story_posts": [],
                             "story_interactions": [],
+                            "total_story_posts": 0,
+                            "total_liked_users": 0,
                             "total_collected": 0,
                             "error": failure_error,
                             "raw_result": final_result or self._history_errors_text(history),
@@ -2167,63 +2203,151 @@ class BrowserUseAgent:
                         await asyncio.sleep(wait_time)
                         continue
 
+                    raw_story_posts = []
+                    if isinstance(data.get("story_posts"), list):
+                        raw_story_posts = data.get("story_posts") or []
+                    elif isinstance(data.get("stories"), list):
+                        raw_story_posts = data.get("stories") or []
+
+                    by_story_url: Dict[str, Dict[str, Any]] = {}
+                    normalized_story_posts: List[Dict[str, Any]] = []
+
+                    for story_item in raw_story_posts:
+                        if not isinstance(story_item, dict):
+                            continue
+
+                        story_url_value = (
+                            story_item.get("story_url")
+                            or story_item.get("url")
+                            or story_item.get("post_url")
+                        )
+                        story_url_text = str(story_url_value or "").strip()
+                        if story_url_text.startswith("/"):
+                            story_url_text = f"https://www.instagram.com{story_url_text}"
+                        if story_url_text and "/stories/" in story_url_text and not story_url_text.endswith("/"):
+                            story_url_text = f"{story_url_text}/"
+
+                        view_count = _to_int_or_none(story_item.get("view_count"))
+                        if view_count is None:
+                            view_count = _to_int_or_none(story_item.get("views"))
+                        if view_count is None:
+                            view_count = _to_int_or_none(story_item.get("viewers_count"))
+
+                        raw_liked_users = (
+                            story_item.get("liked_users")
+                            or story_item.get("like_users")
+                            or []
+                        )
+                        if not isinstance(raw_liked_users, list):
+                            raw_liked_users = []
+
+                        liked_users: List[Dict[str, str]] = []
+                        seen_liked_keys: set[str] = set()
+                        for raw_user in raw_liked_users:
+                            user_url = ""
+                            user_username = ""
+                            if isinstance(raw_user, dict):
+                                user_url = str(raw_user.get("user_url") or "").strip()
+                                user_username = str(raw_user.get("user_username") or "").strip().lstrip("@")
+                            elif isinstance(raw_user, str):
+                                candidate = raw_user.strip()
+                                if "instagram.com" in candidate:
+                                    user_url = candidate
+                                else:
+                                    user_username = candidate.lstrip("@")
+                            else:
+                                continue
+
+                            if user_url.startswith("/"):
+                                user_url = f"https://www.instagram.com{user_url}"
+                            if not user_url and user_username:
+                                user_url = f"https://www.instagram.com/{user_username}/"
+
+                            if user_url and "instagram.com" in user_url:
+                                parsed_user = urlparse(user_url)
+                                user_path_parts = [part for part in parsed_user.path.split("/") if part]
+                                if user_path_parts:
+                                    normalized_username = user_path_parts[0].strip().lstrip("@")
+                                    if normalized_username:
+                                        user_username = user_username or normalized_username
+                                        user_url = f"https://www.instagram.com/{normalized_username}/"
+
+                            if not user_url and not user_username:
+                                continue
+
+                            dedupe_user = user_url or user_username
+                            if dedupe_user in seen_liked_keys:
+                                continue
+                            seen_liked_keys.add(dedupe_user)
+
+                            liked_users.append(
+                                {
+                                    "user_username": user_username or "",
+                                    "user_url": user_url or "",
+                                }
+                            )
+
+                        story_key = story_url_text or f"story::{len(normalized_story_posts)}"
+                        if story_key in by_story_url:
+                            existing_story = by_story_url[story_key]
+                            existing_likes: List[Dict[str, str]] = existing_story.get("liked_users", [])
+                            existing_like_keys = {
+                                item.get("user_url") or item.get("user_username")
+                                for item in existing_likes
+                                if isinstance(item, dict)
+                            }
+                            for liked_user in liked_users:
+                                dedupe_user = liked_user.get("user_url") or liked_user.get("user_username")
+                                if not dedupe_user or dedupe_user in existing_like_keys:
+                                    continue
+                                existing_like_keys.add(dedupe_user)
+                                existing_likes.append(liked_user)
+                            existing_story["liked_users"] = existing_likes[:safe_max_interactions]
+                            if existing_story.get("view_count") is None and view_count is not None:
+                                existing_story["view_count"] = view_count
+                            continue
+
+                        normalized_story = {
+                            "story_url": story_url_text or "",
+                            "view_count": view_count,
+                            "liked_users": liked_users[:safe_max_interactions],
+                        }
+                        by_story_url[story_key] = normalized_story
+                        normalized_story_posts.append(normalized_story)
+
                     normalized_items: List[Dict[str, str]] = []
                     seen_keys: set[str] = set()
-
-                    for value in data.get("story_interactions", []) or []:
-                        if not isinstance(value, dict):
-                            continue
-
-                        interaction_type = self._normalize_story_interaction_type(
-                            value.get("type")
-                        )
-                        if not interaction_type:
-                            continue
-
-                        user_url = str(value.get("user_url") or "").strip()
-                        user_username = str(value.get("user_username") or "").strip().lstrip("@")
-
-                        if user_url.startswith("/"):
-                            user_url = f"https://www.instagram.com{user_url}"
-                        if not user_url and user_username:
-                            user_url = f"https://www.instagram.com/{user_username}/"
-
-                        if user_url and "instagram.com" in user_url:
-                            parsed_user = urlparse(user_url)
-                            path_parts = [part for part in parsed_user.path.split("/") if part]
-                            if path_parts:
-                                normalized_username = path_parts[0].strip().lstrip("@")
-                                if normalized_username:
-                                    user_username = user_username or normalized_username
-                                    user_url = f"https://www.instagram.com/{normalized_username}/"
-
-                        if not user_url and not user_username:
-                            continue
-
-                        dedupe_key = f"{user_url or user_username}|{interaction_type}"
-                        if dedupe_key in seen_keys:
-                            continue
-                        seen_keys.add(dedupe_key)
-
-                        normalized_items.append(
-                            {
-                                "user_url": user_url or "",
-                                "user_username": user_username or "",
-                                "type": interaction_type,
-                            }
-                        )
+                    for story_item in normalized_story_posts:
+                        for liked_user in story_item.get("liked_users", []):
+                            user_url = str(liked_user.get("user_url") or "").strip()
+                            user_username = str(liked_user.get("user_username") or "").strip().lstrip("@")
+                            if not user_url and not user_username:
+                                continue
+                            dedupe_key = f"{user_url or user_username}|like"
+                            if dedupe_key in seen_keys:
+                                continue
+                            seen_keys.add(dedupe_key)
+                            normalized_items.append(
+                                {
+                                    "user_url": user_url,
+                                    "user_username": user_username,
+                                    "type": "like",
+                                }
+                            )
+                            if len(normalized_items) >= safe_max_interactions:
+                                break
                         if len(normalized_items) >= safe_max_interactions:
                             break
 
                     stories_accessible = bool(data.get("stories_accessible"))
-                    if normalized_items and not stories_accessible:
+                    if normalized_story_posts and not stories_accessible:
                         stories_accessible = True
 
                     reported_error = str(data.get("error") or "").strip().lower() or None
                     judge_failed = not history.is_successful()
                     likely_false_no_story = (
                         judge_failed
-                        and not normalized_items
+                        and not normalized_story_posts
                         and (reported_error in (None, "", "no_active_stories"))
                     )
                     if likely_false_no_story:
@@ -2243,7 +2367,10 @@ class BrowserUseAgent:
                     return {
                         "profile_url": data.get("profile_url") or profile_url,
                         "stories_accessible": stories_accessible,
+                        "story_posts": normalized_story_posts,
                         "story_interactions": normalized_items,
+                        "total_story_posts": len(normalized_story_posts),
+                        "total_liked_users": len(normalized_items),
                         "total_collected": len(normalized_items),
                         "error": reported_error,
                         "raw_result": final_result,
@@ -2255,7 +2382,10 @@ class BrowserUseAgent:
                         return {
                             "profile_url": profile_url,
                             "stories_accessible": False,
+                            "story_posts": [],
                             "story_interactions": [],
+                            "total_story_posts": 0,
+                            "total_liked_users": 0,
                             "total_collected": 0,
                             "error": failure_error,
                         }
@@ -2287,7 +2417,10 @@ class BrowserUseAgent:
                     return {
                         "profile_url": profile_url,
                         "stories_accessible": False,
+                        "story_posts": [],
                         "story_interactions": [],
+                        "total_story_posts": 0,
+                        "total_liked_users": 0,
                         "total_collected": 0,
                         "error": str(exc),
                     }
@@ -2300,7 +2433,10 @@ class BrowserUseAgent:
             return {
                 "profile_url": profile_url,
                 "stories_accessible": False,
+                "story_posts": [],
                 "story_interactions": [],
+                "total_story_posts": 0,
+                "total_liked_users": 0,
                 "total_collected": 0,
                 "error": "all_retries_failed",
             }

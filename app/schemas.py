@@ -311,6 +311,19 @@ class ScrapingStoryInteraction(BaseModel):
     type: str
 
 
+class ScrapingStoryLikedUser(BaseModel):
+    """Usuario que deu like no story."""
+    user_username: Optional[str] = None
+    user_url: Optional[str] = None
+
+
+class ScrapingStoryPostResult(BaseModel):
+    """Resultado por story: URL, views e usuarios que deram like."""
+    story_url: str
+    view_count: Optional[int] = None
+    liked_users: List[ScrapingStoryLikedUser] = []
+
+
 class ScrapingResultPost(BaseModel):
     """Resultado de um post extraído."""
     post_url: str
@@ -364,6 +377,7 @@ class ScrapingCompleteResponse(BaseModel):
     flow: Optional[str] = None
     profile: Optional[ScrapingResultProfile] = None
     extracted_posts: List[ScrapingRecentPostResult] = []
+    story_posts: List[ScrapingStoryPostResult] = []
     story_interactions: List[ScrapingStoryInteraction] = []
     total_posts: int = 0
     total_interactions: int = 0

@@ -244,6 +244,26 @@ async def get_scraping_results(
         Resultados do scraping
     """
     try:
+        def _to_int_or_none(value: Any) -> int | None:
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+            text = str(value).strip()
+            if not text:
+                return None
+            digits = "".join(ch for ch in text if ch.isdigit())
+            if not digits:
+                return None
+            try:
+                return int(digits)
+            except Exception:
+                return None
+
         def _normalize_story_interactions(items: Any) -> list[dict[str, str | None]]:
             normalized: list[dict[str, str | None]] = []
             if not isinstance(items, list):
@@ -293,6 +313,121 @@ async def get_scraping_results(
                 )
 
             return normalized
+
+        def _normalize_story_posts(items: Any) -> list[dict[str, Any]]:
+            normalized_posts: list[dict[str, Any]] = []
+            if not isinstance(items, list):
+                return normalized_posts
+
+            seen_story_keys: set[str] = set()
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+
+                story_url = str(
+                    item.get("story_url")
+                    or item.get("url")
+                    or item.get("post_url")
+                    or ""
+                ).strip()
+                if story_url.startswith("/"):
+                    story_url = f"https://www.instagram.com{story_url}"
+                if story_url and "/stories/" in story_url and not story_url.endswith("/"):
+                    story_url = f"{story_url}/"
+
+                story_key = story_url or f"story::{len(normalized_posts)}"
+                if story_key in seen_story_keys:
+                    continue
+                seen_story_keys.add(story_key)
+
+                view_count = _to_int_or_none(item.get("view_count"))
+                if view_count is None:
+                    view_count = _to_int_or_none(item.get("views"))
+                if view_count is None:
+                    view_count = _to_int_or_none(item.get("viewers_count"))
+
+                raw_liked_users = item.get("liked_users") or item.get("like_users") or []
+                if not isinstance(raw_liked_users, list):
+                    raw_liked_users = []
+
+                liked_users: list[dict[str, str | None]] = []
+                seen_user_keys: set[str] = set()
+                for raw_user in raw_liked_users:
+                    user_url = ""
+                    user_username = ""
+                    if isinstance(raw_user, dict):
+                        user_url = str(raw_user.get("user_url") or "").strip()
+                        user_username = str(raw_user.get("user_username") or "").strip().lstrip("@")
+                    elif isinstance(raw_user, str):
+                        candidate = raw_user.strip()
+                        if "instagram.com" in candidate:
+                            user_url = candidate
+                        else:
+                            user_username = candidate.lstrip("@")
+                    else:
+                        continue
+
+                    if user_url.startswith("/"):
+                        user_url = f"https://www.instagram.com{user_url}"
+                    if not user_url and user_username:
+                        user_url = f"https://www.instagram.com/{user_username}/"
+
+                    if user_url and "instagram.com" in user_url:
+                        parsed_user = urlparse(user_url)
+                        path_parts = [part for part in parsed_user.path.split("/") if part]
+                        if path_parts:
+                            normalized_username = path_parts[0].strip().lstrip("@")
+                            if normalized_username:
+                                user_username = user_username or normalized_username
+                                user_url = f"https://www.instagram.com/{normalized_username}/"
+
+                    if not user_url and not user_username:
+                        continue
+
+                    user_key = user_url or user_username
+                    if user_key in seen_user_keys:
+                        continue
+                    seen_user_keys.add(user_key)
+                    liked_users.append(
+                        {
+                            "user_username": user_username or None,
+                            "user_url": user_url or None,
+                        }
+                    )
+
+                normalized_posts.append(
+                    {
+                        "story_url": story_url or "",
+                        "view_count": view_count,
+                        "liked_users": liked_users,
+                    }
+                )
+
+            return normalized_posts
+
+        def _story_posts_to_interactions(story_posts: list[dict[str, Any]]) -> list[dict[str, str | None]]:
+            interactions: list[dict[str, str | None]] = []
+            seen: set[str] = set()
+            for story_item in story_posts:
+                for liked_user in story_item.get("liked_users", []) or []:
+                    if not isinstance(liked_user, dict):
+                        continue
+                    user_url = str(liked_user.get("user_url") or "").strip()
+                    user_username = str(liked_user.get("user_username") or "").strip().lstrip("@")
+                    if not user_url and not user_username:
+                        continue
+                    key = f"{user_url or user_username}|like"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    interactions.append(
+                        {
+                            "user_username": user_username or None,
+                            "user_url": user_url or None,
+                            "type": "like",
+                        }
+                    )
+            return interactions
 
         job = db.query(ScrapingJob).filter(ScrapingJob.id == job_id).first()
 
@@ -350,9 +485,13 @@ async def get_scraping_results(
         if flow == "stories_interactions" and isinstance(flow_result, dict):
             summary = flow_result.get("summary", {}) or {}
             profile_payload = flow_result.get("profile", {}) or {}
+            story_posts = _normalize_story_posts(
+                flow_result.get("story_posts", [])
+                or flow_result.get("stories", [])
+            )
             story_interactions = _normalize_story_interactions(
                 flow_result.get("story_interactions", [])
-                or flow_result.get("interactions", [])
+                or _story_posts_to_interactions(story_posts)
             )
             return ScrapingCompleteResponse(
                 job_id=job.id,
@@ -367,12 +506,16 @@ async def get_scraping_results(
                     "follower_count": profile_payload.get("follower_count"),
                     "posts": [],
                 },
+                story_posts=story_posts,
                 story_interactions=story_interactions,
-                total_posts=0,
+                total_posts=_safe_int(summary.get("total_story_posts", len(story_posts)) or 0),
                 total_interactions=_safe_int(
                     summary.get(
-                        "total_story_interactions",
-                        summary.get("total_interactions", len(story_interactions)),
+                        "total_story_likes",
+                        summary.get(
+                            "total_story_interactions",
+                            summary.get("total_interactions", len(story_interactions)),
+                        ),
                     )
                     or 0
                 ),
@@ -402,12 +545,21 @@ async def get_scraping_results(
 
         if not profile and isinstance(flow_result, dict):
             posts = flow_result.get("posts", []) or []
-            interactions = flow_result.get("interactions", []) or []
+            story_posts = (
+                _normalize_story_posts(
+                    flow_result.get("story_posts", [])
+                    or flow_result.get("stories", [])
+                )
+                if flow == "stories_interactions"
+                else []
+            )
             story_interactions = (
                 _normalize_story_interactions(flow_result.get("story_interactions", []))
                 if flow == "stories_interactions"
                 else []
             )
+            if flow == "stories_interactions" and not story_interactions:
+                story_interactions = _story_posts_to_interactions(story_posts)
             summary = flow_result.get("summary", {}) or {}
             profile_payload = flow_result.get("profile", {}) or {}
             return ScrapingCompleteResponse(
@@ -434,13 +586,17 @@ async def get_scraping_results(
                     ],
                 },
                 total_posts=_safe_int(summary.get("total_posts", len(posts)) or 0),
+                story_posts=story_posts,
                 story_interactions=story_interactions,
                 total_interactions=_safe_int(
                     summary.get(
-                        "total_interactions",
+                        "total_story_likes",
                         summary.get(
                             "total_story_interactions",
-                            len(interactions) if interactions else len(story_interactions),
+                            summary.get(
+                                "total_interactions",
+                                len(story_interactions),
+                            ),
                         ),
                     )
                     or 0
@@ -455,11 +611,25 @@ async def get_scraping_results(
                 "Perfil não encontrado para job %s; retornando resultado baseado no metadata/job sem consulta de perfil.",
                 job.id,
             )
-            story_interactions = (
-                _normalize_story_interactions(flow_result.get("story_interactions", []))
+            story_posts = (
+                _normalize_story_posts(
+                    flow_result.get("story_posts", [])
+                    or flow_result.get("stories", [])
+                )
                 if flow == "stories_interactions" and isinstance(flow_result, dict)
                 else []
             )
+            story_interactions = (
+                _normalize_story_interactions(
+                    flow_result.get("story_interactions", [])
+                    if isinstance(flow_result, dict)
+                    else []
+                )
+                if flow == "stories_interactions" and isinstance(flow_result, dict)
+                else []
+            )
+            if flow == "stories_interactions" and not story_interactions:
+                story_interactions = _story_posts_to_interactions(story_posts)
             return ScrapingCompleteResponse(
                 job_id=job.id,
                 status=job.status,
@@ -473,6 +643,7 @@ async def get_scraping_results(
                     "follower_count": None,
                     "posts": [],
                 },
+                story_posts=story_posts,
                 story_interactions=story_interactions,
                 total_posts=_safe_int(job.posts_scraped, 0),
                 total_interactions=_safe_int(job.interactions_scraped, 0),
@@ -1196,20 +1367,38 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
                         "username": fake_username,
                         "profile_url": fake_profile_url,
                     },
+                    "story_posts": [
+                        {
+                            "story_url": f"https://www.instagram.com/stories/{fake_username}/DUMMYSTORY001/",
+                            "view_count": 1161,
+                            "liked_users": [
+                                {
+                                    "user_url": "https://www.instagram.com/dummy_liker_1/",
+                                    "user_username": "dummy_liker_1",
+                                },
+                                {
+                                    "user_url": "https://www.instagram.com/dummy_liker_2/",
+                                    "user_username": "dummy_liker_2",
+                                },
+                            ],
+                        },
+                    ],
                     "story_interactions": [
                         {
-                            "type": "view",
-                            "user_url": "https://www.instagram.com/dummy_viewer_1/",
-                            "user_username": "dummy_viewer_1",
+                            "type": "like",
+                            "user_url": "https://www.instagram.com/dummy_liker_1/",
+                            "user_username": "dummy_liker_1",
                         },
                         {
-                            "type": "reaction",
-                            "user_url": "https://www.instagram.com/dummy_viewer_2/",
-                            "user_username": "dummy_viewer_2",
+                            "type": "like",
+                            "user_url": "https://www.instagram.com/dummy_liker_2/",
+                            "user_username": "dummy_liker_2",
                         },
                     ],
                     "summary": {
-                        "total_posts": 0,
+                        "total_posts": 1,
+                        "total_story_posts": 1,
+                        "total_story_likes": 2,
                         "total_story_interactions": 2,
                         "total_interactions": 2,
                         "scraped_at": datetime.utcnow().isoformat(),
@@ -1284,7 +1473,10 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
             total_interactions = int(summary.get("total_like_users", 0) or 0)
         elif flow == "stories_interactions":
             total_interactions = int(
-                summary.get("total_story_interactions", summary.get("total_interactions", 0))
+                summary.get(
+                    "total_story_likes",
+                    summary.get("total_story_interactions", summary.get("total_interactions", 0)),
+                )
                 or 0
             )
         else:
