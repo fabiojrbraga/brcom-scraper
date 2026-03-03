@@ -1086,13 +1086,63 @@ class BrowserUseAgent:
         }
         """
 
+        async def _read_state_from_current_page() -> tuple[Optional[Any], Dict[str, Any]]:
+            page_obj = await browser_session.get_current_page()
+            if page_obj is None:
+                return None, {}
+            state_raw = await self._evaluate_page_json(page_obj, state_script)
+            state_data = state_raw if isinstance(state_raw, dict) else {}
+            return page_obj, state_data
+
+        async def _wait_for_story_url(
+            max_wait_seconds: float = 20.0,
+        ) -> tuple[Optional[Any], Dict[str, Any], bool]:
+            deadline = asyncio.get_event_loop().time() + max_wait_seconds
+            last_page: Optional[Any] = None
+            last_state: Dict[str, Any] = {}
+
+            while asyncio.get_event_loop().time() < deadline:
+                page_obj, state_data = await _read_state_from_current_page()
+                if page_obj is not None:
+                    last_page = page_obj
+                if state_data:
+                    last_state = state_data
+                if state_data.get("login_required"):
+                    return last_page, last_state, True
+                current_story_url_value = self._normalize_story_url_value(
+                    state_data.get("story_url") or state_data.get("current_url")
+                )
+                story_id_value = self._extract_story_id_from_url(current_story_url_value)
+                if current_story_url_value and story_id_value:
+                    return last_page, last_state, True
+                await asyncio.sleep(1.0)
+
+            return last_page, last_state, False
+
         await self._navigate_to_url_with_timeout(
             browser_session,
             story_url,
-            timeout_ms=15000,
+            timeout_ms=30000,
             new_tab=False,
         )
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.0)
+
+        page, initial_state, initial_ready = await _wait_for_story_url(max_wait_seconds=20.0)
+        if initial_state.get("login_required"):
+            return {
+                "profile_url": profile_url,
+                "stories_accessible": False,
+                "story_posts": [],
+                "total_story_posts": 0,
+                "total_liked_users": 0,
+                "total_collected": 0,
+                "error": "login_required",
+            }
+        if not initial_ready:
+            logger.warning(
+                "Stories JS: viewer ainda nao estabilizou apos navegacao inicial (%s).",
+                story_url,
+            )
 
         story_posts: List[Dict[str, Any]] = []
         seen_story_ids: set[str] = set()
@@ -1102,7 +1152,7 @@ class BrowserUseAgent:
         max_story_steps = max(5, min(80, safe_max_interactions * 2))
 
         for _ in range(max_story_steps):
-            page = await browser_session.get_current_page()
+            page, state = await _read_state_from_current_page()
             if page is None:
                 return {
                     "profile_url": profile_url,
@@ -1113,9 +1163,6 @@ class BrowserUseAgent:
                     "total_collected": len(seen_like_keys),
                     "error": "story_open_failed",
                 }
-
-            state_raw = await self._evaluate_page_json(page, state_script)
-            state = state_raw if isinstance(state_raw, dict) else {}
             if state.get("login_required"):
                 return {
                     "profile_url": profile_url,
@@ -1131,42 +1178,26 @@ class BrowserUseAgent:
                 state.get("story_url") or state.get("current_url")
             )
             if not current_story_url:
-                if last_valid_story_url and recover_attempts < 2:
+                if last_valid_story_url and recover_attempts < 3:
                     recover_attempts += 1
                     await self._navigate_to_url_with_timeout(
                         browser_session,
                         last_valid_story_url,
-                        timeout_ms=15000,
+                        timeout_ms=30000,
                         new_tab=False,
                     )
-                    await asyncio.sleep(1.5)
+                    await _wait_for_story_url(max_wait_seconds=12.0)
                     continue
-                if recover_attempts < 4:
+                if recover_attempts < 6:
                     recover_attempts += 1
                     await self._navigate_to_url_with_timeout(
                         browser_session,
                         story_url,
-                        timeout_ms=15000,
+                        timeout_ms=30000,
                         new_tab=False,
                     )
-                    await asyncio.sleep(2.0)
+                    await _wait_for_story_url(max_wait_seconds=14.0)
                     continue
-                if story_posts:
-                    break
-                return {
-                    "profile_url": profile_url,
-                    "stories_accessible": False,
-                    "story_posts": [],
-                    "total_story_posts": 0,
-                    "total_liked_users": 0,
-                    "total_collected": 0,
-                    "error": "no_active_stories",
-                }
-
-            recover_attempts = 0
-            last_valid_story_url = current_story_url
-            story_id = self._extract_story_id_from_url(current_story_url)
-            if not story_id:
                 if story_posts:
                     break
                 return {
@@ -1178,6 +1209,31 @@ class BrowserUseAgent:
                     "total_collected": 0,
                     "error": "story_open_failed",
                 }
+
+            last_valid_story_url = current_story_url
+            story_id = self._extract_story_id_from_url(current_story_url)
+            if not story_id:
+                if recover_attempts < 6:
+                    recover_attempts += 1
+                    logger.warning(
+                        "Stories JS: URL sem story_id (%s). Aguardando estabilizacao (%s/6)...",
+                        current_story_url,
+                        recover_attempts,
+                    )
+                    await _wait_for_story_url(max_wait_seconds=10.0)
+                    continue
+                if story_posts:
+                    break
+                return {
+                    "profile_url": profile_url,
+                    "stories_accessible": False,
+                    "story_posts": [],
+                    "total_story_posts": 0,
+                    "total_liked_users": 0,
+                    "total_collected": 0,
+                    "error": "story_open_failed",
+                }
+            recover_attempts = 0
             if story_id in seen_story_ids:
                 break
             seen_story_ids.add(story_id)
