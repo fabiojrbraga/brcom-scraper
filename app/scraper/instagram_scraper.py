@@ -873,13 +873,10 @@ class InstagramScraper:
                 html_error = str(exc)
                 logger.warning("Falha na extração DOM (HTML) do perfil %s: %s", profile_url, exc)
 
-            dom_has_core_data = any(
-                _has_value(profile_info.get(key))
-                for key in core_profile_fields
-            )
+            dom_attempt_succeeded = bool(profile_html and profile_html.strip())
 
-            # 2) FALLBACK: fluxo atual com Browser Use somente se DOM vier pobre.
-            if not dom_has_core_data:
+            # 2) FALLBACK: fluxo atual com Browser Use somente se a tentativa DOM falhar.
+            if not dom_attempt_succeeded:
                 try:
                     browser_use_result = await browser_use_agent.scrape_profile_basic_info(
                         profile_url=profile_url,
@@ -893,7 +890,7 @@ class InstagramScraper:
                 except Exception as exc:
                     logger.warning("Browser Use nao conseguiu extrair perfil %s: %s", profile_url, exc)
 
-            still_poor = not any(
+            still_poor = (not dom_attempt_succeeded) and not any(
                 _has_value(profile_info.get(key))
                 for key in core_profile_fields
             )
