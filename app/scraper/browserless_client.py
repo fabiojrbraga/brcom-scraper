@@ -285,6 +285,23 @@ class BrowserlessClient:
                             url,
                         )
                         continue
+                    if (
+                        endpoint == "/function"
+                        and "status=400" in error_text
+                        and '"url" is not allowed' in error_text
+                    ):
+                        # Some Browserless builds expose /function with a different schema (without "url").
+                        # Remove this endpoint from future attempts in this process to avoid repeated noisy failures.
+                        if endpoint in self._script_endpoints:
+                            self._script_endpoints = [
+                                item for item in self._script_endpoints if item != endpoint
+                            ]
+                        logger.warning(
+                            "Endpoint Browserless %s incompatível com payload atual em %s. "
+                            "Endpoint será desabilitado para próximas tentativas.",
+                            endpoint,
+                            url,
+                        )
                     break
 
             if last_error:

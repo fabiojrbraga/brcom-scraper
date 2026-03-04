@@ -2427,7 +2427,15 @@ class BrowserUseAgent:
                     )
 
                     restore_event_bus = self._patch_event_bus_for_stop(browser_session)
-                    history = await agent.run()
+                    run_kwargs: Dict[str, Any] = {}
+                    try:
+                        run_sig = inspect.signature(agent.run)
+                        if "max_steps" in run_sig.parameters:
+                            # Perfil básico não precisa múltiplos ciclos de extração.
+                            run_kwargs["max_steps"] = 2
+                    except Exception:
+                        run_kwargs = {}
+                    history = await agent.run(**run_kwargs) if run_kwargs else await agent.run()
                     final_result = history.final_result() or ""
 
                     if (not history.is_successful()) and self._contains_protocol_error(final_result) and attempt < max_retries:

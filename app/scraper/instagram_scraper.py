@@ -1336,9 +1336,7 @@ class InstagramScraper:
 
             profile_info: Dict[str, Any] = {}
             browser_use_result: Dict[str, Any] = {}
-            profile_html: Optional[str] = None
             profile_screenshot: Optional[str] = None
-            html_error: Optional[str] = None
             screenshot_error: Optional[str] = None
 
             def _has_value(value: Any) -> bool:
@@ -1381,232 +1379,73 @@ class InstagramScraper:
                 "post_count",
             )
 
-            # 1) DOM FIRST: tenta extração determinística via HTML/DOM.
+            # Browser Use direto (sem etapa DOM).
+            before_browser_use = {key: profile_info.get(key) for key in core_profile_fields}
             try:
-                profile_html = await self.browserless.get_html(
-                    profile_url,
-                    cookies=cookies,
-                    user_agent=user_agent,
+                browser_use_result = await browser_use_agent.scrape_profile_basic_info(
+                    profile_url=profile_url,
+                    storage_state=storage_state,
                 )
-                html_info = self._extract_profile_info_from_html(
-                    profile_html,
-                    username_hint=username_fallback,
-                )
-                if isinstance(html_info, dict):
-                    for key, value in html_info.items():
-                        if profile_info.get(key) is None and value is not None:
+                if isinstance(browser_use_result, dict) and not browser_use_result.get("error"):
+                    for key, value in browser_use_result.items():
+                        if value is None:
+                            continue
+
+                        current_value = profile_info.get(key)
+
+                        if key in ("follower_count", "following_count", "post_count"):
+                            numeric_value = self._to_int_or_none(value)
+                            if numeric_value is not None:
+                                profile_info[key] = numeric_value
+                            continue
+
+                        if key == "full_name":
+                            current_name_norm = (
+                                str(current_value).strip().lower()
+                                if isinstance(current_value, str)
+                                else ""
+                            )
+                            if (not _has_value(current_value)) or current_name_norm in {
+                                "instagram",
+                                "meta",
+                                "instagram from meta",
+                            }:
+                                profile_info[key] = value
+                            continue
+
+                        if key == "bio":
+                            if (not _has_value(current_value)) or self._is_generic_instagram_bio(
+                                current_value,
+                                username_hint=profile_info.get("username") or username_fallback,
+                            ):
+                                profile_info[key] = value
+                            continue
+
+                        if not _has_value(current_value):
                             profile_info[key] = value
-                self._sanitize_profile_info_quality(
-                    profile_info,
-                    username_hint=profile_info.get("username") or username_fallback,
-                )
-                logger.info("Extração DOM de perfil concluída para %s", profile_url)
-            except Exception as exc:
-                html_error = str(exc)
-                logger.warning("Falha na extração DOM (HTML) do perfil %s: %s", profile_url, exc)
-
-            dom_attempt_succeeded = bool(profile_html and profile_html.strip())
-            dom_has_core_data = _has_core_profile_data(profile_info)
-            dom_missing_core = [
-                key
-                for key in core_profile_fields
-                if not _has_value(profile_info.get(key))
-            ]
-            dom_log_snapshot = {
-                "username": profile_info.get("username"),
-                "full_name": profile_info.get("full_name"),
-                "bio_preview": (
-                    (str(profile_info.get("bio"))[:120] + "...")
-                    if isinstance(profile_info.get("bio"), str) and len(str(profile_info.get("bio"))) > 120
-                    else profile_info.get("bio")
-                ),
-                "follower_count": profile_info.get("follower_count"),
-                "following_count": profile_info.get("following_count"),
-                "post_count": profile_info.get("post_count"),
-                "verified": profile_info.get("verified"),
-                "is_private": profile_info.get("is_private"),
-            }
-            logger.info(
-                "DOM profile extraction summary for %s: html_ok=%s extracted=%s missing_core=%s",
-                profile_url,
-                dom_attempt_succeeded,
-                dom_log_snapshot,
-                dom_missing_core,
-            )
-
-            needs_rendered_dom_probe = (
-                (not _has_value(profile_info.get("full_name")))
-                or (not _has_value(profile_info.get("bio")))
-                or self._is_generic_instagram_bio(
-                    profile_info.get("bio"),
-                    username_hint=profile_info.get("username") or username_fallback,
-                )
-                or any(
-                    not _has_value(profile_info.get(key))
-                    for key in ("follower_count", "following_count", "post_count")
-                )
-            )
-
-            if needs_rendered_dom_probe:
-                rendered_script = """
-                (() => {
-                    const safeText = (el) => (el ? (el.innerText || el.textContent || "").trim() : null);
-                    const header = document.querySelector("main header");
-                    const main = document.querySelector("main");
-                    const statLines = Array.from(document.querySelectorAll("main header ul li"))
-                        .map((el) => safeText(el))
-                        .filter(Boolean);
-                    const bioLines = Array.from(document.querySelectorAll("main header section span, main header section h1, main header section div"))
-                        .map((el) => safeText(el))
-                        .filter(Boolean);
-                    const usernameEl = document.querySelector("main header h2");
-                    const fullNameEl = document.querySelector("main header h1");
-                    return {
-                        page_title: document.title || null,
-                        og_title: document.querySelector("meta[property=\"og:title\"]")?.content || null,
-                        og_description: document.querySelector("meta[property=\"og:description\"]")?.content || null,
-                        header_text: safeText(header),
-                        main_text: safeText(main),
-                        username_text: safeText(usernameEl),
-                        full_name_text: safeText(fullNameEl),
-                        stat_lines: statLines,
-                        bio_lines: bioLines,
-                    };
-                })();
-                """
-                try:
-                    rendered_payload = await self.browserless.execute_script(
-                        profile_url,
-                        script=rendered_script,
-                        timeout=45000,
-                        cookies=cookies,
-                        user_agent=user_agent,
-                    )
-                    rendered_info = self._extract_profile_info_from_rendered_dom_payload(
-                        rendered_payload,
-                        username_hint=profile_info.get("username") or username_fallback,
-                    )
-
-                    for key in ("follower_count", "following_count", "post_count"):
-                        rendered_value = self._to_int_or_none(rendered_info.get(key))
-                        if rendered_value is not None:
-                            profile_info[key] = rendered_value
-
-                    rendered_full_name = rendered_info.get("full_name")
-                    if _has_value(rendered_full_name) and not _has_value(profile_info.get("full_name")):
-                        profile_info["full_name"] = rendered_full_name
-
-                    rendered_bio = rendered_info.get("bio")
-                    current_bio = profile_info.get("bio")
-                    current_bio_is_generic = self._is_generic_instagram_bio(
-                        current_bio,
-                        username_hint=profile_info.get("username") or username_fallback,
-                    )
-                    if _has_value(rendered_bio) and (not _has_value(current_bio) or current_bio_is_generic):
-                        profile_info["bio"] = rendered_bio
-
-                    if _has_value(rendered_info.get("username")) and not _has_value(profile_info.get("username")):
-                        profile_info["username"] = rendered_info["username"]
 
                     self._sanitize_profile_info_quality(
                         profile_info,
                         username_hint=profile_info.get("username") or username_fallback,
                     )
 
-                    rendered_log_snapshot = {
-                        "username": profile_info.get("username"),
-                        "full_name": profile_info.get("full_name"),
-                        "bio_preview": (
-                            (str(profile_info.get("bio"))[:120] + "...")
-                            if isinstance(profile_info.get("bio"), str) and len(str(profile_info.get("bio"))) > 120
-                            else profile_info.get("bio")
-                        ),
-                        "follower_count": profile_info.get("follower_count"),
-                        "following_count": profile_info.get("following_count"),
-                        "post_count": profile_info.get("post_count"),
-                    }
-                    logger.info(
-                        "Rendered DOM profile extraction summary for %s: extracted=%s",
-                        profile_url,
-                        rendered_log_snapshot,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Falha na extração DOM renderizada (execute_script) do perfil %s: %s",
-                        profile_url,
-                        exc,
-                    )
+                browser_use_filled_core = [
+                    key
+                    for key in core_profile_fields
+                    if (not _has_value(before_browser_use.get(key))) and _has_value(profile_info.get(key))
+                ]
+                logger.info(
+                    "Browser Use profile extraction concluido para %s | error=%s | core_filled=%s",
+                    profile_url,
+                    browser_use_result.get("error") if isinstance(browser_use_result, dict) else None,
+                    browser_use_filled_core,
+                )
+            except Exception as exc:
+                logger.warning("Browser Use nao conseguiu extrair perfil %s: %s", profile_url, exc)
 
-            dom_has_core_data = _has_core_profile_data(profile_info)
+            still_poor = not _has_core_profile_data(profile_info)
 
-            # 2) FALLBACK: Browser Use quando DOM falha OU quando DOM vem sem dados core.
-            if not dom_has_core_data:
-                before_browser_use = {key: profile_info.get(key) for key in core_profile_fields}
-                try:
-                    browser_use_result = await browser_use_agent.scrape_profile_basic_info(
-                        profile_url=profile_url,
-                        storage_state=storage_state,
-                    )
-                    if isinstance(browser_use_result, dict) and not browser_use_result.get("error"):
-                        for key, value in browser_use_result.items():
-                            if value is None:
-                                continue
-
-                            current_value = profile_info.get(key)
-
-                            if key in ("follower_count", "following_count", "post_count"):
-                                numeric_value = self._to_int_or_none(value)
-                                if numeric_value is not None:
-                                    profile_info[key] = numeric_value
-                                continue
-
-                            if key == "full_name":
-                                current_name_norm = (
-                                    str(current_value).strip().lower()
-                                    if isinstance(current_value, str)
-                                    else ""
-                                )
-                                if (not _has_value(current_value)) or current_name_norm in {
-                                    "instagram",
-                                    "meta",
-                                    "instagram from meta",
-                                }:
-                                    profile_info[key] = value
-                                continue
-
-                            if key == "bio":
-                                if (not _has_value(current_value)) or self._is_generic_instagram_bio(
-                                    current_value,
-                                    username_hint=profile_info.get("username") or username_fallback,
-                                ):
-                                    profile_info[key] = value
-                                continue
-
-                            if not _has_value(current_value):
-                                profile_info[key] = value
-
-                        self._sanitize_profile_info_quality(
-                            profile_info,
-                            username_hint=profile_info.get("username") or username_fallback,
-                        )
-                    browser_use_filled_core = [
-                        key
-                        for key in core_profile_fields
-                        if (not _has_value(before_browser_use.get(key))) and _has_value(profile_info.get(key))
-                    ]
-                    logger.info(
-                        "Fallback Browser Use executado para %s | error=%s | core_filled=%s",
-                        profile_url,
-                        browser_use_result.get("error") if isinstance(browser_use_result, dict) else None,
-                        browser_use_filled_core,
-                    )
-                except Exception as exc:
-                    logger.warning("Browser Use nao conseguiu extrair perfil %s: %s", profile_url, exc)
-
-            has_core_data_after_fallback = _has_core_profile_data(profile_info)
-            still_poor = not has_core_data_after_fallback
-
-            # 3) ÃšLTIMO fallback: IA sobre screenshot+HTML.
+            # Ultimo fallback opcional: IA sobre screenshot.
             if still_poor and use_ai_fallback:
                 try:
                     profile_screenshot = await self.browserless.screenshot(
@@ -1618,12 +1457,11 @@ class InstagramScraper:
                     screenshot_error = str(exc)
                     logger.warning("Falha ao capturar screenshot do perfil %s: %s", profile_url, exc)
 
-                if not profile_screenshot and not profile_html:
+                if not profile_screenshot:
                     details = " ; ".join(
                         item
                         for item in [
                             screenshot_error,
-                            html_error,
                             browser_use_result.get("error") if isinstance(browser_use_result, dict) else None,
                         ]
                         if item
@@ -1634,12 +1472,16 @@ class InstagramScraper:
 
                 ai_info = await self.ai_extractor.extract_profile_info(
                     screenshot_base64=profile_screenshot,
-                    html_content=profile_html,
+                    html_content=None,
                 )
                 if isinstance(ai_info, dict):
                     for key, value in ai_info.items():
                         if profile_info.get(key) is None and value is not None:
                             profile_info[key] = value
+                    self._sanitize_profile_info_quality(
+                        profile_info,
+                        username_hint=profile_info.get("username") or username_fallback,
+                    )
             elif still_poor and not use_ai_fallback:
                 logger.info(
                     "Dados core do perfil permaneceram incompletos para %s; "
