@@ -23,6 +23,7 @@ class BrowserlessClient:
         self.max_retries = max(1, settings.browserless_request_retries)
         self.retry_backoff_seconds = max(0.1, settings.browserless_retry_backoff_seconds)
         self.semaphore = asyncio.Semaphore(max(1, settings.browserless_max_concurrency))
+        self._script_endpoints = ["/execute", "/function"]
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout))
 
     def _is_field_validation_error(self, response: httpx.Response, fields: list[str]) -> bool:
@@ -256,15 +257,39 @@ class BrowserlessClient:
             if user_agent:
                 payload["userAgent"] = user_agent
 
-            response = await self._post_with_retry(
-                endpoint="/execute",
-                payload=payload,
-                url_for_log=url,
-                fallback_fields=["timeout", "waitFor", "cookies", "userAgent"],
-            )
-            result = response.json().get("data")
-            logger.info(f"✅ Script executado em: {url}")
-            return result
+            endpoints = list(self._script_endpoints) or ["/execute", "/function"]
+            last_error: Optional[Exception] = None
+
+            for endpoint in endpoints:
+                try:
+                    response = await self._post_with_retry(
+                        endpoint=endpoint,
+                        payload=payload,
+                        url_for_log=url,
+                        fallback_fields=["timeout", "waitFor", "cookies", "userAgent"],
+                    )
+                    result = response.json().get("data")
+                    logger.info(f"✅ Script executado em: {url} (endpoint={endpoint})")
+                    return result
+                except Exception as endpoint_error:
+                    last_error = endpoint_error
+                    error_text = str(endpoint_error).lower()
+                    if "status=404" in error_text:
+                        if endpoint in self._script_endpoints:
+                            self._script_endpoints = [
+                                item for item in self._script_endpoints if item != endpoint
+                            ]
+                        logger.warning(
+                            "Endpoint Browserless %s indisponível para execute_script em %s. Tentando próximo endpoint.",
+                            endpoint,
+                            url,
+                        )
+                        continue
+                    break
+
+            if last_error:
+                raise last_error
+            raise RuntimeError(f"Nenhum endpoint de execute_script disponível para {url}")
 
         except Exception as e:
             logger.error(f"❌ Erro ao executar script em {url}: {e}")
