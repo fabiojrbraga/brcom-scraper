@@ -246,6 +246,195 @@ class InstagramScraper:
                 if full_name and full_name.lower() != "instagram":
                     extracted["full_name"] = full_name
 
+        # Fallback adicional: tenta JSON-LD quando disponível.
+        if any(extracted.get(k) is None for k in ("full_name", "bio", "follower_count")):
+            ld_json_matches = re.findall(
+                r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            for ld_raw in ld_json_matches:
+                payload = (ld_raw or "").strip()
+                if not payload:
+                    continue
+                try:
+                    data = json.loads(payload)
+                except Exception:
+                    continue
+
+                candidates: list[dict[str, Any]] = []
+                if isinstance(data, dict):
+                    candidates.append(data)
+                elif isinstance(data, list):
+                    candidates.extend(item for item in data if isinstance(item, dict))
+
+                for item in candidates:
+                    if extracted.get("full_name") is None and isinstance(item.get("name"), str):
+                        name = item.get("name").strip()
+                        if name and name.lower() != "instagram":
+                            extracted["full_name"] = name
+
+                    if extracted.get("bio") is None and isinstance(item.get("description"), str):
+                        description = item.get("description").strip()
+                        if description:
+                            extracted["bio"] = description
+
+                    if extracted.get("follower_count") is None:
+                        stats = item.get("interactionStatistic")
+                        stat_items: list[dict[str, Any]] = []
+                        if isinstance(stats, dict):
+                            stat_items = [stats]
+                        elif isinstance(stats, list):
+                            stat_items = [stat for stat in stats if isinstance(stat, dict)]
+                        for stat in stat_items:
+                            stat_type = str(stat.get("interactionType") or "").lower()
+                            if "follow" not in stat_type:
+                                continue
+                            stat_count = self._to_int_or_none(stat.get("userInteractionCount"))
+                            if stat_count is not None:
+                                extracted["follower_count"] = stat_count
+                                break
+
+                if all(extracted.get(k) is not None for k in ("full_name", "bio", "follower_count")):
+                    break
+
+        # Fallback adicional: parse do texto visível (renderizado) do perfil.
+        if any(
+            extracted.get(k) is None
+            for k in ("full_name", "bio", "follower_count", "following_count", "post_count")
+        ):
+            visible_text = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", text)
+            visible_text = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", visible_text)
+            visible_text = re.sub(r"(?is)<[^>]+>", "\n", visible_text)
+            visible_text = html_lib.unescape(visible_text).replace("\xa0", " ")
+            visible_text = re.sub(r"[ \t\r\f\v]+", " ", visible_text)
+            visible_text = re.sub(r"\n{2,}", "\n", visible_text)
+
+            def _extract_count_from_visible(patterns: list[str]) -> Optional[int]:
+                for pattern in patterns:
+                    match = re.search(pattern, visible_text, flags=re.IGNORECASE)
+                    if not match:
+                        continue
+                    count_value = self._to_int_or_none(match.group(1))
+                    if count_value is not None:
+                        return count_value
+                return None
+
+            if extracted.get("post_count") is None:
+                extracted["post_count"] = _extract_count_from_visible(
+                    [
+                        r"(\d[\d\.,kKmM]*)\s*(?:posts?|publica(?:ç|c)(?:[õo]es)?)\b",
+                    ]
+                )
+
+            if extracted.get("follower_count") is None:
+                extracted["follower_count"] = _extract_count_from_visible(
+                    [
+                        r"(\d[\d\.,kKmM]*)\s*(?:seguidores|followers)\b",
+                    ]
+                )
+
+            if extracted.get("following_count") is None:
+                extracted["following_count"] = _extract_count_from_visible(
+                    [
+                        r"(\d[\d\.,kKmM]*)\s*(?:seguindo|following)\b",
+                    ]
+                )
+
+            lines = [line.strip() for line in visible_text.split("\n") if line.strip()]
+            profile_username = (str(extracted.get("username") or username_hint or "")).strip().lstrip("@").lower()
+
+            def _is_count_line(line: str) -> bool:
+                return bool(
+                    re.search(
+                        r"\b(posts?|publica(?:ç|c)(?:[õo]es)?|seguidores|followers|seguindo|following)\b",
+                        line,
+                        flags=re.IGNORECASE,
+                    )
+                )
+
+            def _is_noise_line(line: str) -> bool:
+                lowered = line.lower()
+                noise_tokens = (
+                    "seguir",
+                    "follow",
+                    "message",
+                    "mensagem",
+                    "editar perfil",
+                    "edit profile",
+                    "seguido(a) por",
+                    "followed by",
+                )
+                return any(token in lowered for token in noise_tokens)
+
+            if profile_username and lines:
+                username_idx = next(
+                    (
+                        idx
+                        for idx, line in enumerate(lines)
+                        if profile_username in re.sub(r"[@:•]", " ", line.lower()).split()
+                        or line.lower().startswith(profile_username)
+                    ),
+                    None,
+                )
+            else:
+                username_idx = None
+
+            if username_idx is not None:
+                window = lines[username_idx: min(len(lines), username_idx + 20)]
+            else:
+                window = lines[:25]
+
+            full_name_idx: Optional[int] = None
+            if extracted.get("full_name") is None:
+                for idx, candidate in enumerate(window):
+                    candidate_clean = candidate.strip()
+                    if not candidate_clean:
+                        continue
+                    if profile_username and candidate_clean.lower().strip("@") == profile_username:
+                        continue
+                    if _is_count_line(candidate_clean) or _is_noise_line(candidate_clean):
+                        continue
+                    if candidate_clean.startswith("@"):
+                        continue
+                    if re.search(r"https?://|instagram\.com", candidate_clean, flags=re.IGNORECASE):
+                        continue
+                    if len(candidate_clean) > 80:
+                        continue
+                    extracted["full_name"] = candidate_clean
+                    full_name_idx = idx
+                    break
+
+            if extracted.get("bio") is None:
+                count_idx = next((idx for idx, line in enumerate(window) if _is_count_line(line)), None)
+                start_idx = 0
+                if count_idx is not None:
+                    start_idx = count_idx + 1
+                elif full_name_idx is not None:
+                    start_idx = full_name_idx + 1
+
+                bio_parts: list[str] = []
+                for candidate in window[start_idx:]:
+                    candidate_clean = candidate.strip()
+                    if not candidate_clean:
+                        continue
+                    if _is_noise_line(candidate_clean):
+                        if bio_parts:
+                            break
+                        continue
+                    if _is_count_line(candidate_clean):
+                        continue
+                    if profile_username and candidate_clean.lower().strip("@") == profile_username:
+                        continue
+                    if re.search(r"https?://|instagram\.com", candidate_clean, flags=re.IGNORECASE):
+                        continue
+                    bio_parts.append(candidate_clean)
+                    if len(bio_parts) >= 4:
+                        break
+
+                if bio_parts:
+                    extracted["bio"] = "\n".join(bio_parts)
+
         # limpeza
         if isinstance(extracted.get("bio"), str):
             extracted["bio"] = extracted["bio"].strip() or None
@@ -775,6 +964,7 @@ class InstagramScraper:
         save_to_db: bool = True,
         cache_ttl_days: int = 0,
         session_username: Optional[str] = None,
+        use_ai_fallback: bool = True,
     ) -> Dict[str, Any]:
         """
         Raspa somente os dados do perfil (sem posts/interacoes).
@@ -874,9 +1064,40 @@ class InstagramScraper:
                 logger.warning("Falha na extração DOM (HTML) do perfil %s: %s", profile_url, exc)
 
             dom_attempt_succeeded = bool(profile_html and profile_html.strip())
+            dom_has_core_data = any(
+                _has_value(profile_info.get(key))
+                for key in core_profile_fields
+            )
+            dom_missing_core = [
+                key
+                for key in core_profile_fields
+                if not _has_value(profile_info.get(key))
+            ]
+            dom_log_snapshot = {
+                "username": profile_info.get("username"),
+                "full_name": profile_info.get("full_name"),
+                "bio_preview": (
+                    (str(profile_info.get("bio"))[:120] + "...")
+                    if isinstance(profile_info.get("bio"), str) and len(str(profile_info.get("bio"))) > 120
+                    else profile_info.get("bio")
+                ),
+                "follower_count": profile_info.get("follower_count"),
+                "following_count": profile_info.get("following_count"),
+                "post_count": profile_info.get("post_count"),
+                "verified": profile_info.get("verified"),
+                "is_private": profile_info.get("is_private"),
+            }
+            logger.info(
+                "DOM profile extraction summary for %s: html_ok=%s extracted=%s missing_core=%s",
+                profile_url,
+                dom_attempt_succeeded,
+                dom_log_snapshot,
+                dom_missing_core,
+            )
 
-            # 2) FALLBACK: fluxo atual com Browser Use somente se a tentativa DOM falhar.
-            if not dom_attempt_succeeded:
+            # 2) FALLBACK: Browser Use quando DOM falha OU quando DOM vem sem dados core.
+            if (not dom_attempt_succeeded) or (not dom_has_core_data):
+                before_browser_use = {key: profile_info.get(key) for key in core_profile_fields}
                 try:
                     browser_use_result = await browser_use_agent.scrape_profile_basic_info(
                         profile_url=profile_url,
@@ -886,17 +1107,28 @@ class InstagramScraper:
                         for key, value in browser_use_result.items():
                             if profile_info.get(key) is None and value is not None:
                                 profile_info[key] = value
-                    logger.info("Fallback Browser Use executado para %s", profile_url)
+                    browser_use_filled_core = [
+                        key
+                        for key in core_profile_fields
+                        if (not _has_value(before_browser_use.get(key))) and _has_value(profile_info.get(key))
+                    ]
+                    logger.info(
+                        "Fallback Browser Use executado para %s | error=%s | core_filled=%s",
+                        profile_url,
+                        browser_use_result.get("error") if isinstance(browser_use_result, dict) else None,
+                        browser_use_filled_core,
+                    )
                 except Exception as exc:
                     logger.warning("Browser Use nao conseguiu extrair perfil %s: %s", profile_url, exc)
 
-            still_poor = (not dom_attempt_succeeded) and not any(
+            has_core_data_after_fallback = any(
                 _has_value(profile_info.get(key))
                 for key in core_profile_fields
             )
+            still_poor = not has_core_data_after_fallback
 
             # 3) ÚLTIMO fallback: IA sobre screenshot+HTML.
-            if still_poor:
+            if still_poor and use_ai_fallback:
                 try:
                     profile_screenshot = await self.browserless.screenshot(
                         profile_url,
@@ -929,6 +1161,12 @@ class InstagramScraper:
                     for key, value in ai_info.items():
                         if profile_info.get(key) is None and value is not None:
                             profile_info[key] = value
+            elif still_poor and not use_ai_fallback:
+                logger.info(
+                    "Dados core do perfil permaneceram incompletos para %s; "
+                    "fallback de IA desabilitado para esta chamada.",
+                    profile_url,
+                )
 
             normalized = {
                 "username": (profile_info.get("username") or username_fallback).strip().lstrip("@").lower(),

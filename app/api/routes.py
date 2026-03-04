@@ -808,6 +808,7 @@ async def scrape_profile_info(
             save_to_db=True,
             cache_ttl_days=settings.profile_cache_ttl_days,
             session_username=request.session_username,
+            use_ai_fallback=False,
         )
         return ProfileScrapeResponse(**result)
     except Exception as e:
