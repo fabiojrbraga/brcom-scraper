@@ -135,41 +135,50 @@ def _ensure_interactions_post_url_column() -> None:
 
 def _ensure_interaction_type_view_value() -> None:
     """
-    Garante que o enum interactiontype (PostgreSQL) contenha o valor 'view'.
+    Garante que o enum interactiontype (PostgreSQL) contenha o valor VIEW/view
+    no mesmo padrao de caixa ja existente no enum.
     """
     try:
         if engine.dialect.name != "postgresql":
             return
 
-        # ALTER TYPE .. ADD VALUE pode exigir autocommit em algumas versoes.
         with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
-            conn.execute(
+            type_exists = conn.execute(
+                text(
+                    "SELECT 1 FROM pg_type WHERE typname = 'interactiontype' LIMIT 1"
+                )
+            ).scalar()
+            if not type_exists:
+                return
+
+            labels_rows = conn.execute(
                 text(
                     """
-                    DO $$
-                    BEGIN
-                        IF EXISTS (
-                            SELECT 1
-                            FROM pg_type
-                            WHERE typname = 'interactiontype'
-                        ) THEN
-                            IF NOT EXISTS (
-                                SELECT 1
-                                FROM pg_type t
-                                JOIN pg_enum e ON e.enumtypid = t.oid
-                                WHERE t.typname = 'interactiontype'
-                                  AND e.enumlabel = 'view'
-                            ) THEN
-                                ALTER TYPE interactiontype ADD VALUE 'view';
-                            END IF;
-                        END IF;
-                    END $$;
+                    SELECT e.enumlabel
+                    FROM pg_type t
+                    JOIN pg_enum e ON e.enumtypid = t.oid
+                    WHERE t.typname = 'interactiontype'
                     """
                 )
-            )
-        logger.info("✅ Enum interactiontype validado com valor 'view'")
+            ).fetchall()
+            existing_labels = {str(row[0]) for row in labels_rows}
+
+            if "LIKE" in existing_labels:
+                target_label = "VIEW"
+            elif "like" in existing_labels:
+                target_label = "view"
+            else:
+                target_label = "VIEW"
+
+            if target_label not in existing_labels:
+                conn.execute(
+                    text(f"ALTER TYPE interactiontype ADD VALUE '{target_label}'")
+                )
+                logger.info("✅ Valor '%s' adicionado ao enum interactiontype", target_label)
+            else:
+                logger.info("✅ Enum interactiontype já contém valor '%s'", target_label)
     except Exception as e:
-        logger.warning("⚠️ Não foi possível garantir enum interactiontype com valor 'view': %s", e)
+        logger.warning("⚠️ Não foi possível garantir enum interactiontype com valor VIEW/view: %s", e)
 
 
 def drop_db():
