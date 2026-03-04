@@ -14,6 +14,7 @@ class InteractionTypeSchema(str, Enum):
     COMMENT = "comment"
     SHARE = "share"
     SAVE = "save"
+    VIEW = "view"
 
 
 # ==================== Profile Schemas ====================

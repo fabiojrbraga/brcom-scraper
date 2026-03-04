@@ -18,6 +18,7 @@ class InteractionType(str, enum.Enum):
     COMMENT = "comment"
     SHARE = "share"
     SAVE = "save"
+    VIEW = "view"
 
 
 class Profile(Base):

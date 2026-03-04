@@ -50,6 +50,7 @@ def init_db():
         Base.metadata.create_all(bind=engine)
         _ensure_profiles_full_name_column()
         _ensure_interactions_post_url_column()
+        _ensure_interaction_type_view_value()
         logger.info("✅ Banco de dados inicializado com sucesso")
     except Exception as e:
         logger.error(f"❌ Erro ao inicializar banco de dados: {e}")
@@ -130,6 +131,45 @@ def _ensure_interactions_post_url_column() -> None:
         logger.info("✅ Coluna/índices interactions.post_url garantidos com sucesso")
     except Exception as e:
         logger.warning("⚠️ Não foi possível garantir interactions.post_url: %s", e)
+
+
+def _ensure_interaction_type_view_value() -> None:
+    """
+    Garante que o enum interactiontype (PostgreSQL) contenha o valor 'view'.
+    """
+    try:
+        if engine.dialect.name != "postgresql":
+            return
+
+        # ALTER TYPE .. ADD VALUE pode exigir autocommit em algumas versoes.
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(
+                text(
+                    """
+                    DO $$
+                    BEGIN
+                        IF EXISTS (
+                            SELECT 1
+                            FROM pg_type
+                            WHERE typname = 'interactiontype'
+                        ) THEN
+                            IF NOT EXISTS (
+                                SELECT 1
+                                FROM pg_type t
+                                JOIN pg_enum e ON e.enumtypid = t.oid
+                                WHERE t.typname = 'interactiontype'
+                                  AND e.enumlabel = 'view'
+                            ) THEN
+                                ALTER TYPE interactiontype ADD VALUE 'view';
+                            END IF;
+                        END IF;
+                    END $$;
+                    """
+                )
+            )
+        logger.info("✅ Enum interactiontype validado com valor 'view'")
+    except Exception as e:
+        logger.warning("⚠️ Não foi possível garantir enum interactiontype com valor 'view': %s", e)
 
 
 def drop_db():
