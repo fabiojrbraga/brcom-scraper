@@ -833,47 +833,72 @@ class InstagramScraper:
 
             profile_info: Dict[str, Any] = {}
             browser_use_result: Dict[str, Any] = {}
-
-            try:
-                browser_use_result = await browser_use_agent.scrape_profile_basic_info(
-                    profile_url=profile_url,
-                    storage_state=storage_state,
-                )
-                if isinstance(browser_use_result, dict) and not browser_use_result.get("error"):
-                    profile_info.update(browser_use_result)
-            except Exception as exc:
-                logger.warning("Browser Use nao conseguiu extrair perfil %s: %s", profile_url, exc)
-
             profile_html: Optional[str] = None
             profile_screenshot: Optional[str] = None
             html_error: Optional[str] = None
             screenshot_error: Optional[str] = None
 
-            html_info: Dict[str, Any] = {}
-            need_more_data = not any(
-                profile_info.get(key) is not None
-                for key in ("bio", "follower_count", "following_count", "post_count")
+            def _has_value(value: Any) -> bool:
+                if value is None:
+                    return False
+                if isinstance(value, str):
+                    return bool(value.strip())
+                return True
+
+            core_profile_fields = (
+                "full_name",
+                "bio",
+                "follower_count",
+                "following_count",
+                "post_count",
             )
 
-            if need_more_data:
-                try:
-                    profile_html = await self.browserless.get_html(
-                        profile_url,
-                        cookies=cookies,
-                        user_agent=user_agent,
-                    )
-                    html_info = self._extract_profile_info_from_html(profile_html, username_hint=username_fallback)
+            # 1) DOM FIRST: tenta extração determinística via HTML/DOM.
+            try:
+                profile_html = await self.browserless.get_html(
+                    profile_url,
+                    cookies=cookies,
+                    user_agent=user_agent,
+                )
+                html_info = self._extract_profile_info_from_html(
+                    profile_html,
+                    username_hint=username_fallback,
+                )
+                if isinstance(html_info, dict):
                     for key, value in html_info.items():
                         if profile_info.get(key) is None and value is not None:
                             profile_info[key] = value
+                logger.info("Extração DOM de perfil concluída para %s", profile_url)
+            except Exception as exc:
+                html_error = str(exc)
+                logger.warning("Falha na extração DOM (HTML) do perfil %s: %s", profile_url, exc)
+
+            dom_has_core_data = any(
+                _has_value(profile_info.get(key))
+                for key in core_profile_fields
+            )
+
+            # 2) FALLBACK: fluxo atual com Browser Use somente se DOM vier pobre.
+            if not dom_has_core_data:
+                try:
+                    browser_use_result = await browser_use_agent.scrape_profile_basic_info(
+                        profile_url=profile_url,
+                        storage_state=storage_state,
+                    )
+                    if isinstance(browser_use_result, dict) and not browser_use_result.get("error"):
+                        for key, value in browser_use_result.items():
+                            if profile_info.get(key) is None and value is not None:
+                                profile_info[key] = value
+                    logger.info("Fallback Browser Use executado para %s", profile_url)
                 except Exception as exc:
-                    html_error = str(exc)
-                    logger.warning("Falha ao obter/parsing HTML do perfil %s: %s", profile_url, exc)
+                    logger.warning("Browser Use nao conseguiu extrair perfil %s: %s", profile_url, exc)
 
             still_poor = not any(
-                profile_info.get(key) is not None
-                for key in ("bio", "follower_count", "following_count", "post_count")
+                _has_value(profile_info.get(key))
+                for key in core_profile_fields
             )
+
+            # 3) ÚLTIMO fallback: IA sobre screenshot+HTML.
             if still_poor:
                 try:
                     profile_screenshot = await self.browserless.screenshot(
