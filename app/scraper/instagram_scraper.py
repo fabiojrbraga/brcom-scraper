@@ -1699,7 +1699,7 @@ class InstagramScraper:
         Requer sessao autenticada valida do Instagram.
         """
         try:
-            logger.info("ðŸš€ Iniciando fluxo stories_interactions para %s", profile_url)
+            logger.info("Iniciando fluxo stories_interactions para %s", profile_url)
 
             if not profile_url.startswith("http"):
                 profile_url = f"https://instagram.com/{profile_url}"
@@ -2119,15 +2119,24 @@ class InstagramScraper:
                     interactions_to_persist,
                 )
 
-            logger.info(
-                "âœ… Fluxo stories_interactions concluido: story_posts=%s viewers=%s likes=%s",
-                total_story_posts,
-                total_story_viewers,
-                total_liked_users,
-            )
+            if raw_error:
+                logger.warning(
+                    "Fluxo stories_interactions finalizado com erro=%s: story_posts=%s viewers=%s likes=%s",
+                    raw_error,
+                    total_story_posts,
+                    total_story_viewers,
+                    total_liked_users,
+                )
+            else:
+                logger.info(
+                    "Fluxo stories_interactions concluido: story_posts=%s viewers=%s likes=%s",
+                    total_story_posts,
+                    total_story_viewers,
+                    total_liked_users,
+                )
             return result
         except Exception as exc:
-            logger.exception("âŒ Erro no fluxo stories_interactions para %s: %s", profile_url, exc)
+            logger.exception("Erro no fluxo stories_interactions para %s: %s", profile_url, exc)
             raise
 
     async def _scrape_posts(
@@ -2494,10 +2503,14 @@ class InstagramScraper:
                         )
                         db.add(interaction)
             db.commit()
-            logger.info(f"âœ… Posts e interaÃ§Ãµes salvos no banco")
+            logger.info(
+                "Persistencia de posts/interacoes concluida: posts=%s interactions=%s",
+                len(posts_data),
+                len(interactions),
+            )
 
         except Exception as e:
-            logger.error(f"âŒ Erro ao salvar posts e interaÃ§Ãµes: {e}")
+            logger.error("Erro ao salvar posts e interacoes: %s", e)
             db.rollback()
             raise
 

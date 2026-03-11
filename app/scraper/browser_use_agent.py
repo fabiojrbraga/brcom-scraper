@@ -427,7 +427,13 @@ class BrowserUseAgent:
                 pass
         return session
 
-    def _create_agent(self, task: str, llm: ChatOpenAI, browser_session: BrowserSession) -> Agent:
+    def _create_agent(
+        self,
+        task: str,
+        llm: ChatOpenAI,
+        browser_session: BrowserSession,
+        **extra_kwargs: Any,
+    ) -> Agent:
         possible_kwargs = {
             "task": task,
             "llm": llm,
@@ -438,6 +444,7 @@ class BrowserUseAgent:
             "keep_browser_open": True,
             "keep_browser_session": True,
         }
+        possible_kwargs.update(extra_kwargs)
         try:
             sig = inspect.signature(Agent.__init__)
             allowed = {k: v for k, v in possible_kwargs.items() if k in sig.parameters}
@@ -2424,6 +2431,8 @@ class BrowserUseAgent:
                         task=task,
                         llm=llm,
                         browser_session=browser_session,
+                        use_judge=False,
+                        final_response_after_failure=False,
                     )
 
                     restore_event_bus = self._patch_event_bus_for_stop(browser_session)

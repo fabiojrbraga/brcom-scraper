@@ -18,7 +18,7 @@ if database_url.startswith("postgres://"):
 # Criar engine do SQLAlchemy
 engine = create_engine(
     database_url,
-    echo=settings.fastapi_env == "development",
+    echo=settings.sqlalchemy_echo,
     poolclass=NullPool if settings.fastapi_env == "production" else None,
     connect_args={"connect_timeout": settings.request_timeout}
 )

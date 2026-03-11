@@ -62,6 +62,7 @@ class Settings(BaseSettings):
 
     # Application Settings
     log_level: str = "INFO"
+    sqlalchemy_echo: bool = False
     max_retries: int = 3
     request_timeout: int = 30
 
