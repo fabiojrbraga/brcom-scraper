@@ -240,7 +240,7 @@ class ScrapingJobCreate(BaseModel):
     profile_url: str = Field(..., description="URL do perfil Instagram a ser raspado")
     session_username: Optional[str] = Field(
         default=None,
-        description="Username da sessao Instagram a reutilizar (opcional)",
+        description="Username da sessao Instagram ativa a reutilizar (obrigatorio em todos os flows do /scrape)",
     )
     flow: str = Field(
         default="default",

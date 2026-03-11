@@ -926,6 +926,83 @@ class BrowserUseAgent:
         }
         """
 
+        open_story_from_profile_script = """
+        (...args) => {
+          const targetUsername = String(args[0] || '').trim().replace(/^@/, '').toLowerCase();
+          const tryClick = (el, method) => {
+            if (!el) return null;
+            try {
+              el.scrollIntoView({ block: 'center', inline: 'center' });
+            } catch (e) {}
+            try {
+              el.click();
+              return { clicked: true, method };
+            } catch (e) {
+              return null;
+            }
+          };
+
+          const scoreElement = (el, href = '') => {
+            let score = 0;
+            const rect = typeof el.getBoundingClientRect === 'function'
+              ? el.getBoundingClientRect()
+              : { top: 9999, left: 9999, width: 0, height: 0 };
+            const text = ((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
+            const normalizedHref = String(href || '').toLowerCase();
+
+            if (normalizedHref.includes('/stories/')) score += 100;
+            if (targetUsername && normalizedHref.includes(`/stories/${targetUsername}/`)) score += 80;
+            if (text.includes('story') || text.includes('stories') || text.includes('historia') || text.includes('historias')) score += 30;
+            if (el.querySelector && el.querySelector('img')) score += 20;
+            if (rect.top >= 0 && rect.top <= 420) score += 20;
+            if (rect.left >= 0 && rect.left <= 420) score += 10;
+            if (rect.width >= 24 && rect.height >= 24) score += 10;
+
+            return score;
+          };
+
+          const anchorCandidates = Array.from(document.querySelectorAll('a[href]'))
+            .map((el) => ({ el, href: el.getAttribute('href') || '' }))
+            .filter((item) => (item.href || '').includes('/stories/'))
+            .map((item) => ({ ...item, score: scoreElement(item.el, item.href) }))
+            .sort((a, b) => b.score - a.score);
+
+          for (const candidate of anchorCandidates) {
+            const clicked = tryClick(candidate.el, 'story_anchor');
+            if (clicked) {
+              return { ...clicked, href: candidate.href, score: candidate.score };
+            }
+          }
+
+          const genericCandidates = Array.from(
+            document.querySelectorAll('header a, header button, header div[role="button"], main a, main button, main div[role="button"]')
+          )
+            .map((el) => ({
+              el,
+              score: scoreElement(el, el.getAttribute && el.getAttribute('href')),
+            }))
+            .filter((item) => item.score >= 40)
+            .sort((a, b) => b.score - a.score);
+
+          for (const candidate of genericCandidates) {
+            const clicked = tryClick(candidate.el, 'profile_header_candidate');
+            if (clicked) {
+              return { ...clicked, score: candidate.score };
+            }
+          }
+
+          const avatarImg = document.querySelector('header img');
+          if (avatarImg) {
+            const clicked = tryClick(avatarImg.closest('button, a, div[role="button"]') || avatarImg, 'header_avatar');
+            if (clicked) {
+              return clicked;
+            }
+          }
+
+          return { clicked: false, reason: 'profile_story_trigger_not_found' };
+        }
+        """
+
         extract_story_viewers_script = """
         (...args) => (async () => {
           const maxUsers = Math.max(1, Number(args[0] || 300));
@@ -1281,6 +1358,43 @@ class BrowserUseAgent:
 
             return last_page, last_state, False
 
+        async def _recover_story_from_profile(
+            reason: str,
+            max_wait_seconds: float = 14.0,
+        ) -> tuple[Optional[Any], Dict[str, Any], bool]:
+            await self._navigate_to_url_with_timeout(
+                browser_session,
+                profile_url,
+                timeout_ms=30000,
+                new_tab=False,
+            )
+            await asyncio.sleep(1.5)
+            page_obj, state_data = await _read_state_from_current_page()
+            if page_obj is None:
+                return page_obj, state_data, False
+
+            click_raw = await self._evaluate_page_json(
+                page_obj,
+                open_story_from_profile_script,
+                self._extract_instagram_username(profile_url),
+            )
+            click_data = click_raw if isinstance(click_raw, dict) else {}
+            if not click_data.get("clicked"):
+                logger.warning(
+                    "Stories JS: nao foi possivel abrir o story pelo perfil (%s): %s",
+                    reason,
+                    click_data.get("reason") or "profile_story_trigger_not_found",
+                )
+                return page_obj, state_data, False
+
+            logger.info(
+                "Stories JS: recovery pelo perfil acionado (%s) via %s",
+                reason,
+                click_data.get("method") or "unknown",
+            )
+            await asyncio.sleep(1.2)
+            return await _wait_for_story_url(max_wait_seconds=max_wait_seconds)
+
         await self._navigate_to_url_with_timeout(
             browser_session,
             story_url,
@@ -1290,6 +1404,11 @@ class BrowserUseAgent:
         await asyncio.sleep(1.0)
 
         page, initial_state, initial_ready = await _wait_for_story_url(max_wait_seconds=20.0)
+        if not initial_ready and not initial_state.get("login_required"):
+            page, initial_state, initial_ready = await _recover_story_from_profile(
+                reason="navegacao_inicial_sem_story_id",
+                max_wait_seconds=16.0,
+            )
         if initial_state.get("login_required"):
             return {
                 "profile_url": profile_url,
@@ -1377,9 +1496,32 @@ class BrowserUseAgent:
                     "error": "story_open_failed",
                 }
 
-            last_valid_story_url = current_story_url
             story_id = self._extract_story_id_from_url(current_story_url)
             if not story_id:
+                if (
+                    "/stories/" not in current_story_url
+                    and recover_attempts < 3
+                ):
+                    recover_attempts += 1
+                    logger.warning(
+                        "Stories JS: URL fora do viewer (%s). Tentando recovery pelo perfil (%s/3)...",
+                        current_story_url,
+                        recover_attempts,
+                    )
+                    _, recovered_state, recovered_ready = await _recover_story_from_profile(
+                        reason="viewer_redirecionado_para_fora_do_story",
+                        max_wait_seconds=16.0,
+                    )
+                    if recovered_ready:
+                        current_story_url = self._normalize_story_url_value(
+                            recovered_state.get("story_url") or recovered_state.get("current_url")
+                        )
+                        story_id = self._extract_story_id_from_url(current_story_url)
+                        if story_id:
+                            last_valid_story_url = current_story_url
+                            recover_attempts = 0
+                    if not story_id:
+                        continue
                 if recover_attempts < 6:
                     recover_attempts += 1
                     logger.warning(
@@ -1401,6 +1543,7 @@ class BrowserUseAgent:
                     "total_collected": 0,
                     "error": "story_open_failed",
                 }
+            last_valid_story_url = current_story_url
             recover_attempts = 0
             if story_id in seen_story_ids:
                 break

@@ -87,6 +87,28 @@ def _get_active_instagram_session(
     return query.order_by(InstagramSession.updated_at.desc()).first()
 
 
+def _require_active_scrape_session(
+    db: Session,
+    session_username: str | None,
+    flow: str,
+) -> tuple[str, InstagramSession]:
+    normalized_username = _normalize_session_username(session_username)
+    if not normalized_username:
+        raise RuntimeError(
+            f"Fluxo {flow} exige session_username ativo. "
+            "Informe session_username de uma sessao Instagram ativa."
+        )
+
+    active_session = _get_active_instagram_session(db, normalized_username)
+    if not active_session:
+        raise RuntimeError(
+            f"Sessao Instagram '@{normalized_username}' nao encontrada ou inativa. "
+            f"Login no Instagram e obrigatorio para executar o fluxo {flow}."
+        )
+
+    return normalized_username, active_session
+
+
 def _build_stale_job_error_message(status: str) -> str:
     if status == "running":
         return "Job interrompido: processo reiniciado ou timeout excedido durante execucao em background."
@@ -216,30 +238,15 @@ async def start_scraping(
         request_payload["profile_url"] = normalized_profile_url
         flow = str(request_payload.get("flow") or "default").strip().lower()
         request_payload["flow"] = flow
-        session_username = _normalize_session_username(
-            str(request_payload.get("session_username") or "")
-        )
-        if session_username:
-            request_payload["session_username"] = session_username
-
-        if flow == "stories_interactions":
-            if not session_username:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Fluxo stories_interactions exige sessao autenticada. "
-                        "Informe session_username de uma sessao Instagram ativa."
-                    ),
-                )
-            session = _get_active_instagram_session(db, session_username)
-            if not session:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Sessao Instagram '@{session_username}' nao encontrada ou inativa. "
-                        "Login e obrigatorio para coletar interacoes de stories."
-                    ),
-                )
+        try:
+            session_username, _ = _require_active_scrape_session(
+                db,
+                str(request_payload.get("session_username") or ""),
+                flow,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        request_payload["session_username"] = session_username
 
         job = ScrapingJob(
             profile_url=normalized_profile_url,
@@ -1371,18 +1378,11 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
         # Mesmo que venha true na request, forçamos false neste job.
         collect_like_user_profiles = False
 
-        if flow == "stories_interactions":
-            if not session_username:
-                raise RuntimeError(
-                    "Fluxo stories_interactions exige session_username ativo. "
-                    "Login no Instagram e obrigatorio para coletar interacoes de stories."
-                )
-            active_session = _get_active_instagram_session(db, session_username)
-            if not active_session:
-                raise RuntimeError(
-                    f"Sessao Instagram '@{session_username}' nao encontrada ou inativa. "
-                    "Login no Instagram e obrigatorio para coletar interacoes de stories."
-                )
+        session_username, _ = _require_active_scrape_session(
+            db,
+            session_username,
+            flow,
+        )
 
         # Executar scraping de acordo com o fluxo.
         if test_mode:

@@ -54,6 +54,12 @@ class InstagramScraper:
         parts = url.rstrip("/").split("/")
         return parts[-1]
 
+    def _require_session_username(self, session_username: Optional[str], flow: str) -> str:
+        normalized_username = str(session_username or "").strip().lstrip("@").lower()
+        if not normalized_username:
+            raise RuntimeError(f"session_username e obrigatorio no fluxo {flow}.")
+        return normalized_username
+
     def _extract_post_urls_from_html(self, html: str, max_posts: int) -> List[str]:
         """
         Extrai links canônicos de posts/reels (/p/... e /reel/...) a partir do HTML do perfil.
@@ -1196,18 +1202,23 @@ class InstagramScraper:
             if not profile_url.endswith("/"):
                 profile_url = f"{profile_url}/"
 
+            normalized_session_username = self._require_session_username(
+                session_username,
+                "default",
+            )
             username = self._extract_username_from_url(profile_url)
             storage_state = (
                 await browser_use_agent.ensure_instagram_session(
                     db,
-                    instagram_username=session_username,
+                    instagram_username=normalized_session_username,
                 )
                 if db
                 else None
             )
-            if session_username and not storage_state:
+            if not storage_state:
                 raise RuntimeError(
-                    f"Sessao Instagram '@{session_username}' nao encontrada ou invalida."
+                    f"Sessao Instagram '@{normalized_session_username}' nao encontrada ou invalida. "
+                    "E necessario estar logado no Instagram para executar o fluxo default."
                 )
             cookies = browser_use_agent.get_cookies(storage_state)
             user_agent = browser_use_agent.get_user_agent(storage_state)
@@ -1217,7 +1228,7 @@ class InstagramScraper:
                 db=db,
                 save_to_db=True,
                 cache_ttl_days=0,
-                session_username=session_username,
+                session_username=normalized_session_username,
             )
 
             posts_data = await self._scrape_posts(
@@ -1542,18 +1553,23 @@ class InstagramScraper:
             if not profile_url.startswith("http"):
                 profile_url = f"https://instagram.com/{profile_url}"
 
+            normalized_session_username = self._require_session_username(
+                session_username,
+                "recent_likes",
+            )
             username = self._extract_username_from_url(profile_url)
             storage_state = (
                 await browser_use_agent.ensure_instagram_session(
                     db,
-                    instagram_username=session_username,
+                    instagram_username=normalized_session_username,
                 )
                 if db
                 else None
             )
-            if session_username and not storage_state:
+            if not storage_state:
                 raise RuntimeError(
-                    f"Sessao Instagram '@{session_username}' nao encontrada ou invalida."
+                    f"Sessao Instagram '@{normalized_session_username}' nao encontrada ou invalida. "
+                    "E necessario estar logado no Instagram para coletar curtidores recentes."
                 )
             cookies = browser_use_agent.get_cookies(storage_state)
             user_agent = browser_use_agent.get_user_agent(storage_state)
@@ -1706,13 +1722,10 @@ class InstagramScraper:
             if not profile_url.endswith("/"):
                 profile_url = f"{profile_url}/"
 
-            normalized_session_username = (
-                str(session_username or "").strip().lstrip("@").lower() or None
+            normalized_session_username = self._require_session_username(
+                session_username,
+                "stories_interactions",
             )
-            if not normalized_session_username:
-                raise RuntimeError(
-                    "session_username e obrigatorio no fluxo stories_interactions."
-                )
 
             username = self._extract_username_from_url(profile_url)
             safe_max_interactions = max(1, int(max_interactions or 300))
