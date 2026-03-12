@@ -1072,16 +1072,44 @@ class BrowserUseAgent:
         open_story_from_profile_script = """
         (...args) => {
           const targetUsername = String(args[0] || '').trim().replace(/^@/, '').toLowerCase();
-          const tryClick = (el, method) => {
-            if (!el) return null;
+          const tryCenterClick = (el, method) => {
+            if (!el || typeof el.getBoundingClientRect !== 'function') return null;
             try {
-              el.scrollIntoView({ block: 'center', inline: 'center' });
-            } catch (e) {}
-            try {
-              el.click();
-              return { clicked: true, method };
+              const rect = el.getBoundingClientRect();
+              const x = Math.max(2, Math.floor(rect.left + (rect.width / 2)));
+              const y = Math.max(2, Math.floor(rect.top + (rect.height / 2)));
+              const target = document.elementFromPoint(x, y) || el;
+              ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach((eventName) => {
+                try {
+                  target.dispatchEvent(new MouseEvent(eventName, {
+                    bubbles: true,
+                    cancelable: true,
+                    composed: true,
+                    clientX: x,
+                    clientY: y,
+                    view: window,
+                  }));
+                } catch (e) {}
+              });
+              return { clicked: true, method: `${method}_center_click`, x, y };
             } catch (e) {
               return null;
+            }
+          };
+
+          const tryClick = (el, method) => {
+            if (!el) return null;
+            const clickable = (typeof el.closest === 'function')
+              ? (el.closest('button, a, div[role="button"]') || el)
+              : el;
+            try {
+              clickable.scrollIntoView({ block: 'center', inline: 'center' });
+            } catch (e) {}
+            try {
+              clickable.click();
+              return { clicked: true, method };
+            } catch (e) {
+              return tryCenterClick(clickable, method);
             }
           };
 
@@ -1092,14 +1120,20 @@ class BrowserUseAgent:
               : { top: 9999, left: 9999, width: 0, height: 0 };
             const text = ((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
             const normalizedHref = String(href || '').toLowerCase();
+            const tagName = String(el.tagName || '').toLowerCase();
 
             if (normalizedHref.includes('/stories/')) score += 100;
             if (targetUsername && normalizedHref.includes(`/stories/${targetUsername}/`)) score += 80;
             if (text.includes('story') || text.includes('stories') || text.includes('historia') || text.includes('historias')) score += 30;
+            if (text.includes('follow') || text.includes('seguir') || text.includes('message') || text.includes('mensagem') || text.includes('edit profile')) score -= 40;
             if (el.querySelector && el.querySelector('img')) score += 20;
+            if (el.querySelector && el.querySelector('canvas, svg')) score += 20;
+            if (tagName === 'img' || tagName === 'canvas' || tagName === 'svg') score += 25;
             if (rect.top >= 0 && rect.top <= 420) score += 20;
             if (rect.left >= 0 && rect.left <= 420) score += 10;
             if (rect.width >= 24 && rect.height >= 24) score += 10;
+            if (Math.abs(rect.width - rect.height) <= Math.max(24, rect.width * 0.35)) score += 15;
+            if (rect.width >= 36 && rect.width <= 220 && rect.height >= 36 && rect.height <= 220) score += 15;
 
             return score;
           };
@@ -1134,6 +1168,20 @@ class BrowserUseAgent:
             }
           }
 
+          const visualCandidates = Array.from(
+            document.querySelectorAll('header img, header canvas, header svg, main img, main canvas, main svg')
+          )
+            .map((el) => ({ el, score: scoreElement(el, el.getAttribute && el.getAttribute('href')) }))
+            .filter((item) => item.score >= 45)
+            .sort((a, b) => b.score - a.score);
+
+          for (const candidate of visualCandidates) {
+            const clicked = tryClick(candidate.el, 'visual_avatar_candidate');
+            if (clicked) {
+              return { ...clicked, score: candidate.score };
+            }
+          }
+
           const avatarImg = document.querySelector('header img');
           if (avatarImg) {
             const clicked = tryClick(avatarImg.closest('button, a, div[role="button"]') || avatarImg, 'header_avatar');
@@ -1142,7 +1190,25 @@ class BrowserUseAgent:
             }
           }
 
-          return { clicked: false, reason: 'profile_story_trigger_not_found' };
+          const header = document.querySelector('header');
+          if (header) {
+            const fallbackClick = tryCenterClick(header, 'header_region_fallback');
+            if (fallbackClick) {
+              return fallbackClick;
+            }
+          }
+
+          return {
+            clicked: false,
+            reason: 'profile_story_trigger_not_found',
+            debug: {
+              anchor_candidates: anchorCandidates.length,
+              generic_candidates: genericCandidates.length,
+              visual_candidates: visualCandidates.length,
+              has_header_img: Boolean(avatarImg),
+              current_url: window.location.href || '',
+            },
+          };
         }
         """
 
@@ -1524,9 +1590,10 @@ class BrowserUseAgent:
             click_data = click_raw if isinstance(click_raw, dict) else {}
             if not click_data.get("clicked"):
                 logger.warning(
-                    "Stories JS: nao foi possivel abrir o story pelo perfil (%s): %s",
+                    "Stories JS: nao foi possivel abrir o story pelo perfil (%s): %s debug=%s",
                     reason,
                     click_data.get("reason") or "profile_story_trigger_not_found",
+                    click_data.get("debug"),
                 )
                 return page_obj, state_data, False
 
