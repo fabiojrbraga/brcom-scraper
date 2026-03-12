@@ -998,6 +998,94 @@ class BrowserUseAgent:
         raw = await page.evaluate(script, *args)
         return self._parse_evaluate_payload(raw)
 
+    def _stories_debug_root_dir(self) -> Path:
+        return Path(__file__).resolve().parents[2] / ".artifacts" / "stories-debug"
+
+    def _sanitize_debug_artifact_name(self, value: str) -> str:
+        raw = str(value or "").strip().lower()
+        sanitized_chars = [
+            ch if ch.isalnum() else "_"
+            for ch in raw
+        ]
+        sanitized = "".join(sanitized_chars).strip("_")
+        while "__" in sanitized:
+            sanitized = sanitized.replace("__", "_")
+        return sanitized or "artifact"
+
+    async def _capture_page_debug_artifacts(
+        self,
+        page: Any,
+        output_dir: Path,
+        label: str,
+        state_data: Optional[Dict[str, Any]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if page is None:
+            return None
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        safe_label = self._sanitize_debug_artifact_name(label)
+        screenshot_path = output_dir / f"{safe_label}.png"
+        html_path = output_dir / f"{safe_label}.html"
+        meta_path = output_dir / f"{safe_label}.json"
+
+        page_url = ""
+        page_title = ""
+        screenshot_error = None
+        html_error = None
+
+        try:
+            page_url = str(getattr(page, "url", "") or "")
+        except Exception:
+            page_url = ""
+
+        try:
+            title_fn = getattr(page, "title", None)
+            if callable(title_fn):
+                page_title = str(await self._maybe_await(title_fn()) or "").strip()
+        except Exception as exc:
+            page_title = f"title_error: {exc}"
+
+        try:
+            screenshot_fn = getattr(page, "screenshot", None)
+            if callable(screenshot_fn):
+                await self._maybe_await(
+                    screenshot_fn(path=str(screenshot_path), full_page=True)
+                )
+        except Exception as exc:
+            screenshot_error = str(exc)
+
+        try:
+            content_fn = getattr(page, "content", None)
+            if callable(content_fn):
+                html_content = await self._maybe_await(content_fn())
+                if isinstance(html_content, str):
+                    html_path.write_text(html_content, encoding="utf-8")
+        except Exception as exc:
+            html_error = str(exc)
+
+        meta = {
+            "captured_at": datetime.utcnow().isoformat(),
+            "page_url": page_url,
+            "page_title": page_title,
+            "label": label,
+            "state": state_data or {},
+            "extra": extra or {},
+            "screenshot_error": screenshot_error,
+            "html_error": html_error,
+        }
+        meta_path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        return {
+            "screenshot_path": str(screenshot_path) if screenshot_path.exists() else None,
+            "html_path": str(html_path) if html_path.exists() else None,
+            "meta_path": str(meta_path),
+            "page_url": page_url,
+        }
+
     async def _scrape_story_interactions_via_js(
         self,
         browser_session: BrowserSession,
@@ -1563,6 +1651,56 @@ class BrowserUseAgent:
         }
         """
 
+        target_username = self._extract_instagram_username(profile_url) or "instagram"
+        debug_run_id = (
+            f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_"
+            f"{self._sanitize_debug_artifact_name(target_username)}_"
+            f"{uuid4().hex[:8]}"
+        )
+        debug_output_dir = self._stories_debug_root_dir() / debug_run_id
+        debug_capture_count = 0
+        debug_capture_limit = 12
+
+        async def _capture_story_debug(
+            page_obj: Optional[Any],
+            label: str,
+            state_data: Optional[Dict[str, Any]] = None,
+            extra: Optional[Dict[str, Any]] = None,
+        ) -> Optional[Dict[str, Any]]:
+            nonlocal debug_capture_count
+            if page_obj is None or debug_capture_count >= debug_capture_limit:
+                return None
+
+            effective_state = state_data
+            if effective_state is None:
+                try:
+                    state_raw = await self._evaluate_page_json(page_obj, state_script)
+                    effective_state = state_raw if isinstance(state_raw, dict) else {}
+                except Exception as exc:
+                    effective_state = {"state_capture_error": str(exc)}
+
+            debug_capture_count += 1
+            artifact = await self._capture_page_debug_artifacts(
+                page_obj,
+                output_dir=debug_output_dir,
+                label=f"{debug_capture_count:02d}_{label}",
+                state_data=effective_state,
+                extra={
+                    "profile_url": profile_url,
+                    "story_url": story_url,
+                    **(extra or {}),
+                },
+            )
+            if artifact:
+                logger.info(
+                    "Stories JS: debug salvo (%s): screenshot=%s html=%s meta=%s",
+                    label,
+                    artifact.get("screenshot_path"),
+                    artifact.get("html_path"),
+                    artifact.get("meta_path"),
+                )
+            return artifact
+
         async def _read_state_from_current_page() -> tuple[Optional[Any], Dict[str, Any]]:
             page_obj = await browser_session.get_current_page()
             if page_obj is None:
@@ -1600,8 +1738,6 @@ class BrowserUseAgent:
             reason: str,
             max_wait_seconds: float = 14.0,
         ) -> tuple[Optional[Any], Dict[str, Any], bool]:
-            target_username = self._extract_instagram_username(profile_url)
-
             async def _attempt_open_story_from_page(
                 page_obj: Optional[Any],
                 page_reason: str,
@@ -1626,6 +1762,11 @@ class BrowserUseAgent:
                             click_data.get("method") or "unknown",
                         )
                         await asyncio.sleep(1.2)
+                        await _capture_story_debug(
+                            page_obj,
+                            f"recovery_clicked_{page_reason}",
+                            extra={"click_data": click_data},
+                        )
                         return True, click_data
                     await asyncio.sleep(1.0)
                 logger.warning(
@@ -1633,6 +1774,11 @@ class BrowserUseAgent:
                     page_reason,
                     (last_click_data or {}).get("reason") or "profile_story_trigger_not_found",
                     (last_click_data or {}).get("debug"),
+                )
+                await _capture_story_debug(
+                    page_obj,
+                    f"recovery_not_found_{page_reason}",
+                    extra={"click_data": last_click_data or {}},
                 )
                 return False, last_click_data
 
@@ -1683,6 +1829,12 @@ class BrowserUseAgent:
                 max_wait_seconds=16.0,
             )
         if initial_state.get("login_required"):
+            await _capture_story_debug(
+                page,
+                "login_required_initial",
+                state_data=initial_state,
+                extra={"auth_prompt_reason": initial_state.get("auth_prompt_reason")},
+            )
             return {
                 "profile_url": profile_url,
                 "stories_accessible": False,
@@ -1698,6 +1850,11 @@ class BrowserUseAgent:
                 "Stories JS: viewer ainda nao estabilizou apos navegacao inicial (%s).",
                 story_url,
             )
+            await _capture_story_debug(
+                page,
+                "initial_viewer_not_ready",
+                state_data=initial_state,
+            )
 
         story_posts: List[Dict[str, Any]] = []
         seen_story_ids: set[str] = set()
@@ -1706,9 +1863,13 @@ class BrowserUseAgent:
         last_valid_story_url = ""
         recover_attempts = 0
         max_story_steps = max(5, min(80, safe_max_interactions * 2))
+        last_page_snapshot = page
+        last_state_snapshot = initial_state if isinstance(initial_state, dict) else {}
 
         for _ in range(max_story_steps):
             page, state = await _read_state_from_current_page()
+            last_page_snapshot = page
+            last_state_snapshot = state if isinstance(state, dict) else {}
             if page is None:
                 return {
                     "profile_url": profile_url,
@@ -1721,6 +1882,12 @@ class BrowserUseAgent:
                     "error": "story_open_failed",
                 }
             if state.get("login_required"):
+                await _capture_story_debug(
+                    page,
+                    "login_required_during_loop",
+                    state_data=state,
+                    extra={"auth_prompt_reason": state.get("auth_prompt_reason")},
+                )
                 return {
                     "profile_url": profile_url,
                     "stories_accessible": False,
@@ -1758,6 +1925,12 @@ class BrowserUseAgent:
                     continue
                 if story_posts:
                     break
+                await _capture_story_debug(
+                    page,
+                    "story_url_empty_exhausted",
+                    state_data=state,
+                    extra={"last_valid_story_url": last_valid_story_url},
+                )
                 return {
                     "profile_url": profile_url,
                     "stories_accessible": False,
@@ -1781,6 +1954,12 @@ class BrowserUseAgent:
                         current_story_url,
                         recover_attempts,
                     )
+                    await _capture_story_debug(
+                        page,
+                        f"url_outside_viewer_attempt_{recover_attempts}",
+                        state_data=state,
+                        extra={"current_story_url": current_story_url},
+                    )
                     _, recovered_state, recovered_ready = await _recover_story_from_profile(
                         reason="viewer_redirecionado_para_fora_do_story",
                         max_wait_seconds=16.0,
@@ -1802,10 +1981,23 @@ class BrowserUseAgent:
                         current_story_url,
                         recover_attempts,
                     )
+                    if recover_attempts == 1:
+                        await _capture_story_debug(
+                            page,
+                            "story_id_missing_waiting",
+                            state_data=state,
+                            extra={"current_story_url": current_story_url},
+                        )
                     await _wait_for_story_url(max_wait_seconds=10.0)
                     continue
                 if story_posts:
                     break
+                await _capture_story_debug(
+                    page,
+                    "story_id_missing_exhausted",
+                    state_data=state,
+                    extra={"current_story_url": current_story_url},
+                )
                 return {
                     "profile_url": profile_url,
                     "stories_accessible": False,
@@ -2015,6 +2207,12 @@ class BrowserUseAgent:
                 "error": None,
             }
 
+        await _capture_story_debug(
+            last_page_snapshot,
+            "story_open_failed_final",
+            state_data=last_state_snapshot,
+            extra={"last_valid_story_url": last_valid_story_url},
+        )
         return {
             "profile_url": profile_url,
             "stories_accessible": False,
