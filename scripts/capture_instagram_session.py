@@ -3,6 +3,7 @@ Captura storage_state do Instagram com login humano (sem IA no login).
 
 Uso:
   python scripts/capture_instagram_session.py
+  python scripts/capture_instagram_session.py --browser chromium
   python scripts/capture_instagram_session.py --mode browserless
 """
 
@@ -68,7 +69,10 @@ async def _launch_local_browser(playwright, browser_name: str):
                 "Google Chrome local nao encontrado pelo Playwright. "
                 "Instale o Chrome ou use --browser chromium."
             ) from exc
-        raise
+        raise RuntimeError(
+            "Chromium local nao encontrado pelo Playwright. "
+            "Execute: python -m playwright install chromium"
+        ) from exc
 
 
 def _default_chrome_user_data_dir() -> Path:
@@ -81,14 +85,15 @@ def _default_chrome_user_data_dir() -> Path:
     return Path.home() / ".config" / "google-chrome"
 
 
-def _default_automation_user_data_dir() -> Path:
-    return ROOT_DIR / ".secrets" / "chrome-user-data"
+def _default_automation_user_data_dir(browser_name: str) -> Path:
+    suffix = "chromium-user-data" if browser_name == "chromium" else "chrome-user-data"
+    return ROOT_DIR / ".secrets" / suffix
 
 
 def _resolve_local_profile_mode(profile_mode: str, browser_name: str) -> str:
     if profile_mode != "auto":
         return profile_mode
-    return "automation" if browser_name == "chrome" else "isolated"
+    return "automation"
 
 
 def _detect_last_used_chrome_profile(user_data_dir: Path) -> Optional[str]:
@@ -116,7 +121,7 @@ async def _launch_local_context(
     resolved_profile_mode = _resolve_local_profile_mode(profile_mode, browser_name)
 
     if resolved_profile_mode == "automation":
-        user_data_dir = chrome_user_data_dir or _default_automation_user_data_dir()
+        user_data_dir = chrome_user_data_dir or _default_automation_user_data_dir(browser_name)
         user_data_dir.mkdir(parents=True, exist_ok=True)
 
         launch_kwargs = {
@@ -126,7 +131,7 @@ async def _launch_local_context(
         if browser_name == "chrome":
             launch_kwargs["channel"] = "chrome"
 
-        print(f"[i] Abrindo perfil persistente de automacao em: {user_data_dir}")
+        print(f"[i] Abrindo perfil persistente de automacao ({browser_name}) em: {user_data_dir}")
 
         try:
             context = await playwright.chromium.launch_persistent_context(**launch_kwargs)
@@ -206,7 +211,7 @@ async def _capture(
         page = context.pages[0] if context.pages else await context.new_page()
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
-        print("\n[acao manual] Faça login no Instagram no navegador aberto.")
+        print("\n[acao manual] Faca login no Instagram no navegador aberto.")
         print("[acao manual] Complete 2FA/challenge se necessario.")
         input("Quando terminar e estiver logado, pressione ENTER para salvar a sessao...")
 
@@ -223,6 +228,9 @@ async def _capture(
             "capture_mode": mode,
             "local_browser": browser_name if mode == "local" else None,
             "local_profile_mode": resolved_profile_mode if mode == "local" else None,
+            "local_user_data_dir": (
+                str(resolved_user_data_dir) if mode == "local" and resolved_user_data_dir else None
+            ),
             "chrome_user_data_dir": (
                 str(resolved_user_data_dir) if mode == "local" and resolved_user_data_dir else None
             ),
@@ -253,22 +261,26 @@ def main() -> int:
     parser.add_argument(
         "--browser",
         choices=("chromium", "chrome"),
-        default="chrome",
-        help="Navegador do modo local: chrome (padrao) ou Chromium do Playwright.",
+        default="chromium",
+        help="Navegador do modo local: Chromium do Playwright (padrao) ou Google Chrome.",
     )
     parser.add_argument(
         "--profile-mode",
         choices=("auto", "automation", "isolated", "system"),
         default="auto",
-        help="No modo local: auto usa perfil persistente proprio com Chrome e isolado com Chromium.",
+        help="No modo local: auto usa perfil persistente proprio para Chromium/Chrome.",
     )
     parser.add_argument(
+        "--user-data-dir",
         "--chrome-user-data-dir",
+        dest="chrome_user_data_dir",
         type=Path,
-        help="Diretorio User Data para perfil persistente local. Padrao: .secrets/chrome-user-data.",
+        help="Diretorio User Data para perfil persistente local. Padrao: .secrets/chromium-user-data ou .secrets/chrome-user-data.",
     )
     parser.add_argument(
+        "--profile-directory",
         "--chrome-profile-directory",
+        dest="chrome_profile_directory",
         help="Subperfil do Chrome, ex.: Default ou Profile 1. Usado apenas com --profile-mode system.",
     )
     parser.add_argument(

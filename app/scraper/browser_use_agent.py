@@ -1008,12 +1008,27 @@ class BrowserUseAgent:
         state_script = """
         (...args) => {
           const href = window.location.href || '';
+          const path = window.location.pathname || '';
           const storyMatch = href.match(/\\/stories\\/([^\\/?#]+)\\/(\\d+)(?:\\/|$)/i);
           const storyUrl = storyMatch ? `https://www.instagram.com/stories/${storyMatch[1]}/${storyMatch[2]}/` : '';
           const isStoryUrl = Boolean(storyMatch);
           const pageText = (document.body && document.body.innerText) ? document.body.innerText : '';
-          const loginRequired = /\\/accounts\\/login/i.test(window.location.pathname || '')
-            || /log in|entrar/i.test(pageText.slice(0, 2000));
+          const textSample = pageText.slice(0, 4000).toLowerCase();
+          const hasPasswordInput = Boolean(document.querySelector('input[type="password"]'));
+          const loginPath = /\\/accounts\\/login/i.test(path);
+          const challengePath = /\\/challenge\\/?|\\/accounts\\/suspended\\/?|\\/accounts\\/onetap\\/?|\\/two_factor\\/?|\\/reauthentication\\//i.test(path);
+          const loginText = /\\blog in\\b|\\bentrar\\b|senha incorreta|incorrect password/i.test(textSample);
+          const challengeText = /confirm it's you|confirm its you|enter your password|security code|enter code|unusual login attempt|check your notifications|challenge required|checkpoint required|confirme que e voce|confirme que é voce|digite sua senha|insira sua senha|codigo de seguranca|código de seguranca|insira o codigo|insira o código|verifique sua identidade/i.test(textSample);
+          const passwordPrompt = hasPasswordInput && /continue|confirm|confirmar|continuar|password|senha/i.test(textSample);
+          const loginRequired = loginPath || challengePath || loginText || challengeText || passwordPrompt;
+          let authPromptReason = null;
+          if (loginRequired) {
+            if (challengePath) authPromptReason = 'challenge_path';
+            else if (passwordPrompt) authPromptReason = 'password_prompt';
+            else if (challengeText) authPromptReason = 'challenge_text';
+            else if (loginPath) authPromptReason = 'login_path';
+            else if (loginText) authPromptReason = 'login_text';
+          }
 
           let viewCount = null;
           const controls = Array.from(document.querySelectorAll('button,div[role="button"],a,span'));
@@ -1041,11 +1056,13 @@ class BrowserUseAgent:
 
           return {
             current_url: href,
+            current_path: path,
             story_url: storyUrl,
             is_story_url: isStoryUrl,
             view_count: Number.isFinite(viewCount) ? viewCount : null,
             viewers_modal_open: viewersModalOpen,
-            login_required: loginRequired
+            login_required: loginRequired,
+            auth_prompt_reason: authPromptReason,
           };
         }
         """
@@ -1118,18 +1135,24 @@ class BrowserUseAgent:
             const rect = typeof el.getBoundingClientRect === 'function'
               ? el.getBoundingClientRect()
               : { top: 9999, left: 9999, width: 0, height: 0 };
-            const text = ((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '')).toLowerCase();
+            const text = (
+              (el.textContent || '') + ' '
+              + (el.getAttribute('aria-label') || '') + ' '
+              + (el.getAttribute('title') || '') + ' '
+              + (el.getAttribute('alt') || '')
+            ).toLowerCase();
             const normalizedHref = String(href || '').toLowerCase();
             const tagName = String(el.tagName || '').toLowerCase();
 
             if (normalizedHref.includes('/stories/')) score += 100;
             if (targetUsername && normalizedHref.includes(`/stories/${targetUsername}/`)) score += 80;
+            if (targetUsername && (text.includes(targetUsername) || normalizedHref.includes(`/${targetUsername}/`))) score += 60;
             if (text.includes('story') || text.includes('stories') || text.includes('historia') || text.includes('historias')) score += 30;
             if (text.includes('follow') || text.includes('seguir') || text.includes('message') || text.includes('mensagem') || text.includes('edit profile')) score -= 40;
             if (el.querySelector && el.querySelector('img')) score += 20;
             if (el.querySelector && el.querySelector('canvas, svg')) score += 20;
             if (tagName === 'img' || tagName === 'canvas' || tagName === 'svg') score += 25;
-            if (rect.top >= 0 && rect.top <= 420) score += 20;
+            if (rect.top >= 0 && rect.top <= 520) score += 20;
             if (rect.left >= 0 && rect.left <= 420) score += 10;
             if (rect.width >= 24 && rect.height >= 24) score += 10;
             if (Math.abs(rect.width - rect.height) <= Math.max(24, rect.width * 0.35)) score += 15;
@@ -1152,7 +1175,7 @@ class BrowserUseAgent:
           }
 
           const genericCandidates = Array.from(
-            document.querySelectorAll('header a, header button, header div[role="button"], main a, main button, main div[role="button"]')
+            document.querySelectorAll('a, button, div[role="button"]')
           )
             .map((el) => ({
               el,
@@ -1169,7 +1192,7 @@ class BrowserUseAgent:
           }
 
           const visualCandidates = Array.from(
-            document.querySelectorAll('header img, header canvas, header svg, main img, main canvas, main svg')
+            document.querySelectorAll('img, canvas, svg')
           )
             .map((el) => ({ el, score: scoreElement(el, el.getAttribute && el.getAttribute('href')) }))
             .filter((item) => item.score >= 45)
@@ -1202,10 +1225,16 @@ class BrowserUseAgent:
             clicked: false,
             reason: 'profile_story_trigger_not_found',
             debug: {
+              ready_state: document.readyState || '',
+              body_text_length: ((document.body && document.body.innerText) || '').length,
               anchor_candidates: anchorCandidates.length,
               generic_candidates: genericCandidates.length,
               visual_candidates: visualCandidates.length,
               has_header_img: Boolean(avatarImg),
+              total_anchors: document.querySelectorAll('a').length,
+              total_images: document.querySelectorAll('img').length,
+              has_main: Boolean(document.querySelector('main')),
+              has_header: Boolean(document.querySelector('header')),
               current_url: window.location.href || '',
             },
           };
@@ -1571,39 +1600,73 @@ class BrowserUseAgent:
             reason: str,
             max_wait_seconds: float = 14.0,
         ) -> tuple[Optional[Any], Dict[str, Any], bool]:
-            await self._navigate_to_url_with_timeout(
-                browser_session,
-                profile_url,
-                timeout_ms=30000,
-                new_tab=False,
-            )
-            await asyncio.sleep(1.5)
-            page_obj, state_data = await _read_state_from_current_page()
-            if page_obj is None:
-                return page_obj, state_data, False
+            target_username = self._extract_instagram_username(profile_url)
 
-            click_raw = await self._evaluate_page_json(
-                page_obj,
-                open_story_from_profile_script,
-                self._extract_instagram_username(profile_url),
-            )
-            click_data = click_raw if isinstance(click_raw, dict) else {}
-            if not click_data.get("clicked"):
+            async def _attempt_open_story_from_page(
+                page_obj: Optional[Any],
+                page_reason: str,
+                wait_seconds: float,
+            ) -> tuple[bool, Optional[dict[str, Any]]]:
+                if page_obj is None:
+                    return False, None
+                deadline = asyncio.get_event_loop().time() + wait_seconds
+                last_click_data: Optional[dict[str, Any]] = None
+                while asyncio.get_event_loop().time() < deadline:
+                    click_raw = await self._evaluate_page_json(
+                        page_obj,
+                        open_story_from_profile_script,
+                        target_username,
+                    )
+                    click_data = click_raw if isinstance(click_raw, dict) else {}
+                    last_click_data = click_data
+                    if click_data.get("clicked"):
+                        logger.info(
+                            "Stories JS: recovery acionado (%s) via %s",
+                            page_reason,
+                            click_data.get("method") or "unknown",
+                        )
+                        await asyncio.sleep(1.2)
+                        return True, click_data
+                    await asyncio.sleep(1.0)
                 logger.warning(
                     "Stories JS: nao foi possivel abrir o story pelo perfil (%s): %s debug=%s",
-                    reason,
-                    click_data.get("reason") or "profile_story_trigger_not_found",
-                    click_data.get("debug"),
+                    page_reason,
+                    (last_click_data or {}).get("reason") or "profile_story_trigger_not_found",
+                    (last_click_data or {}).get("debug"),
                 )
-                return page_obj, state_data, False
+                return False, last_click_data
 
-            logger.info(
-                "Stories JS: recovery pelo perfil acionado (%s) via %s",
-                reason,
-                click_data.get("method") or "unknown",
+            page_obj, state_data = await _read_state_from_current_page()
+            opened, _ = await _attempt_open_story_from_page(
+                page_obj,
+                f"{reason}:pagina_atual",
+                wait_seconds=4.0,
             )
-            await asyncio.sleep(1.2)
-            return await _wait_for_story_url(max_wait_seconds=max_wait_seconds)
+            if opened:
+                return await _wait_for_story_url(max_wait_seconds=max_wait_seconds)
+
+            recovery_urls = [
+                ("perfil_alvo", profile_url),
+                ("home_feed", "https://www.instagram.com/"),
+            ]
+            for label, recovery_url in recovery_urls:
+                await self._navigate_to_url_with_timeout(
+                    browser_session,
+                    recovery_url,
+                    timeout_ms=30000,
+                    new_tab=False,
+                )
+                await asyncio.sleep(2.5)
+                page_obj, state_data = await _read_state_from_current_page()
+                opened, _ = await _attempt_open_story_from_page(
+                    page_obj,
+                    f"{reason}:{label}",
+                    wait_seconds=4.0,
+                )
+                if opened:
+                    return await _wait_for_story_url(max_wait_seconds=max_wait_seconds)
+
+            return page_obj, state_data, False
 
         await self._navigate_to_url_with_timeout(
             browser_session,
