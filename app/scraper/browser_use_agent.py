@@ -1035,32 +1035,67 @@ class BrowserUseAgent:
         html_error = None
 
         try:
-            page_url = str(getattr(page, "url", "") or "")
+            get_url_fn = getattr(page, "get_url", None)
+            if callable(get_url_fn):
+                page_url = str(await self._maybe_await(get_url_fn()) or "").strip()
+            else:
+                page_url = str(getattr(page, "url", "") or "")
         except Exception:
             page_url = ""
 
         try:
-            title_fn = getattr(page, "title", None)
+            title_fn = getattr(page, "get_title", None) or getattr(page, "title", None)
             if callable(title_fn):
                 page_title = str(await self._maybe_await(title_fn()) or "").strip()
         except Exception as exc:
             page_title = f"title_error: {exc}"
 
         try:
-            screenshot_fn = getattr(page, "screenshot", None)
-            if callable(screenshot_fn):
-                await self._maybe_await(
-                    screenshot_fn(path=str(screenshot_path), full_page=True)
+            screenshot_bytes = None
+            browser_session = getattr(page, "_browser_session", None)
+            session_screenshot_fn = getattr(browser_session, "take_screenshot", None)
+            if callable(session_screenshot_fn):
+                screenshot_bytes = await self._maybe_await(
+                    session_screenshot_fn(path=str(screenshot_path), full_page=True)
                 )
+            else:
+                screenshot_fn = getattr(page, "screenshot", None)
+                if callable(screenshot_fn):
+                    screenshot_data = await self._maybe_await(screenshot_fn())
+                    if isinstance(screenshot_data, str) and screenshot_data.strip():
+                        import base64
+
+                        screenshot_bytes = base64.b64decode(screenshot_data)
+                        screenshot_path.write_bytes(screenshot_bytes)
+                    elif isinstance(screenshot_data, (bytes, bytearray)):
+                        screenshot_bytes = bytes(screenshot_data)
+                        screenshot_path.write_bytes(screenshot_bytes)
+
+            if screenshot_bytes is None and not screenshot_path.exists():
+                raise RuntimeError("no supported screenshot method available")
         except Exception as exc:
             screenshot_error = str(exc)
 
         try:
+            html_content = None
             content_fn = getattr(page, "content", None)
             if callable(content_fn):
                 html_content = await self._maybe_await(content_fn())
-                if isinstance(html_content, str):
-                    html_path.write_text(html_content, encoding="utf-8")
+            if not isinstance(html_content, str) or not html_content:
+                evaluate_fn = getattr(page, "evaluate", None)
+                if callable(evaluate_fn):
+                    html_raw = await self._maybe_await(
+                        evaluate_fn(
+                            "(...args) => document.documentElement ? document.documentElement.outerHTML : ''"
+                        )
+                    )
+                    if isinstance(html_raw, str):
+                        html_content = html_raw
+
+            if not isinstance(html_content, str) or not html_content:
+                raise RuntimeError("no supported html extraction method available")
+
+            html_path.write_text(html_content, encoding="utf-8")
         except Exception as exc:
             html_error = str(exc)
 
