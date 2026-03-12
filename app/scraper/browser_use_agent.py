@@ -1128,8 +1128,10 @@ class BrowserUseAgent:
         story_url: str,
         safe_max_interactions: int,
     ) -> Dict[str, Any]:
+        target_username = self._extract_instagram_username(profile_url) or ""
         state_script = """
         (...args) => {
+          const targetUsername = String(args[0] || '').trim().replace(/^@/, '').toLowerCase();
           const href = window.location.href || '';
           const path = window.location.pathname || '';
           const storyMatch = href.match(/\\/stories\\/([^\\/?#]+)\\/(\\d+)(?:\\/|$)/i);
@@ -1139,7 +1141,8 @@ class BrowserUseAgent:
           const textSample = pageText.slice(0, 4000).toLowerCase();
           const hasPasswordInput = Boolean(document.querySelector('input[type="password"]'));
           const loginPath = /\\/accounts\\/login/i.test(path);
-          const challengePath = /\\/challenge\\/?|\\/accounts\\/suspended\\/?|\\/accounts\\/onetap\\/?|\\/two_factor\\/?|\\/reauthentication\\//i.test(path);
+          const oneTapPath = /\\/accounts\\/onetap\\/?/i.test(path);
+          const challengePath = /\\/challenge\\/?|\\/accounts\\/suspended\\/?|\\/two_factor\\/?|\\/reauthentication\\//i.test(path);
           const loginText = /\\blog in\\b|\\bentrar\\b|senha incorreta|incorrect password/i.test(textSample);
           const challengeText = /confirm it's you|confirm its you|enter your password|security code|enter code|unusual login attempt|check your notifications|challenge required|checkpoint required|confirme que e voce|confirme que é voce|digite sua senha|insira sua senha|codigo de seguranca|código de seguranca|insira o codigo|insira o código|verifique sua identidade/i.test(textSample);
           const passwordPrompt = hasPasswordInput && /continue|confirm|confirmar|continuar|password|senha/i.test(textSample);
@@ -1155,6 +1158,7 @@ class BrowserUseAgent:
 
           let viewCount = null;
           const controls = Array.from(document.querySelectorAll('button,div[role="button"],a,span'));
+          const clickableControls = Array.from(document.querySelectorAll('button,div[role="button"],a'));
           const seenControl = controls.find((el) => /^(seen by|visto por)\\s*\\d+/i.test((el.textContent || '').trim()));
           const readDigits = (text) => {
             if (!text) return null;
@@ -1170,6 +1174,32 @@ class BrowserUseAgent:
 
           const dialog = document.querySelector('div[role="dialog"]');
           const dialogText = dialog ? ((dialog.textContent || '').toLowerCase()) : '';
+          const removeProfilesModalOpen = Boolean(
+            dialog && /remove profiles from this browser|remove profiles|remover perfis deste navegador|remover perfis/i.test(dialogText)
+          );
+          const continueVisible = clickableControls.some((el) => {
+            const text = ((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '')).trim().toLowerCase();
+            return text === 'continue'
+              || text === 'continuar'
+              || text.startsWith('continue as')
+              || text.startsWith('continuar como');
+          });
+          const alternateProfileVisible = clickableControls.some((el) => {
+            const text = ((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '')).trim().toLowerCase();
+            return text.includes('use another profile')
+              || text.includes('usar outro perfil')
+              || text.includes('create new account')
+              || text.includes('criar nova conta');
+          });
+          const landingTextVisible = /see everyday moments from|close friends|veja momentos do dia a dia|amigos proximos|amigos próximos/i.test(textSample);
+          const targetUsernameVisible = Boolean(targetUsername) && textSample.includes(targetUsername);
+          const profileGateVisible = Boolean(
+            oneTapPath
+            || removeProfilesModalOpen
+            || (continueVisible && alternateProfileVisible)
+            || (continueVisible && targetUsernameVisible)
+            || (continueVisible && landingTextVisible)
+          );
           const viewersModalOpen = Boolean(
             dialog && (
               dialogText.includes('visualizador')
@@ -1184,8 +1214,120 @@ class BrowserUseAgent:
             is_story_url: isStoryUrl,
             view_count: Number.isFinite(viewCount) ? viewCount : null,
             viewers_modal_open: viewersModalOpen,
+            profile_gate_visible: profileGateVisible,
+            profile_gate_modal_open: removeProfilesModalOpen,
+            profile_gate_continue_visible: continueVisible,
+            profile_gate_username_visible: targetUsernameVisible,
             login_required: loginRequired,
             auth_prompt_reason: authPromptReason,
+          };
+        }
+        """
+
+        resolve_profile_gate_script = """
+        (...args) => {
+          const targetUsername = String(args[0] || '').trim().replace(/^@/, '').toLowerCase();
+          const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          const tryCenterClick = (el, method) => {
+            if (!el || typeof el.getBoundingClientRect !== 'function') return null;
+            try {
+              const rect = el.getBoundingClientRect();
+              const x = Math.max(2, Math.floor(rect.left + (rect.width / 2)));
+              const y = Math.max(2, Math.floor(rect.top + (rect.height / 2)));
+              const target = document.elementFromPoint(x, y) || el;
+              ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach((eventName) => {
+                try {
+                  target.dispatchEvent(new MouseEvent(eventName, {
+                    bubbles: true,
+                    cancelable: true,
+                    composed: true,
+                    clientX: x,
+                    clientY: y,
+                    view: window,
+                  }));
+                } catch (e) {}
+              });
+              return { handled: true, action: method, x, y };
+            } catch (e) {
+              return null;
+            }
+          };
+          const tryClick = (el, method) => {
+            if (!el) return null;
+            const clickable = (typeof el.closest === 'function')
+              ? (el.closest('button, a, div[role="button"]') || el)
+              : el;
+            try {
+              clickable.scrollIntoView({ block: 'center', inline: 'center' });
+            } catch (e) {}
+            try {
+              clickable.click();
+              return { handled: true, action: method };
+            } catch (e) {
+              return tryCenterClick(clickable, method);
+            }
+          };
+
+          const controls = Array.from(document.querySelectorAll('button, a, div[role="button"]'));
+          const dialog = document.querySelector('div[role="dialog"]');
+          const dialogText = normalize(dialog ? dialog.textContent : '');
+          const bodyText = normalize(document.body ? document.body.innerText : '');
+
+          if (dialog && /remove profiles from this browser|remove profiles|remover perfis deste navegador|remover perfis/.test(dialogText)) {
+            const closeCandidate = Array.from(dialog.querySelectorAll('button, [aria-label], div[role="button"], svg'))
+              .find((el) => {
+                const text = normalize((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || ''));
+                return text === 'x'
+                  || text === 'close'
+                  || text === 'fechar'
+                  || text.includes('close')
+                  || text.includes('fechar');
+              });
+            const closeResult = tryClick(closeCandidate, 'close_remove_profiles_modal');
+            if (closeResult) {
+              return closeResult;
+            }
+          }
+
+          const continueCandidates = controls.filter((el) => {
+            const text = normalize((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || ''));
+            return text === 'continue'
+              || text === 'continuar'
+              || text.startsWith('continue as')
+              || text.startsWith('continuar como');
+          });
+
+          if (continueCandidates.length) {
+            let bestContinue = continueCandidates[0];
+            if (targetUsername) {
+              const usernameNode = Array.from(document.querySelectorAll('div, span, a, h1, h2, h3, h4'))
+                .find((el) => normalize(el.textContent || '') === targetUsername);
+              if (usernameNode && typeof usernameNode.closest === 'function') {
+                const container = usernameNode.closest('main, section, article, div');
+                if (container) {
+                  const containerContinue = continueCandidates.find((candidate) => container.contains(candidate));
+                  if (containerContinue) {
+                    bestContinue = containerContinue;
+                  }
+                }
+              }
+            }
+            const continueResult = tryClick(bestContinue, 'continue_saved_profile');
+            if (continueResult) {
+              return continueResult;
+            }
+          }
+
+          return {
+            handled: false,
+            reason: 'profile_gate_not_actionable',
+            debug: {
+              current_url: window.location.href || '',
+              has_dialog: Boolean(dialog),
+              dialog_text: dialogText.slice(0, 240),
+              continue_candidates: continueCandidates.length,
+              target_username_visible: Boolean(targetUsername) && bodyText.includes(targetUsername),
+            },
           };
         }
         """
@@ -1272,6 +1414,16 @@ class BrowserUseAgent:
             if (targetUsername && (text.includes(targetUsername) || normalizedHref.includes(`/${targetUsername}/`))) score += 60;
             if (text.includes('story') || text.includes('stories') || text.includes('historia') || text.includes('historias')) score += 30;
             if (text.includes('follow') || text.includes('seguir') || text.includes('message') || text.includes('mensagem') || text.includes('edit profile')) score -= 40;
+            if (
+              text.includes('continue')
+              || text.includes('continuar')
+              || text.includes('use another profile')
+              || text.includes('usar outro perfil')
+              || text.includes('create new account')
+              || text.includes('criar nova conta')
+              || text.includes('remove profiles')
+              || text.includes('remover perfis')
+            ) score -= 120;
             if (el.querySelector && el.querySelector('img')) score += 20;
             if (el.querySelector && el.querySelector('canvas, svg')) score += 20;
             if (tagName === 'img' || tagName === 'canvas' || tagName === 'svg') score += 25;
@@ -1686,10 +1838,10 @@ class BrowserUseAgent:
         }
         """
 
-        target_username = self._extract_instagram_username(profile_url) or "instagram"
+        debug_username = target_username or "instagram"
         debug_run_id = (
             f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_"
-            f"{self._sanitize_debug_artifact_name(target_username)}_"
+            f"{self._sanitize_debug_artifact_name(debug_username)}_"
             f"{uuid4().hex[:8]}"
         )
         debug_output_dir = self._stories_debug_root_dir() / debug_run_id
@@ -1709,7 +1861,7 @@ class BrowserUseAgent:
             effective_state = state_data
             if effective_state is None:
                 try:
-                    state_raw = await self._evaluate_page_json(page_obj, state_script)
+                    state_raw = await self._evaluate_page_json(page_obj, state_script, target_username)
                     effective_state = state_raw if isinstance(state_raw, dict) else {}
                 except Exception as exc:
                     effective_state = {"state_capture_error": str(exc)}
@@ -1736,11 +1888,58 @@ class BrowserUseAgent:
                 )
             return artifact
 
+        async def _resolve_profile_gate(
+            page_obj: Optional[Any],
+            page_reason: str,
+            state_data: Optional[Dict[str, Any]] = None,
+        ) -> bool:
+            if page_obj is None:
+                return False
+
+            effective_state = state_data if isinstance(state_data, dict) else {}
+            if not effective_state.get("profile_gate_visible"):
+                return False
+
+            action_raw = await self._evaluate_page_json(
+                page_obj,
+                resolve_profile_gate_script,
+                target_username,
+            )
+            action_data = action_raw if isinstance(action_raw, dict) else {}
+            if action_data.get("handled"):
+                logger.info(
+                    "Stories JS: profile gate resolvido (%s) via %s",
+                    page_reason,
+                    action_data.get("action") or "unknown",
+                )
+                await asyncio.sleep(1.5)
+                await _capture_story_debug(
+                    page_obj,
+                    f"profile_gate_resolved_{page_reason}",
+                    state_data=effective_state,
+                    extra={"action_data": action_data},
+                )
+                return True
+
+            logger.warning(
+                "Stories JS: profile gate detectado mas nao resolvido (%s): %s debug=%s",
+                page_reason,
+                action_data.get("reason") or "profile_gate_not_actionable",
+                action_data.get("debug"),
+            )
+            await _capture_story_debug(
+                page_obj,
+                f"profile_gate_unresolved_{page_reason}",
+                state_data=effective_state,
+                extra={"action_data": action_data},
+            )
+            return False
+
         async def _read_state_from_current_page() -> tuple[Optional[Any], Dict[str, Any]]:
             page_obj = await browser_session.get_current_page()
             if page_obj is None:
                 return None, {}
-            state_raw = await self._evaluate_page_json(page_obj, state_script)
+            state_raw = await self._evaluate_page_json(page_obj, state_script, target_username)
             state_data = state_raw if isinstance(state_raw, dict) else {}
             return page_obj, state_data
 
@@ -1757,6 +1956,12 @@ class BrowserUseAgent:
                     last_page = page_obj
                 if state_data:
                     last_state = state_data
+                if await _resolve_profile_gate(
+                    page_obj,
+                    page_reason="wait_for_story_url",
+                    state_data=state_data,
+                ):
+                    continue
                 if state_data.get("login_required"):
                     return last_page, last_state, True
                 current_story_url_value = self._normalize_story_url_value(
@@ -1783,6 +1988,14 @@ class BrowserUseAgent:
                 deadline = asyncio.get_event_loop().time() + wait_seconds
                 last_click_data: Optional[dict[str, Any]] = None
                 while asyncio.get_event_loop().time() < deadline:
+                    state_raw = await self._evaluate_page_json(page_obj, state_script, target_username)
+                    current_state = state_raw if isinstance(state_raw, dict) else {}
+                    if await _resolve_profile_gate(
+                        page_obj,
+                        page_reason=f"{page_reason}:before_open_story",
+                        state_data=current_state,
+                    ):
+                        return True, {"handled_profile_gate": True}
                     click_raw = await self._evaluate_page_json(
                         page_obj,
                         open_story_from_profile_script,
@@ -1916,6 +2129,13 @@ class BrowserUseAgent:
                     "total_collected": total_viewers_collected,
                     "error": "story_open_failed",
                 }
+            if await _resolve_profile_gate(
+                page,
+                page_reason="main_loop",
+                state_data=state,
+            ):
+                await _wait_for_story_url(max_wait_seconds=12.0)
+                continue
             if state.get("login_required"):
                 await _capture_story_debug(
                     page,
