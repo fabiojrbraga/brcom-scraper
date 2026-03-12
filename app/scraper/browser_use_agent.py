@@ -371,6 +371,7 @@ class BrowserUseAgent:
         self,
         cdp_url: str,
         storage_state: Optional[Union[Dict[str, Any], str, Path]] = None,
+        user_agent: Optional[str] = None,
     ) -> BrowserSession:
         """
         Cria BrowserSession com fallback de argumentos para diferentes versoes do browser-use.
@@ -389,6 +390,8 @@ class BrowserUseAgent:
             wait_for_network_idle_page_load_time=network_idle_wait,
             wait_between_actions=wait_between_actions,
         )
+        if user_agent:
+            base_kwargs["user_agent"] = user_agent
         ctor_attempts = []
         if ws_connect_kwargs is not None:
             ctor_attempts.append({**base_kwargs, "ws_connect_kwargs": ws_connect_kwargs, "keep_alive": True})
@@ -525,6 +528,130 @@ class BrowserUseAgent:
             "cookies": cookies,
             "origins": origins,
         }
+
+    def _prepare_storage_state_for_browser_session(
+        self,
+        storage_state: Optional[Dict[str, Any]],
+    ) -> tuple[Optional[Union[Dict[str, Any], str]], Optional[str], Optional[str]]:
+        clean_state = self._sanitize_storage_state(storage_state)
+        storage_state_file = self._write_storage_state_temp_file(storage_state)
+        session_user_agent = self.get_user_agent(storage_state)
+        return storage_state_file or clean_state, storage_state_file, session_user_agent
+
+    def _read_storage_state_payload(
+        self,
+        storage_state: Optional[Union[Dict[str, Any], str, Path]],
+    ) -> Dict[str, Any]:
+        if isinstance(storage_state, dict):
+            return storage_state
+        if isinstance(storage_state, (str, Path)):
+            path = Path(storage_state)
+            if path.exists():
+                try:
+                    loaded = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        return loaded
+                except Exception as exc:
+                    logger.warning("Falha ao ler storage_state de %s: %s", path, exc)
+        return {}
+
+    async def _get_browser_session_cookie_snapshot(
+        self,
+        browser_session: BrowserSession,
+    ) -> Dict[str, Any]:
+        getter = getattr(browser_session, "_cdp_get_cookies", None)
+        if not callable(getter):
+            return {
+                "count": 0,
+                "sessionid_present": False,
+                "ds_user_id_present": False,
+            }
+
+        try:
+            cookies = await self._maybe_await(getter())
+        except Exception as exc:
+            logger.debug("Falha ao consultar cookies atuais da sessao de browser: %s", exc)
+            return {
+                "count": 0,
+                "sessionid_present": False,
+                "ds_user_id_present": False,
+                "error": str(exc),
+            }
+
+        if not isinstance(cookies, list):
+            cookies = []
+        cookie_names = {str(cookie.get("name") or "").strip().lower() for cookie in cookies if isinstance(cookie, dict)}
+        return {
+            "count": len(cookies),
+            "sessionid_present": "sessionid" in cookie_names,
+            "ds_user_id_present": "ds_user_id" in cookie_names,
+        }
+
+    async def _force_apply_storage_state(
+        self,
+        browser_session: BrowserSession,
+        storage_state: Optional[Union[Dict[str, Any], str, Path]],
+    ) -> None:
+        payload = self._read_storage_state_payload(storage_state)
+        cookies = payload.get("cookies")
+        if isinstance(cookies, list) and cookies:
+            setter = getattr(browser_session, "_cdp_set_cookies", None)
+            if callable(setter):
+                await self._maybe_await(setter(cookies))
+
+        origins = payload.get("origins")
+        if isinstance(origins, list) and origins:
+            add_script = getattr(browser_session, "_cdp_add_init_script", None)
+            if callable(add_script):
+                for origin in origins:
+                    if not isinstance(origin, dict):
+                        continue
+                    for item in origin.get("localStorage", []) or []:
+                        if not isinstance(item, dict):
+                            continue
+                        script = (
+                            f"window.localStorage.setItem({json.dumps(item.get('name'))}, "
+                            f"{json.dumps(item.get('value'))});"
+                        )
+                        await self._maybe_await(add_script(script))
+                    for item in origin.get("sessionStorage", []) or []:
+                        if not isinstance(item, dict):
+                            continue
+                        script = (
+                            f"window.sessionStorage.setItem({json.dumps(item.get('name'))}, "
+                            f"{json.dumps(item.get('value'))});"
+                        )
+                        await self._maybe_await(add_script(script))
+
+    async def _ensure_browser_session_storage_state_loaded(
+        self,
+        browser_session: BrowserSession,
+    ) -> None:
+        storage_state = getattr(browser_session.browser_profile, "storage_state", None)
+        if not storage_state:
+            return
+
+        try:
+            from browser_use.browser.events import LoadStorageStateEvent
+
+            load_event = browser_session.event_bus.dispatch(LoadStorageStateEvent())
+            await load_event
+            await load_event.event_result(raise_if_any=True, raise_if_none=False)
+        except Exception as exc:
+            logger.debug("Falha ao aguardar LoadStorageStateEvent: %s", exc)
+
+        snapshot = await self._get_browser_session_cookie_snapshot(browser_session)
+        if not snapshot.get("sessionid_present"):
+            await self._force_apply_storage_state(browser_session, storage_state)
+            await asyncio.sleep(0.2)
+            snapshot = await self._get_browser_session_cookie_snapshot(browser_session)
+
+        logger.info(
+            "Browser session cookies apos carregar storage_state: total=%s sessionid=%s ds_user_id=%s",
+            snapshot.get("count", 0),
+            snapshot.get("sessionid_present", False),
+            snapshot.get("ds_user_id_present", False),
+        )
 
     def _write_storage_state_temp_file(self, storage_state: Optional[Dict[str, Any]]) -> Optional[str]:
         clean_state = self._sanitize_storage_state(storage_state)
@@ -765,6 +892,21 @@ class BrowserUseAgent:
             raw_url = f"{raw_url}/"
         return raw_url
 
+    def _extract_instagram_username(self, value: str) -> str:
+        raw_value = str(value or "").strip()
+        if not raw_value:
+            return ""
+        if not raw_value.startswith(("http://", "https://")):
+            return raw_value.strip("/").split("/")[0].strip().lstrip("@").lower()
+
+        parsed = urlparse(raw_value)
+        if "instagram.com" not in parsed.netloc.lower():
+            return ""
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if not path_parts:
+            return ""
+        return path_parts[0].strip().lstrip("@").lower()
+
     def _extract_story_id_from_url(self, story_url: str) -> Optional[str]:
         normalized_url = self._normalize_story_url_value(story_url)
         if not normalized_url:
@@ -793,6 +935,7 @@ class BrowserUseAgent:
                     self._maybe_await(method()),
                     timeout=timeout_s,
                 )
+                await self._ensure_browser_session_storage_state_loaded(browser_session)
                 return
             except Exception as exc:
                 errors.append(f"{method_name}: {exc}")
@@ -2303,10 +2446,9 @@ class BrowserUseAgent:
         reconnect_url = self._get_browserless_reconnect_url(storage_state)
         session_info = self._get_browserless_session_info(storage_state)
         session_connect_url = session_info.get("connect") if isinstance(session_info.get("connect"), str) else None
-        clean_storage_state = self._sanitize_storage_state(storage_state)
-        storage_state_file = self._write_storage_state_temp_file(storage_state)
-        storage_state_for_session: Optional[Union[Dict[str, Any], str]]
-        storage_state_for_session = storage_state_file or clean_storage_state
+        storage_state_for_session, storage_state_file, session_user_agent = (
+            self._prepare_storage_state_for_browser_session(storage_state)
+        )
         logger.info(
             "Browser Use recebeu storage_state com %s cookies.",
             len(self._extract_cookies(storage_state or {})),
@@ -2381,7 +2523,11 @@ class BrowserUseAgent:
                     - NÃ£o invente dados.
                     """
 
-                    browser_session = self._create_browser_session(cdp_url, storage_state=storage_state_for_session)
+                    browser_session = self._create_browser_session(
+                        cdp_url,
+                        storage_state=storage_state_for_session,
+                        user_agent=session_user_agent,
+                    )
                     llm = ChatOpenAI(model=self.model, api_key=self.api_key)
                     agent = self._create_agent(
                         task=task,
@@ -2507,10 +2653,9 @@ class BrowserUseAgent:
         reconnect_url = self._get_browserless_reconnect_url(storage_state)
         session_info = self._get_browserless_session_info(storage_state)
         session_connect_url = session_info.get("connect") if isinstance(session_info.get("connect"), str) else None
-        clean_storage_state = self._sanitize_storage_state(storage_state)
-        storage_state_file = self._write_storage_state_temp_file(storage_state)
-        storage_state_for_session: Optional[Union[Dict[str, Any], str]]
-        storage_state_for_session = storage_state_file or clean_storage_state
+        storage_state_for_session, storage_state_file, session_user_agent = (
+            self._prepare_storage_state_for_browser_session(storage_state)
+        )
 
         try:
             for attempt in range(1, max_retries + 1):
@@ -2568,7 +2713,11 @@ class BrowserUseAgent:
                     - NÃ£o invente links.
                     """
 
-                    browser_session = self._create_browser_session(cdp_url, storage_state=storage_state_for_session)
+                    browser_session = self._create_browser_session(
+                        cdp_url,
+                        storage_state=storage_state_for_session,
+                        user_agent=session_user_agent,
+                    )
                     llm = ChatOpenAI(model=self.model, api_key=self.api_key)
                     agent = self._create_agent(
                         task=task,
@@ -2748,10 +2897,9 @@ class BrowserUseAgent:
         reconnect_url = self._get_browserless_reconnect_url(storage_state)
         session_info = self._get_browserless_session_info(storage_state)
         session_connect_url = session_info.get("connect") if isinstance(session_info.get("connect"), str) else None
-        clean_storage_state = self._sanitize_storage_state(storage_state)
-        storage_state_file = self._write_storage_state_temp_file(storage_state)
-        storage_state_for_session: Optional[Union[Dict[str, Any], str]]
-        storage_state_for_session = storage_state_file or clean_storage_state
+        storage_state_for_session, storage_state_file, session_user_agent = (
+            self._prepare_storage_state_for_browser_session(storage_state)
+        )
 
         try:
             for attempt in range(1, max_retries + 1):
@@ -2820,7 +2968,11 @@ class BrowserUseAgent:
                     - Retorne JSON puro no resultado final.
                     """
 
-                    browser_session = self._create_browser_session(cdp_url, storage_state=storage_state_for_session)
+                    browser_session = self._create_browser_session(
+                        cdp_url,
+                        storage_state=storage_state_for_session,
+                        user_agent=session_user_agent,
+                    )
                     llm = ChatOpenAI(model=self.model, api_key=self.api_key)
                     agent = self._create_agent(
                         task=task,
@@ -3043,10 +3195,9 @@ class BrowserUseAgent:
         # Fluxo de stories tem mostrado mais instabilidade com reconnect reaproveitado.
         # Mantemos flag para trocar para CDP fresh apos qualquer erro de protocolo.
         force_fresh_cdp = False
-        clean_storage_state = self._sanitize_storage_state(storage_state)
-        storage_state_file = self._write_storage_state_temp_file(storage_state)
-        storage_state_for_session: Optional[Union[Dict[str, Any], str]]
-        storage_state_for_session = storage_state_file or clean_storage_state
+        storage_state_for_session, storage_state_file, session_user_agent = (
+            self._prepare_storage_state_for_browser_session(storage_state)
+        )
 
         def _to_int_or_none(value: Any) -> Optional[int]:
             if value is None:
@@ -3144,6 +3295,7 @@ class BrowserUseAgent:
                     browser_session = self._create_browser_session(
                         cdp_url,
                         storage_state=storage_state_for_session,
+                        user_agent=session_user_agent,
                     )
                     restore_event_bus = self._patch_event_bus_for_stop(browser_session)
 
@@ -3789,10 +3941,9 @@ class BrowserUseAgent:
         reconnect_url = self._get_browserless_reconnect_url(storage_state)
         session_info = self._get_browserless_session_info(storage_state)
         session_connect_url = session_info.get("connect") if isinstance(session_info.get("connect"), str) else None
-        clean_storage_state = self._sanitize_storage_state(storage_state)
-        storage_state_file = self._write_storage_state_temp_file(storage_state)
-        storage_state_for_session: Optional[Union[Dict[str, Any], str]]
-        storage_state_for_session = storage_state_file or clean_storage_state
+        storage_state_for_session, storage_state_file, session_user_agent = (
+            self._prepare_storage_state_for_browser_session(storage_state)
+        )
 
         try:
             for attempt in range(1, max_retries + 1):
@@ -3846,7 +3997,11 @@ class BrowserUseAgent:
                     - Se nÃ£o conseguir um campo, retorne null.
                     """
 
-                    browser_session = self._create_browser_session(cdp_url, storage_state=storage_state_for_session)
+                    browser_session = self._create_browser_session(
+                        cdp_url,
+                        storage_state=storage_state_for_session,
+                        user_agent=session_user_agent,
+                    )
                     llm = ChatOpenAI(model=self.model, api_key=self.api_key)
                     agent = self._create_agent(
                         task=task,
@@ -3940,10 +4095,9 @@ class BrowserUseAgent:
         """
         max_retries = getattr(settings, "browser_use_max_retries", 3)
         retry_delay = 3
-        clean_storage_state = self._sanitize_storage_state(storage_state)
-        storage_state_file = self._write_storage_state_temp_file(storage_state)
-        storage_state_for_session: Optional[Union[Dict[str, Any], str]]
-        storage_state_for_session = storage_state_file or clean_storage_state
+        storage_state_for_session, storage_state_file, session_user_agent = (
+            self._prepare_storage_state_for_browser_session(storage_state)
+        )
 
         try:
             for attempt in range(1, max_retries + 1):
@@ -3951,7 +4105,11 @@ class BrowserUseAgent:
                 restore_event_bus = None
                 try:
                     cdp_url = await self._resolve_browserless_cdp_url()
-                    browser_session = self._create_browser_session(cdp_url, storage_state=storage_state_for_session)
+                    browser_session = self._create_browser_session(
+                        cdp_url,
+                        storage_state=storage_state_for_session,
+                        user_agent=session_user_agent,
+                    )
                     llm = ChatOpenAI(model=self.model, api_key=self.api_key)
 
                     task = f"""

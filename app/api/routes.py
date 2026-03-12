@@ -1542,10 +1542,18 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
                 session_username=session_username,
             )
 
+        if isinstance(result, dict):
+            result_error = str(result.get("error") or "").strip().lower()
+            if result_error == "login_required":
+                raise RuntimeError(
+                    "Sessao Instagram expirada ou invalida; novo login necessario."
+                )
+
         if flow == "stories_interactions" and isinstance(result, dict):
             story_error = str(result.get("error") or "").strip().lower()
             fatal_story_errors = {
                 "story_open_failed",
+                "login_required",
                 "protocol_error",
                 "all_retries_failed",
                 "parse_failed",

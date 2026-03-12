@@ -75,9 +75,18 @@ Se voce nao quiser expor usuario/senha do Instagram para a IA, use o fluxo manua
 # 1) Capturar storage_state apos login humano (abre navegador)
 python scripts/capture_instagram_session.py --mode local
 
+# Opcional: forcar um navegador limpo, sem cookies persistidos
+python scripts/capture_instagram_session.py --mode local --profile-mode isolated
+
+# Opcional: forcar Chromium do Playwright
+python scripts/capture_instagram_session.py --mode local --browser chromium
+
 # 2) Importar sessao no banco
 python scripts/import_instagram_session.py --username seu_usuario
 ```
+
+Observacao: com `--mode local`, o script usa Google Chrome com um perfil persistente proprio em `.secrets/chrome-user-data`. Faca o login uma vez e os cookies ficam disponiveis nas proximas execucoes.
+Observacao: reutilizar diretamente o perfil padrao da sua instalacao do Chrome nao e o fluxo suportado nas versoes atuais do Chrome/Playwright.
 
 Arquivo gerado: `.secrets/instagram_storage_state.json` (ignorado no git).
 
@@ -108,8 +117,12 @@ Observacao: o script de captura salva tambem o `user_agent` da sessao e o scrape
 # Instalar dependências
 pip install -r requirements.txt
 
-# Instalar Chromium para captura manual de sessão local
+# O modo local usa Google Chrome por padrao com perfil persistente proprio
+# Opcional: instalar Chromium do Playwright para usar --browser chromium
 python -m playwright install chromium
+
+# Exemplo com Chromium
+# python scripts/capture_instagram_session.py --mode local --browser chromium
 
 # Iniciar com Docker Compose
 docker-compose up -d
