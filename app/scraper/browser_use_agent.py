@@ -1139,6 +1139,10 @@ class BrowserUseAgent:
           const isStoryUrl = Boolean(storyMatch);
           const pageText = (document.body && document.body.innerText) ? document.body.innerText : '';
           const textSample = pageText.slice(0, 4000).toLowerCase();
+          const metaDescription = (
+            document.querySelector('meta[name="description"]')
+            && document.querySelector('meta[name="description"]').getAttribute('content')
+          ) ? document.querySelector('meta[name="description"]').getAttribute('content').toLowerCase() : '';
           const hasPasswordInput = Boolean(document.querySelector('input[type="password"]'));
           const loginPath = /\\/accounts\\/login/i.test(path);
           const oneTapPath = /\\/accounts\\/onetap\\/?/i.test(path);
@@ -1146,9 +1150,9 @@ class BrowserUseAgent:
           const loginText = /\\blog in\\b|\\bentrar\\b|senha incorreta|incorrect password/i.test(textSample);
           const challengeText = /confirm it's you|confirm its you|enter your password|security code|enter code|unusual login attempt|check your notifications|challenge required|checkpoint required|confirme que e voce|confirme que é voce|digite sua senha|insira sua senha|codigo de seguranca|código de seguranca|insira o codigo|insira o código|verifique sua identidade/i.test(textSample);
           const passwordPrompt = hasPasswordInput && /continue|confirm|confirmar|continuar|password|senha/i.test(textSample);
-          const loginRequired = loginPath || challengePath || loginText || challengeText || passwordPrompt;
+          const baseLoginRequired = loginPath || challengePath || loginText || challengeText || passwordPrompt;
           let authPromptReason = null;
-          if (loginRequired) {
+          if (baseLoginRequired) {
             if (challengePath) authPromptReason = 'challenge_path';
             else if (passwordPrompt) authPromptReason = 'password_prompt';
             else if (challengeText) authPromptReason = 'challenge_text';
@@ -1200,6 +1204,20 @@ class BrowserUseAgent:
             || (continueVisible && targetUsernameVisible)
             || (continueVisible && landingTextVisible)
           );
+          let profileGateHtmlSample = '';
+          if (profileGateVisible) {
+            const html = (document.documentElement && document.documentElement.innerHTML) ? document.documentElement.innerHTML : '';
+            profileGateHtmlSample = html.slice(0, 250000).toLowerCase();
+          }
+          const profileGateRequiresPassword = Boolean(
+            profileGateVisible && (
+              profileGateHtmlSample.includes('password_entry')
+              || profileGateHtmlSample.includes('"n_credential_type":"password"')
+              || profileGateHtmlSample.includes('"n_credential_type","value":"password"')
+              || metaDescription.includes('create an account or log in to instagram')
+            )
+          );
+          const loginRequired = baseLoginRequired || profileGateRequiresPassword;
           const viewersModalOpen = Boolean(
             dialog && (
               dialogText.includes('visualizador')
@@ -1218,8 +1236,9 @@ class BrowserUseAgent:
             profile_gate_modal_open: removeProfilesModalOpen,
             profile_gate_continue_visible: continueVisible,
             profile_gate_username_visible: targetUsernameVisible,
+            profile_gate_requires_password: profileGateRequiresPassword,
             login_required: loginRequired,
-            auth_prompt_reason: authPromptReason,
+            auth_prompt_reason: profileGateRequiresPassword ? 'profile_gate_password_entry' : authPromptReason,
           };
         }
         """
@@ -1228,12 +1247,20 @@ class BrowserUseAgent:
         (...args) => {
           const targetUsername = String(args[0] || '').trim().replace(/^@/, '').toLowerCase();
           const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          const getCenter = (el) => {
+            if (!el || typeof el.getBoundingClientRect !== 'function') return null;
+            const rect = el.getBoundingClientRect();
+            return {
+              x: Math.max(2, Math.floor(rect.left + (rect.width / 2))),
+              y: Math.max(2, Math.floor(rect.top + (rect.height / 2))),
+            };
+          };
           const tryCenterClick = (el, method) => {
             if (!el || typeof el.getBoundingClientRect !== 'function') return null;
             try {
-              const rect = el.getBoundingClientRect();
-              const x = Math.max(2, Math.floor(rect.left + (rect.width / 2)));
-              const y = Math.max(2, Math.floor(rect.top + (rect.height / 2)));
+              const center = getCenter(el);
+              if (!center) return null;
+              const { x, y } = center;
               const target = document.elementFromPoint(x, y) || el;
               ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach((eventName) => {
                 try {
@@ -1247,7 +1274,7 @@ class BrowserUseAgent:
                   }));
                 } catch (e) {}
               });
-              return { handled: true, action: method, x, y };
+              return { handled: true, action: method, x, y, click_strategy: 'center_events' };
             } catch (e) {
               return null;
             }
@@ -1257,12 +1284,19 @@ class BrowserUseAgent:
             const clickable = (typeof el.closest === 'function')
               ? (el.closest('button, a, div[role="button"]') || el)
               : el;
+            const center = getCenter(clickable);
             try {
               clickable.scrollIntoView({ block: 'center', inline: 'center' });
             } catch (e) {}
             try {
               clickable.click();
-              return { handled: true, action: method };
+              return {
+                handled: true,
+                action: method,
+                x: center ? center.x : null,
+                y: center ? center.y : null,
+                click_strategy: 'dom_click',
+              };
             } catch (e) {
               return tryCenterClick(clickable, method);
             }
@@ -1888,6 +1922,34 @@ class BrowserUseAgent:
                 )
             return artifact
 
+        async def _click_page_coordinates(
+            page_obj: Optional[Any],
+            x: Any,
+            y: Any,
+        ) -> bool:
+            if page_obj is None:
+                return False
+            try:
+                target_x = int(float(x))
+                target_y = int(float(y))
+            except (TypeError, ValueError):
+                return False
+
+            try:
+                mouse = await page_obj.mouse
+                await mouse.move(target_x, target_y)
+                await asyncio.sleep(0.1)
+                await mouse.click(target_x, target_y)
+                return True
+            except Exception as exc:
+                logger.debug(
+                    "Stories JS: falha ao clicar por coordenadas no profile gate (%s, %s): %s",
+                    target_x,
+                    target_y,
+                    exc,
+                )
+                return False
+
         async def _resolve_profile_gate(
             page_obj: Optional[Any],
             page_reason: str,
@@ -1899,6 +1961,8 @@ class BrowserUseAgent:
             effective_state = state_data if isinstance(state_data, dict) else {}
             if not effective_state.get("profile_gate_visible"):
                 return False
+            if effective_state.get("profile_gate_requires_password"):
+                return False
 
             action_raw = await self._evaluate_page_json(
                 page_obj,
@@ -1907,19 +1971,67 @@ class BrowserUseAgent:
             )
             action_data = action_raw if isinstance(action_raw, dict) else {}
             if action_data.get("handled"):
-                logger.info(
-                    "Stories JS: profile gate resolvido (%s) via %s",
+                await asyncio.sleep(0.8)
+                post_action_raw = await self._evaluate_page_json(page_obj, state_script, target_username)
+                post_action_state = post_action_raw if isinstance(post_action_raw, dict) else {}
+                modal_closed = bool(
+                    effective_state.get("profile_gate_modal_open")
+                    and not post_action_state.get("profile_gate_modal_open")
+                )
+                if (not post_action_state.get("profile_gate_visible")) or modal_closed:
+                    logger.info(
+                        "Stories JS: profile gate resolvido (%s) via %s",
+                        page_reason,
+                        action_data.get("action") or "unknown",
+                    )
+                    await _capture_story_debug(
+                        page_obj,
+                        f"profile_gate_resolved_{page_reason}",
+                        state_data=post_action_state or effective_state,
+                        extra={"action_data": action_data},
+                    )
+                    return True
+
+                if await _click_page_coordinates(
+                    page_obj,
+                    action_data.get("x"),
+                    action_data.get("y"),
+                ):
+                    await asyncio.sleep(1.2)
+                    post_mouse_raw = await self._evaluate_page_json(page_obj, state_script, target_username)
+                    post_mouse_state = post_mouse_raw if isinstance(post_mouse_raw, dict) else {}
+                    modal_closed = bool(
+                        effective_state.get("profile_gate_modal_open")
+                        and not post_mouse_state.get("profile_gate_modal_open")
+                    )
+                    if (not post_mouse_state.get("profile_gate_visible")) or modal_closed:
+                        logger.info(
+                            "Stories JS: profile gate resolvido (%s) via %s_mouse",
+                            page_reason,
+                            action_data.get("action") or "unknown",
+                        )
+                        await _capture_story_debug(
+                            page_obj,
+                            f"profile_gate_resolved_{page_reason}",
+                            state_data=post_mouse_state or effective_state,
+                            extra={"action_data": {**action_data, "click_strategy": "mouse_click"}},
+                        )
+                        return True
+
+                logger.warning(
+                    "Stories JS: profile gate clique sem efeito (%s): action=%s strategy=%s url=%s",
                     page_reason,
                     action_data.get("action") or "unknown",
+                    action_data.get("click_strategy") or "unknown",
+                    (post_action_state or {}).get("current_url") or "",
                 )
-                await asyncio.sleep(1.5)
                 await _capture_story_debug(
                     page_obj,
-                    f"profile_gate_resolved_{page_reason}",
-                    state_data=effective_state,
+                    f"profile_gate_click_no_effect_{page_reason}",
+                    state_data=post_action_state or effective_state,
                     extra={"action_data": action_data},
                 )
-                return True
+                return False
 
             logger.warning(
                 "Stories JS: profile gate detectado mas nao resolvido (%s): %s debug=%s",
