@@ -5313,6 +5313,8 @@ class BrowserUseAgent:
             + ' '
             + (el && el.getAttribute ? (el.getAttribute('aria-label') || '') : '')
             + ' '
+            + (el && el.getAttribute ? (el.getAttribute('aria-placeholder') || '') : '')
+            + ' '
             + (el && el.getAttribute ? (el.getAttribute('title') || '') : '')
             + ' '
             + (el && el.getAttribute ? (el.getAttribute('placeholder') || '') : '')
@@ -5343,7 +5345,7 @@ class BrowserUseAgent:
             .filter((item) => messagePatterns.some((pattern) => pattern.test(item.text)))
             .sort((a, b) => Math.abs(a.top - 220) - Math.abs(b.top - 220))[0] || null;
           const dismissButton = controlEntries.find((item) => dismissPatterns.some((pattern) => pattern.test(item.text))) || null;
-          const composerCandidates = Array.from(document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [contenteditable="plaintext-only"], [role="textbox"]'))
+          const composerCandidates = Array.from(document.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable], [role="textbox"], [aria-placeholder]'))
             .filter(isVisible)
             .map((el) => {
               const tagName = String(el.tagName || '').toLowerCase();
@@ -5400,11 +5402,12 @@ class BrowserUseAgent:
             .slice(0, 6).length;
           const emptyThreadMarkers = /start chatting|say hi|send a message to start|start a chat|envie uma mensagem|mande uma mensagem|nenhuma mensagem|comece uma conversa|seja o primeiro a mandar uma mensagem/.test(textSample);
           const threadLikeUrl = /\\/direct\\/t\\//i.test(path);
+          const directPath = /\\/direct\\/(?:t\\/|inbox\\/?)/i.test(path);
           return {
             current_url: href,
             login_required: loginRequired,
-            thread_ready: threadLikeUrl || Boolean(composer),
-            thread_url: threadLikeUrl ? href : '',
+            thread_ready: threadLikeUrl || Boolean(directPath && composer && !composer.is_search_like),
+            thread_url: directPath ? href : '',
             message_button_found: Boolean(messageButton),
             dismiss_button_found: Boolean(dismissButton),
             composer_found: Boolean(composer && !composer.is_search_like),
@@ -5541,7 +5544,7 @@ class BrowserUseAgent:
             const style = window.getComputedStyle(el);
             return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
           };
-          const candidates = Array.from(document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [contenteditable="plaintext-only"], [role="textbox"]'))
+          const candidates = Array.from(document.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable], [role="textbox"], [aria-placeholder]'))
             .filter(isVisible)
             .map((el) => {
               const tagName = String(el.tagName || '').toLowerCase();
@@ -5549,6 +5552,8 @@ class BrowserUseAgent:
                 (el.getAttribute('placeholder') || '')
                 + ' '
                 + (el.getAttribute('aria-label') || '')
+                + ' '
+                + (el.getAttribute('aria-placeholder') || '')
                 + ' '
                 + (el.getAttribute('data-placeholder') || '')
               );
@@ -5845,23 +5850,27 @@ class BrowserUseAgent:
 
                                 Target profile:
                                 - {normalized_profile_url}
+                                - Exact username: {target_username}
 
                                 Goal:
-                                - Open the direct-message conversation for this exact profile in the current tab.
+                                - Open the direct-message conversation for this exact username in the current tab.
                                 - Stop as soon as the conversation thread is open.
 
                                 Instructions:
-                                1) If a blocking popup appears, dismiss it only if needed.
-                                2) Click the profile button labeled "Message" or "Mensagem".
-                                3) Wait for the conversation to open.
-                                4) If the first attempt does not work, try one more time.
-                                5) Do not type or send any message.
-                                6) Do not open a new tab.
-                                7) Do not switch to another conversation.
+                                1) Use only the current tab.
+                                2) Never use the floating Messages widget/bubble in the lower-right corner.
+                                3) First try the profile button labeled "Message" or "Mensagem".
+                                4) If that does not open the conversation, navigate in the same tab to https://www.instagram.com/direct/inbox/
+                                5) In inbox, use search or the new-message flow to open the one-to-one conversation with @{target_username}.
+                                6) If there are multiple results, choose the one whose username matches exactly @{target_username}.
+                                7) Do not type or send any message.
+                                8) Do not open a new tab.
+                                9) Do not switch to a different username.
 
                                 Success condition:
-                                - The URL contains /direct/t/
-                                - OR a visible message composer for this conversation is present.
+                                - The current URL contains /direct/
+                                - AND the active conversation is for @{target_username}
+                                - AND a visible message composer for this conversation is present.
 
                                 Final answer:
                                 - Respond with exactly OPEN_DM_OK on success
@@ -5936,20 +5945,27 @@ class BrowserUseAgent:
 
                                 Target profile:
                                 - {normalized_profile_url}
+                                - Exact username: {target_username}
 
                                 Goal:
-                                - Make the direct-message composer for this profile available and ready in the current tab.
+                                - Make the direct-message composer for @{target_username} available and ready in the current tab.
 
                                 Instructions:
-                                1) If you are still on the profile page, click "Message" / "Mensagem" to open the DM thread.
-                                2) If the DM thread is open, wait until the message composer is visible and ready.
-                                3) If a blocking popup appears, dismiss it only if needed.
-                                4) Do not type or send any message.
-                                5) Do not open a new tab.
-                                6) Do not switch to another conversation.
+                                1) Use only the current tab.
+                                2) Never use the floating Messages widget/bubble in the lower-right corner.
+                                3) If you are still on the profile page, try "Message" / "Mensagem" once.
+                                4) If that does not open the correct conversation, navigate in the same tab to https://www.instagram.com/direct/inbox/
+                                5) In inbox, use search or the new-message flow to open the one-to-one conversation with @{target_username}.
+                                6) If there are multiple results, choose the one whose username matches exactly @{target_username}.
+                                7) Wait until the message composer is visible and ready in that exact conversation.
+                                8) Do not type or send any message.
+                                9) Do not open a new tab.
+                                10) Do not switch to a different username.
 
                                 Success condition:
-                                - A visible message composer / textbox for this conversation exists.
+                                - The current URL contains /direct/
+                                - AND the active conversation is for @{target_username}
+                                - AND a visible message composer / textbox for this conversation exists.
 
                                 Final answer:
                                 - Respond with exactly COMPOSER_READY on success
