@@ -54,6 +54,7 @@ class Settings(BaseSettings):
     instagram_username: Optional[str] = None
     instagram_password: Optional[str] = None
     instagram_session_strict_validation: bool = False
+    instagram_direct_min_days_since_last_message: int = 30
 
     # Investing (opcional)
     investing_username: Optional[str] = None

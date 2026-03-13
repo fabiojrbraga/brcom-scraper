@@ -21,6 +21,7 @@ from app.models import Profile, Post, Interaction, InteractionType
 from app.database import SessionLocal
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,25 @@ class InstagramScraper:
         if not normalized_username:
             raise RuntimeError(f"session_username e obrigatorio no fluxo {flow}.")
         return normalized_username
+
+    def _render_direct_message(self, message_template: str, first_name: str) -> str:
+        """Renderiza placeholders simples de primeiro nome sem alterar o resto da mensagem."""
+        rendered = html_lib.unescape(str(message_template or ""))
+        normalized_first_name = " ".join(str(first_name or "").strip().split())
+        if not normalized_first_name:
+            return rendered.strip()
+
+        replacements = (
+            "{{primeiro_nome}}",
+            "{primeiro_nome}",
+            "[[primeiro_nome]]",
+            "{{first_name}}",
+            "{first_name}",
+            "[[first_name]]",
+        )
+        for placeholder in replacements:
+            rendered = rendered.replace(placeholder, normalized_first_name)
+        return rendered.strip()
 
     def _extract_post_urls_from_html(self, html: str, max_posts: int) -> List[str]:
         """
@@ -2150,6 +2170,92 @@ class InstagramScraper:
             return result
         except Exception as exc:
             logger.exception("Erro no fluxo stories_interactions para %s: %s", profile_url, exc)
+            raise
+
+    async def send_direct_message_if_needed(
+        self,
+        profile_url: str,
+        first_name: str,
+        message_template: str,
+        db: Optional[Session] = None,
+        session_username: Optional[str] = None,
+        min_days_since_last_message: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Envia uma mensagem no direct apenas quando nao existe historico
+        ou quando a ultima mensagem e mais antiga que o limite configurado.
+        """
+        try:
+            logger.info("Iniciando fluxo de direct message para %s", profile_url)
+
+            if not profile_url.startswith("http"):
+                profile_url = f"https://instagram.com/{profile_url}"
+            if not profile_url.endswith("/"):
+                profile_url = f"{profile_url}/"
+
+            normalized_session_username = self._require_session_username(
+                session_username,
+                "direct_message",
+            )
+            safe_min_days = max(
+                1,
+                int(
+                    min_days_since_last_message
+                    or getattr(settings, "instagram_direct_min_days_since_last_message", 30)
+                    or 30
+                ),
+            )
+            rendered_message = self._render_direct_message(message_template, first_name)
+            if not rendered_message:
+                raise RuntimeError("message e obrigatoria no fluxo direct_message.")
+
+            storage_state = (
+                await browser_use_agent.ensure_instagram_session(
+                    db,
+                    instagram_username=normalized_session_username,
+                )
+                if db
+                else None
+            )
+            if not storage_state:
+                raise RuntimeError(
+                    f"Sessao Instagram '@{normalized_session_username}' nao encontrada ou invalida. "
+                    "E necessario estar logado no Instagram para enviar mensagens no direct."
+                )
+
+            raw_result = await browser_use_agent.send_direct_message_if_needed(
+                profile_url=profile_url,
+                storage_state=storage_state,
+                message_text=rendered_message,
+                min_days_since_last_message=safe_min_days,
+            )
+
+            result: Dict[str, Any] = {
+                "status": str(raw_result.get("status") or "skipped"),
+                "reason": str(raw_result.get("reason") or "unknown"),
+                "profile_url": profile_url,
+                "thread_url": raw_result.get("thread_url"),
+                "session_username": normalized_session_username,
+                "first_name": " ".join(str(first_name or "").strip().split()),
+                "message_rendered": rendered_message,
+                "conversation_exists": bool(raw_result.get("conversation_exists")),
+                "no_history": bool(raw_result.get("no_history")),
+                "min_days_since_last_message": safe_min_days,
+                "last_message_at": raw_result.get("last_message_at"),
+                "last_message_age_days": raw_result.get("last_message_age_days"),
+                "sent_at": raw_result.get("sent_at"),
+                "checked_at": raw_result.get("checked_at") or datetime.utcnow(),
+            }
+
+            logger.info(
+                "Fluxo direct_message finalizado para %s: status=%s reason=%s",
+                profile_url,
+                result["status"],
+                result["reason"],
+            )
+            return result
+        except Exception as exc:
+            logger.exception("Erro no fluxo direct_message para %s: %s", profile_url, exc)
             raise
 
     async def _scrape_posts(

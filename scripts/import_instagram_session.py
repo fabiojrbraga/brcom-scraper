@@ -14,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -54,7 +56,35 @@ def _extract_user_agent(raw_state: dict[str, Any]) -> str | None:
     return None
 
 
-async def _validate_state(agent: Any, clean_state: dict[str, Any], skip_validation: bool) -> int:
+def _looks_like_instagram_login_page(text: str) -> bool:
+    lowered = (text or "").lower()
+    login_markers = (
+        "create an account or log in to instagram",
+        "login/device-based/login",
+        '"strategy":"password_entry"',
+        '"login_credential_type":"password"',
+        "use another profile",
+    )
+    return any(marker in lowered for marker in login_markers)
+
+
+def _looks_like_authenticated_instagram_page(text: str) -> bool:
+    lowered = (text or "").lower()
+    authenticated_markers = (
+        '"username":"',
+        '"viewerid":"',
+        '"has_phone_number":',
+        '"is_business_account":',
+        '"should_show_public_contacts":',
+    )
+    return any(marker in lowered for marker in authenticated_markers)
+
+
+async def _validate_state(
+    agent: Any,
+    clean_state: dict[str, Any],
+    skip_validation: bool,
+) -> int:
     cookies = agent.get_cookies(clean_state)
     if not cookies:
         raise RuntimeError("storage_state sem cookies. Login nao parece valido.")
@@ -62,11 +92,49 @@ async def _validate_state(agent: Any, clean_state: dict[str, Any], skip_validati
     if skip_validation:
         return len(cookies)
 
-    is_valid = await agent._is_session_valid(clean_state)
-    if not is_valid:
+    jar = agent._build_cookie_jar(cookies)
+    headers = {
+        "User-Agent": (
+            _extract_user_agent(clean_state)
+            or "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120 Safari/537.36"
+        ),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(
+                "https://www.instagram.com/accounts/edit/",
+                cookies=jar,
+                headers=headers,
+            )
+    except Exception:
+        if agent._has_valid_auth_cookie(clean_state):
+            return len(cookies)
         raise RuntimeError(
             "Sessao invalida pelo check HTTP. Refaca captura apos login manual."
         )
+
+    if resp.url and "login" in str(resp.url):
+        raise RuntimeError(
+            "Sessao invalida pelo check HTTP. Refaca captura apos login manual."
+        )
+
+    text = resp.text or ""
+    if _looks_like_instagram_login_page(text):
+        raise RuntimeError(
+            "Sessao invalida pelo check HTTP. Refaca captura apos login manual."
+        )
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            "Sessao invalida pelo check HTTP. Refaca captura apos login manual."
+        )
+
+    if not _looks_like_authenticated_instagram_page(text):
+        raise RuntimeError(
+            "Sessao invalida pelo check HTTP. Refaca captura apos login manual."
+        )
+
     return len(cookies)
 
 
@@ -95,6 +163,9 @@ def _persist_session(
         db.commit()
         db.refresh(session)
         return session.id, int(deactivated or 0)
+    except Exception as exc:
+        db.rollback()
+        raise RuntimeError(f"Falha ao gravar sessao no banco: {exc}") from exc
     finally:
         db.close()
 
@@ -106,11 +177,16 @@ async def _run(args: argparse.Namespace) -> None:
     if not isinstance(clean_state, dict):
         raise RuntimeError("storage_state invalido. Esperado JSON com cookies/origins.")
     user_agent = _extract_user_agent(raw_state)
+    username = args.username.strip().lstrip("@").lower() if args.username else None
     if user_agent:
         clean_state["_meta"] = {"user_agent": user_agent}
 
-    cookie_count = await _validate_state(agent, clean_state, args.skip_validation)
-    username = args.username.strip().lstrip("@").lower() if args.username else None
+    cookie_count = await _validate_state(
+        agent,
+        clean_state,
+        args.skip_validation,
+    )
+
     session_id, deactivated = _persist_session(
         session_factory,
         session_model,

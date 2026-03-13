@@ -89,6 +89,55 @@ class ProfileScrapeResponse(BaseModel):
     extracted_at: datetime
 
 
+# ==================== Direct Message Schemas ====================
+
+class DirectMessageRequest(BaseModel):
+    """Schema para envio condicional de mensagem no direct."""
+    profile_url: str = Field(..., description="URL do perfil Instagram alvo")
+    session_username: str = Field(
+        ...,
+        description="Username da sessao Instagram ativa a reutilizar",
+    )
+    first_name: str = Field(
+        ...,
+        description="Primeiro nome usado para personalizar a mensagem",
+        validation_alias=AliasChoices("first_name", "primeiro_nome"),
+    )
+    message: str = Field(
+        ...,
+        description="Mensagem/template a ser enviada no direct",
+        validation_alias=AliasChoices("message", "mensagem"),
+    )
+    min_days_since_last_message: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=3650,
+        description="Envia somente se a ultima mensagem tiver mais que esse numero de dias; quando omitido usa a configuracao do servidor",
+        validation_alias=AliasChoices(
+            "min_days_since_last_message",
+            "dias_minimos_desde_ultima_mensagem",
+        ),
+    )
+
+
+class DirectMessageResponse(BaseModel):
+    """Resposta do envio condicional de direct."""
+    status: str
+    reason: str
+    profile_url: str
+    thread_url: Optional[str] = None
+    session_username: str
+    first_name: str
+    message_rendered: str
+    conversation_exists: bool = False
+    no_history: bool = False
+    min_days_since_last_message: int
+    last_message_at: Optional[datetime] = None
+    last_message_age_days: Optional[float] = None
+    sent_at: Optional[datetime] = None
+    checked_at: datetime
+
+
 # ==================== Generic Scrape Schemas ====================
 
 class GenericScrapeRequest(BaseModel):

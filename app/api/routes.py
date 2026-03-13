@@ -6,7 +6,7 @@ Define as rotas para scraping, consulta de dados, etc.
 import logging
 import asyncio
 from typing import Any
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -21,6 +21,8 @@ from app.schemas import (
     ScrapingCompleteResponse,
     ProfileScrapeRequest,
     ProfileScrapeResponse,
+    DirectMessageRequest,
+    DirectMessageResponse,
     GenericScrapeRequest,
     GenericScrapeResponse,
     GenericScrapeJobResultResponse,
@@ -832,6 +834,50 @@ async def scrape_profile_info_get_not_allowed():
         status_code=405,
         detail="Use POST /api/profiles/scrape com body JSON (profile_url).",
     )
+
+
+@router.post("/direct_messages/send", response_model=DirectMessageResponse)
+async def send_direct_message(
+    request: DirectMessageRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Envia direct somente quando nao existe historico
+    ou quando a ultima mensagem e mais antiga que o limite informado.
+    """
+    try:
+        normalized_profile_url = _normalize_profile_url(request.profile_url)
+        session_username, _ = _require_active_scrape_session(
+            db,
+            request.session_username,
+            "direct_message",
+        )
+        result = await instagram_scraper.send_direct_message_if_needed(
+            profile_url=normalized_profile_url,
+            first_name=request.first_name,
+            message_template=request.message,
+            db=db,
+            session_username=session_username,
+            min_days_since_last_message=request.min_days_since_last_message,
+        )
+        return DirectMessageResponse(**result)
+    except HTTPException:
+        raise
+    except RuntimeError as exc:
+        detail = str(exc).strip() or "Erro ao enviar direct."
+        lowered_detail = detail.lower()
+        status_code = (
+            400
+            if "sessao" in lowered_detail
+            or "session" in lowered_detail
+            or lowered_detail == "login_required"
+            else 500
+        )
+        raise HTTPException(status_code=status_code, detail=detail)
+    except Exception as e:
+        logger.error("❌ Erro ao enviar direct para %s: %s", request.profile_url, e)
+        detail = str(e).strip() or "Erro interno ao enviar direct."
+        raise HTTPException(status_code=500, detail=detail)
 
 
 @router.post("/generic_scrape", response_model=ScrapingJobResponse)

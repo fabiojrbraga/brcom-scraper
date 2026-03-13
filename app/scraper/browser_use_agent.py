@@ -7,11 +7,13 @@ import logging
 import asyncio
 import inspect
 import json
+import re
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from browser_use import Agent, BrowserSession, ChatOpenAI
@@ -917,6 +919,224 @@ class BrowserUseAgent:
             story_id = path_parts[2].strip()
             return story_id or None
         return None
+
+    def _relative_time_to_hours(self, text: Optional[str]) -> Optional[float]:
+        """Converte texto relativo do Instagram para horas."""
+        if text is None:
+            return None
+
+        cleaned = str(text).strip().lower()
+        if not cleaned:
+            return None
+
+        cleaned = cleaned.replace("\u2022", " ").replace("\u00b7", " ")
+        cleaned = re.sub(r"\b(editado|editada|edited)\b", "", cleaned)
+        cleaned = re.sub(r"\bago\b", "", cleaned)
+        cleaned = re.sub(r"\bh[aá]\b", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+        if cleaned in {"now", "just now", "agora", "agora mesmo"}:
+            return 0.0
+        if cleaned in {"today", "hoje"}:
+            return 0.0
+        if cleaned in {"yesterday", "ontem"}:
+            return 24.0
+
+        patterns = [
+            (r"(\d+(?:[.,]\d+)?)\s*(?:s|sec|secs|second|seconds|seg|segs|segundo|segundos)\b", 1 / 3600),
+            (r"(\d+(?:[.,]\d+)?)\s*(?:m|min|mins|minute|minutes|minuto|minutos)\b", 1 / 60),
+            (r"(\d+(?:[.,]\d+)?)\s*(?:h|hr|hrs|hour|hours|hora|horas)\b", 1),
+            (r"(\d+(?:[.,]\d+)?)\s*(?:d|day|days|dia|dias)\b", 24),
+            (r"(\d+(?:[.,]\d+)?)\s*(?:w|wk|wks|week|weeks|sem|semana|semanas)\b", 24 * 7),
+            (r"(\d+(?:[.,]\d+)?)\s*(?:mo|month|months|mes|m[eê]s|meses)\b", 24 * 30),
+            (r"(\d+(?:[.,]\d+)?)\s*(?:y|yr|year|years|ano|anos)\b", 24 * 365),
+        ]
+
+        for pattern, multiplier in patterns:
+            match = re.search(pattern, cleaned)
+            if not match:
+                continue
+            value = match.group(1).replace(",", ".")
+            try:
+                return float(value) * multiplier
+            except ValueError:
+                return None
+
+        return None
+
+    def _parse_absolute_date(self, text: str, now: datetime) -> Optional[datetime]:
+        """Interpreta datas absolutas simples do Instagram em UTC."""
+        if not text:
+            return None
+
+        cleaned = text.strip().lower()
+        if not cleaned:
+            return None
+
+        normalized = unicodedata.normalize("NFD", cleaned)
+        normalized = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+        normalized = normalized.replace(",", " ").replace(".", " ")
+        normalized = re.sub(r"\bde\b", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+
+        month_map = {
+            "january": 1,
+            "jan": 1,
+            "february": 2,
+            "feb": 2,
+            "fevereiro": 2,
+            "fev": 2,
+            "march": 3,
+            "mar": 3,
+            "marco": 3,
+            "abril": 4,
+            "apr": 4,
+            "april": 4,
+            "maio": 5,
+            "may": 5,
+            "jun": 6,
+            "june": 6,
+            "junho": 6,
+            "jul": 7,
+            "july": 7,
+            "julho": 7,
+            "aug": 8,
+            "august": 8,
+            "ago": 8,
+            "agosto": 8,
+            "sep": 9,
+            "sept": 9,
+            "september": 9,
+            "set": 9,
+            "setembro": 9,
+            "oct": 10,
+            "october": 10,
+            "out": 10,
+            "outubro": 10,
+            "nov": 11,
+            "november": 11,
+            "novembro": 11,
+            "dec": 12,
+            "december": 12,
+            "dez": 12,
+            "dezembro": 12,
+        }
+
+        tokens = normalized.split()
+        if not tokens:
+            return None
+
+        def _parse_day(token: str) -> Optional[int]:
+            match = re.match(r"(\d{1,2})", token)
+            if not match:
+                return None
+            day = int(match.group(1))
+            return day if 1 <= day <= 31 else None
+
+        def _parse_year(token: Optional[str]) -> Optional[int]:
+            if not token:
+                return None
+            match = re.match(r"(\d{2,4})", token)
+            if not match:
+                return None
+            year = int(match.group(1))
+            return year + 2000 if year < 100 else year
+
+        for idx, token in enumerate(tokens):
+            month = month_map.get(token)
+            if not month:
+                continue
+
+            day = None
+            year = None
+
+            if idx + 1 < len(tokens):
+                day = _parse_day(tokens[idx + 1])
+                if day is not None and idx + 2 < len(tokens):
+                    year = _parse_year(tokens[idx + 2])
+
+            if day is None and idx > 0:
+                day = _parse_day(tokens[idx - 1])
+                if day is not None and idx + 1 < len(tokens):
+                    year = _parse_year(tokens[idx + 1])
+
+            if day is None:
+                continue
+
+            if year is None:
+                year = now.year
+                try:
+                    candidate = datetime(year, month, day, tzinfo=timezone.utc)
+                except ValueError:
+                    return None
+                if candidate.date() > now.date():
+                    try:
+                        candidate = datetime(year - 1, month, day, tzinfo=timezone.utc)
+                    except ValueError:
+                        return None
+                return candidate
+
+            try:
+                return datetime(year, month, day, tzinfo=timezone.utc)
+            except ValueError:
+                return None
+
+        return None
+
+    def _parse_instagram_timestamp(
+        self,
+        value: Any,
+        now: Optional[datetime] = None,
+    ) -> Optional[datetime]:
+        """Converte timestamps do Instagram para datetime UTC quando possivel."""
+        if value is None:
+            return None
+
+        effective_now = now or datetime.now(timezone.utc)
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+        text = str(value).strip()
+        if not text:
+            return None
+
+        iso_candidate = text.replace("Z", "+00:00").replace("z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(iso_candidate)
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+
+        lowered = text.lower()
+        if lowered in {"now", "just now", "agora", "agora mesmo", "today", "hoje"}:
+            return effective_now
+        if lowered in {"yesterday", "ontem"}:
+            return effective_now - timedelta(days=1)
+
+        relative_hours = self._relative_time_to_hours(lowered)
+        if relative_hours is not None:
+            return effective_now - timedelta(hours=relative_hours)
+
+        return self._parse_absolute_date(lowered, effective_now)
+
+    def _should_send_direct_message(
+        self,
+        last_message_at: Optional[datetime],
+        min_days_since_last_message: int,
+        now: Optional[datetime] = None,
+    ) -> tuple[bool, Optional[float]]:
+        """Decide se o direct deve ser enviado com base na ultima mensagem."""
+        if last_message_at is None:
+            return True, None
+
+        effective_now = now or datetime.now(timezone.utc)
+        normalized_last_message_at = (
+            last_message_at
+            if last_message_at.tzinfo
+            else last_message_at.replace(tzinfo=timezone.utc)
+        )
+        age_days = (effective_now - normalized_last_message_at).total_seconds() / 86400.0
+        return age_days > max(1, int(min_days_since_last_message)), age_days
 
     async def _ensure_browser_session_connected(
         self,
@@ -2679,6 +2899,249 @@ class BrowserUseAgent:
                 return True
         return False
 
+    async def inspect_instagram_session_in_browserless(
+        self,
+        storage_state: Optional[Dict[str, Any]],
+        instagram_username: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(storage_state, dict):
+            return {
+                "valid": False,
+                "reason": "invalid_storage_state",
+                "state": {},
+                "root_state": {},
+                "edit_state": {},
+                "storage_state": None,
+                "user_agent": None,
+            }
+
+        cookies = self._extract_cookies(storage_state)
+        if not cookies:
+            return {
+                "valid": False,
+                "reason": "no_cookies",
+                "state": {},
+                "root_state": {},
+                "edit_state": {},
+                "storage_state": None,
+                "user_agent": self.get_user_agent(storage_state),
+            }
+
+        state_script = """
+        (...args) => {
+          const targetUsername = String(args[0] || '').trim().replace(/^@/, '').toLowerCase();
+          const href = window.location.href || '';
+          const path = window.location.pathname || '';
+          const pageText = (document.body && document.body.innerText) ? document.body.innerText : '';
+          const textSample = pageText.slice(0, 4000).toLowerCase();
+          const htmlSample = (document.documentElement && document.documentElement.innerHTML)
+            ? document.documentElement.innerHTML.slice(0, 250000).toLowerCase()
+            : '';
+          const metaDescription = (
+            document.querySelector('meta[name="description"]')
+            && document.querySelector('meta[name="description"]').getAttribute('content')
+          ) ? document.querySelector('meta[name="description"]').getAttribute('content').toLowerCase() : '';
+          const hasPasswordInput = Boolean(document.querySelector('input[type="password"]'));
+          const loginPath = /\\/accounts\\/login/i.test(path);
+          const oneTapPath = /\\/accounts\\/onetap\\/?/i.test(path);
+          const challengePath = /\\/challenge\\/?|\\/accounts\\/suspended\\/?|\\/two_factor\\/?|\\/reauthentication\\//i.test(path);
+          const loginText = /\\blog in\\b|\\bentrar\\b|senha incorreta|incorrect password/i.test(textSample);
+          const challengeText = /confirm it's you|confirm its you|enter your password|security code|enter code|unusual login attempt|check your notifications|challenge required|checkpoint required|confirme que e voce|confirme que é voce|digite sua senha|insira sua senha|codigo de seguranca|código de seguranca|insira o codigo|insira o código|verifique sua identidade/i.test(textSample);
+          const passwordPrompt = hasPasswordInput && /continue|confirm|confirmar|continuar|password|senha/i.test(textSample);
+          const baseLoginRequired = loginPath || challengePath || loginText || challengeText || passwordPrompt;
+          let authPromptReason = null;
+          if (baseLoginRequired) {
+            if (challengePath) authPromptReason = 'challenge_path';
+            else if (passwordPrompt) authPromptReason = 'password_prompt';
+            else if (challengeText) authPromptReason = 'challenge_text';
+            else if (loginPath) authPromptReason = 'login_path';
+            else if (loginText) authPromptReason = 'login_text';
+          }
+
+          const clickableControls = Array.from(document.querySelectorAll('button,div[role="button"],a'));
+          const dialog = document.querySelector('div[role="dialog"]');
+          const dialogText = dialog ? ((dialog.textContent || '').toLowerCase()) : '';
+          const removeProfilesModalOpen = Boolean(
+            dialog && /remove profiles from this browser|remove profiles|remover perfis deste navegador|remover perfis/i.test(dialogText)
+          );
+          const continueVisible = clickableControls.some((el) => {
+            const text = ((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '')).trim().toLowerCase();
+            return text === 'continue'
+              || text === 'continuar'
+              || text.startsWith('continue as')
+              || text.startsWith('continuar como');
+          });
+          const alternateProfileVisible = clickableControls.some((el) => {
+            const text = ((el.textContent || '') + ' ' + (el.getAttribute('aria-label') || '')).trim().toLowerCase();
+            return text.includes('use another profile')
+              || text.includes('usar outro perfil')
+              || text.includes('create new account')
+              || text.includes('criar nova conta');
+          });
+          const landingTextVisible = /see everyday moments from|close friends|veja momentos do dia a dia|amigos proximos|amigos próximos/i.test(textSample);
+          const targetUsernameVisible = Boolean(targetUsername) && textSample.includes(targetUsername);
+          const profileGateVisible = Boolean(
+            oneTapPath
+            || removeProfilesModalOpen
+            || (continueVisible && alternateProfileVisible)
+            || (continueVisible && targetUsernameVisible)
+            || (continueVisible && landingTextVisible)
+          );
+          const profileGateRequiresPassword = Boolean(
+            profileGateVisible && (
+              htmlSample.includes('password_entry')
+              || htmlSample.includes('"login_credential_type":"password"')
+              || htmlSample.includes('"n_credential_type":"password"')
+              || htmlSample.includes('"n_credential_type","value":"password"')
+              || metaDescription.includes('create an account or log in to instagram')
+            )
+          );
+          const loginRequired = baseLoginRequired || profileGateRequiresPassword;
+          if (profileGateRequiresPassword) {
+            authPromptReason = 'profile_gate_password_entry';
+          }
+
+          return {
+            current_url: href,
+            current_path: path,
+            login_required: loginRequired,
+            auth_prompt_reason: authPromptReason,
+            profile_gate_visible: profileGateVisible,
+            profile_gate_modal_open: removeProfilesModalOpen,
+            profile_gate_continue_visible: continueVisible,
+            profile_gate_username_visible: targetUsernameVisible,
+            profile_gate_requires_password: profileGateRequiresPassword,
+          };
+        }
+        """
+
+        async def _read_state(page_obj: Any, username: str) -> Dict[str, Any]:
+            if page_obj is None:
+                return {}
+            state_raw = await self._evaluate_page_json(page_obj, state_script, username)
+            return state_raw if isinstance(state_raw, dict) else {}
+
+        async def _stabilize_state(
+            browser_session: BrowserSession,
+            username: str,
+            attempts: int = 6,
+            delay_seconds: float = 1.0,
+        ) -> tuple[Optional[Any], Dict[str, Any]]:
+            last_page = None
+            last_state: Dict[str, Any] = {}
+            for _ in range(max(1, attempts)):
+                page_obj = await browser_session.get_current_page()
+                if page_obj is not None:
+                    last_page = page_obj
+                state_data = await _read_state(page_obj, username)
+                if state_data:
+                    last_state = state_data
+                current_path = str(last_state.get("current_path") or "")
+                if last_state.get("login_required") or last_state.get("profile_gate_visible"):
+                    return last_page, last_state
+                if current_path.startswith("/accounts/edit"):
+                    return last_page, last_state
+                await asyncio.sleep(delay_seconds)
+            return last_page, last_state
+
+        normalized_username = (instagram_username or "").strip().lstrip("@").lower()
+        browser_session = None
+        storage_state_for_session = None
+        storage_state_file = None
+        browser_user_agent = self.get_user_agent(storage_state)
+
+        try:
+            storage_state_for_session, storage_state_file, session_user_agent = (
+                self._prepare_storage_state_for_browser_session(storage_state)
+            )
+            browser_user_agent = session_user_agent or browser_user_agent
+            cdp_url = await self._resolve_browserless_cdp_url()
+            browser_session = self._create_browser_session(
+                cdp_url,
+                storage_state=storage_state_for_session,
+                user_agent=session_user_agent,
+            )
+            await self._ensure_browser_session_connected(browser_session, timeout_ms=30000)
+
+            await self._navigate_to_url_with_timeout(
+                browser_session,
+                "https://www.instagram.com/",
+                timeout_ms=30000,
+                new_tab=False,
+            )
+            await asyncio.sleep(1.0)
+            root_page, root_state = await _stabilize_state(browser_session, normalized_username)
+
+            if root_page is not None:
+                try:
+                    ua_value = await self._evaluate_page_json(
+                        root_page,
+                        "(...args) => navigator.userAgent || ''",
+                    )
+                    if isinstance(ua_value, str) and ua_value.strip():
+                        browser_user_agent = ua_value.strip()
+                except Exception:
+                    pass
+
+            if root_state.get("login_required") or root_state.get("profile_gate_visible"):
+                reason = (
+                    root_state.get("auth_prompt_reason")
+                    or ("profile_gate_visible" if root_state.get("profile_gate_visible") else "login_required")
+                )
+                return {
+                    "valid": False,
+                    "reason": reason,
+                    "state": root_state,
+                    "root_state": root_state,
+                    "edit_state": {},
+                    "storage_state": None,
+                    "user_agent": browser_user_agent,
+                }
+
+            await self._navigate_to_url_with_timeout(
+                browser_session,
+                "https://www.instagram.com/accounts/edit/",
+                timeout_ms=30000,
+                new_tab=False,
+            )
+            await asyncio.sleep(1.0)
+            _, edit_state = await _stabilize_state(browser_session, normalized_username)
+            edit_path = str(edit_state.get("current_path") or "")
+            edit_valid = (
+                not edit_state.get("login_required")
+                and not edit_state.get("profile_gate_visible")
+                and edit_path.startswith("/accounts/edit")
+            )
+            if not edit_valid:
+                reason = (
+                    edit_state.get("auth_prompt_reason")
+                    or ("unexpected_path" if edit_path else "browserless_validation_failed")
+                )
+                return {
+                    "valid": False,
+                    "reason": reason,
+                    "state": edit_state,
+                    "root_state": root_state,
+                    "edit_state": edit_state,
+                    "storage_state": None,
+                    "user_agent": browser_user_agent,
+                }
+
+            exported_state = await self._export_storage_state_with_retry(browser_session)
+            return {
+                "valid": True,
+                "reason": "authenticated",
+                "state": edit_state,
+                "root_state": root_state,
+                "edit_state": edit_state,
+                "storage_state": exported_state if isinstance(exported_state, dict) else None,
+                "user_agent": browser_user_agent,
+            }
+        finally:
+            if browser_session:
+                await self._detach_browser_session(browser_session)
+            self._cleanup_storage_state_temp_file(storage_state_file)
+
     async def _is_session_valid(self, storage_state: Dict[str, Any]) -> bool:
         """
         Verifica se o storage_state ainda representa uma sessao autenticada.
@@ -2691,6 +3154,21 @@ class BrowserUseAgent:
         if not settings.instagram_session_strict_validation:
             if self._has_valid_auth_cookie(storage_state):
                 return True
+
+        try:
+            browserless_result = await self.inspect_instagram_session_in_browserless(storage_state)
+            if browserless_result.get("valid") is True:
+                return True
+            if browserless_result.get("reason"):
+                logger.info(
+                    "Validacao Browserless da sessao Instagram falhou: reason=%s auth_prompt_reason=%s current_url=%s",
+                    browserless_result.get("reason"),
+                    (browserless_result.get("state") or {}).get("auth_prompt_reason"),
+                    (browserless_result.get("state") or {}).get("current_url"),
+                )
+                return False
+        except Exception as exc:
+            logger.warning("Falha na validacao Browserless da sessao Instagram: %s", exc)
 
         jar = self._build_cookie_jar(cookies)
         headers = {
@@ -4776,6 +5254,589 @@ class BrowserUseAgent:
                         await self._detach_browser_session(browser_session)
 
             return {"error": "all_retries_failed"}
+        finally:
+            self._cleanup_storage_state_temp_file(storage_state_file)
+
+    async def send_direct_message_if_needed(
+        self,
+        profile_url: str,
+        storage_state: Optional[Dict[str, Any]],
+        message_text: str,
+        min_days_since_last_message: int = 30,
+    ) -> Dict[str, Any]:
+        """
+        Envia direct somente quando nao houver historico ou quando o ultimo contato
+        estiver acima do limite de dias informado.
+        """
+        if not storage_state:
+            raise RuntimeError("login_required")
+
+        normalized_profile_url = str(profile_url or "").strip()
+        if not normalized_profile_url.startswith("http"):
+            normalized_profile_url = f"https://www.instagram.com/{normalized_profile_url.strip('/').lstrip('@')}/"
+        if not normalized_profile_url.endswith("/"):
+            normalized_profile_url = f"{normalized_profile_url}/"
+
+        safe_message_text = str(message_text or "").strip()
+        if not safe_message_text:
+            raise RuntimeError("message_text_empty")
+
+        safe_min_days = max(1, int(min_days_since_last_message or 30))
+        max_retries = getattr(settings, "browser_use_max_retries", 3)
+        retry_delay = 5
+        target_username = self._extract_instagram_username(normalized_profile_url)
+        reconnect_url = self._get_browserless_reconnect_url(storage_state)
+        session_info = self._get_browserless_session_info(storage_state)
+        session_connect_url = (
+            session_info.get("connect") if isinstance(session_info.get("connect"), str) else None
+        )
+        storage_state_for_session, storage_state_file, session_user_agent = (
+            self._prepare_storage_state_for_browser_session(storage_state)
+        )
+
+        direct_state_script = """
+        (...args) => {
+          const targetUsername = String(args[0] || '').trim().replace(/^@/, '').toLowerCase();
+          const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          const isVisible = (el) => {
+            if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0
+              && rect.height > 0
+              && style.display !== 'none'
+              && style.visibility !== 'hidden'
+              && style.opacity !== '0';
+          };
+          const getText = (el) => normalize(
+            (el && el.textContent ? el.textContent : '')
+            + ' '
+            + (el && el.getAttribute ? (el.getAttribute('aria-label') || '') : '')
+            + ' '
+            + (el && el.getAttribute ? (el.getAttribute('title') || '') : '')
+            + ' '
+            + (el && el.getAttribute ? (el.getAttribute('placeholder') || '') : '')
+            + ' '
+            + (el && el.getAttribute ? (el.getAttribute('data-placeholder') || '') : '')
+          );
+          const href = window.location.href || '';
+          const path = window.location.pathname || '';
+          const pageText = (document.body && document.body.innerText) ? document.body.innerText : '';
+          const textSample = pageText.slice(0, 14000).toLowerCase();
+          const loginPath = /\\/accounts\\/login/i.test(path);
+          const challengePath = /\\/challenge\\/?|\\/accounts\\/suspended\\/?|\\/two_factor\\/?|\\/reauthentication\\//i.test(path);
+          const hasPasswordInput = Boolean(document.querySelector('input[type="password"]'));
+          const loginText = /\\blog in\\b|\\bentrar\\b|incorrect password|senha incorreta|create new account|criar nova conta/i.test(textSample);
+          const challengeText = /confirm it's you|confirm its you|security code|codigo de seguranca|c[oó]digo de seguran[cç]a|challenge required|checkpoint required|two-factor|duas etapas/i.test(textSample);
+          const loginRequired = loginPath || challengePath || (hasPasswordInput && (loginText || challengeText));
+          const controls = Array.from(document.querySelectorAll('button, a, div[role="button"]')).filter(isVisible);
+          const controlEntries = controls.map((el) => ({
+            text: getText(el),
+            top: typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect().top : 9999,
+          }));
+          const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]')).filter(isVisible);
+          const root = dialogs[0] || document.querySelector('main') || document.body;
+          const messagePatterns = [/^message$/, /^mensagem$/, /^send message$/, /^enviar mensagem$/];
+          const dismissPatterns = [/^not now$/, /^agora nao$/, /^agora n[ãa]o$/, /^cancel$/, /^cancelar$/, /^close$/, /^fechar$/, /^ok$/];
+          const sendPatterns = [/^send$/, /^enviar$/];
+          const messageButton = controlEntries
+            .filter((item) => messagePatterns.some((pattern) => pattern.test(item.text)))
+            .sort((a, b) => Math.abs(a.top - 220) - Math.abs(b.top - 220))[0] || null;
+          const dismissButton = controlEntries.find((item) => dismissPatterns.some((pattern) => pattern.test(item.text))) || null;
+          const composerCandidates = Array.from(document.querySelectorAll('textarea, div[contenteditable="true"], div[role="textbox"]'))
+            .filter(isVisible)
+            .map((el) => {
+              const tagName = String(el.tagName || '').toLowerCase();
+              const meta = getText(el);
+              const rawValue = tagName === 'textarea'
+                ? String(el.value || '')
+                : String(el.innerText || el.textContent || '');
+              return {
+                meta,
+                value_text: rawValue.replace(/\\s+/g, ' ').trim(),
+                in_dialog: Boolean(el.closest && el.closest('div[role="dialog"]')),
+                in_form: Boolean(el.closest && el.closest('form')),
+              };
+            });
+          const composer = composerCandidates.find((item) =>
+            /(message|mensagem|send message|enviar mensagem|write a message|envie uma mensagem|digite sua mensagem)/i.test(item.meta)
+          ) || composerCandidates.find((item) => item.in_form || item.in_dialog || item.value_text.length > 0) || composerCandidates[0] || null;
+          const sendButton = controlEntries.find((item) => sendPatterns.some((pattern) => pattern.test(item.text))) || null;
+          const timeCandidates = Array.from(root.querySelectorAll('time'))
+            .map((el) => ({
+              datetime: String(el.getAttribute('datetime') || '').trim(),
+              text: String(el.textContent || '').trim(),
+            }))
+            .filter((item) => item.datetime || item.text)
+            .slice(-20);
+          const historyMetaLabelCount = Array.from(root.querySelectorAll('[aria-label], [title]'))
+            .map((el) => normalize((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')))
+            .filter((text) => /(\\b|^)(sent|seen|delivered|enviou|enviado|visto|visualizado|entregue)(\\b|$)/i.test(text)).length;
+          const ignoredTexts = new Set([
+            'message',
+            'mensagem',
+            'send',
+            'enviar',
+            'search',
+            'pesquisar',
+            'video chat',
+            'audio call',
+            'call',
+            'ligar',
+            'info',
+            'profile',
+            'perfil',
+          ]);
+          const conversationTextCount = Array.from(root.querySelectorAll('div, span, p, li'))
+            .filter(isVisible)
+            .map((el) => String(el.textContent || '').replace(/\\s+/g, ' ').trim())
+            .filter((text) => text && text.length > 1 && text.length < 300)
+            .filter((text) => !ignoredTexts.has(text.toLowerCase()))
+            .filter((text, index, arr) => arr.indexOf(text) === index)
+            .slice(0, 6).length;
+          const emptyThreadMarkers = /start chatting|say hi|send a message to start|start a chat|envie uma mensagem|mande uma mensagem|nenhuma mensagem|comece uma conversa|seja o primeiro a mandar uma mensagem/.test(textSample);
+          const threadLikeUrl = /\\/direct\\/t\\//i.test(path);
+          return {
+            current_url: href,
+            login_required: loginRequired,
+            thread_ready: threadLikeUrl || Boolean(composer),
+            thread_url: threadLikeUrl ? href : '',
+            message_button_found: Boolean(messageButton),
+            dismiss_button_found: Boolean(dismissButton),
+            composer_found: Boolean(composer),
+            composer_value_length: composer ? composer.value_text.length : 0,
+            send_button_found: Boolean(sendButton),
+            time_candidates: timeCandidates,
+            history_meta_label_count: historyMetaLabelCount,
+            message_text_candidate_count: conversationTextCount,
+            empty_thread_markers: emptyThreadMarkers,
+            target_username_mentioned: Boolean(targetUsername) && textSample.includes(targetUsername),
+          };
+        }
+        """
+        click_message_button_script = """
+        (...args) => {
+          const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          const isVisible = (el) => {
+            if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          const tryClick = (el) => {
+            if (!el) return false;
+            const clickable = (typeof el.closest === 'function')
+              ? (el.closest('button, a, div[role="button"]') || el)
+              : el;
+            try { clickable.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+            try { clickable.click(); return true; } catch (e) { return false; }
+          };
+          const candidates = Array.from(document.querySelectorAll('button, a, div[role="button"]'))
+            .filter(isVisible)
+            .map((el) => ({
+              el,
+              text: normalize(
+                (el.textContent || '')
+                + ' '
+                + (el.getAttribute('aria-label') || '')
+                + ' '
+                + (el.getAttribute('title') || '')
+              ),
+              top: typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect().top : 9999,
+            }))
+            .filter((item) =>
+              item.text === 'message'
+              || item.text === 'mensagem'
+              || item.text === 'send message'
+              || item.text === 'enviar mensagem'
+            )
+            .sort((a, b) => Math.abs(a.top - 220) - Math.abs(b.top - 220));
+          for (const candidate of candidates) {
+            if (tryClick(candidate.el)) {
+              return { clicked: true, text: candidate.text };
+            }
+          }
+          return { clicked: false, reason: 'message_button_not_found' };
+        }
+        """
+        dismiss_overlay_script = """
+        (...args) => {
+          const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          const isVisible = (el) => {
+            if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          const patterns = new Set(['not now', 'agora nao', 'agora não', 'cancel', 'cancelar', 'close', 'fechar', 'ok']);
+          const candidates = Array.from(document.querySelectorAll('button, a, div[role="button"]'))
+            .filter(isVisible)
+            .map((el) => ({
+              el,
+              text: normalize(
+                (el.textContent || '')
+                + ' '
+                + (el.getAttribute('aria-label') || '')
+                + ' '
+                + (el.getAttribute('title') || '')
+              ),
+            }))
+            .filter((item) => patterns.has(item.text));
+          for (const candidate of candidates) {
+            try {
+              candidate.el.click();
+              return { dismissed: true, text: candidate.text };
+            } catch (e) {}
+          }
+          return { dismissed: false, reason: 'dismiss_button_not_found' };
+        }
+        """
+        fill_message_script = """
+        (...args) => {
+          const messageText = String(args[0] || '');
+          const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          const isVisible = (el) => {
+            if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          const candidates = Array.from(document.querySelectorAll('textarea, div[contenteditable="true"], div[role="textbox"]'))
+            .filter(isVisible)
+            .map((el) => {
+              const tagName = String(el.tagName || '').toLowerCase();
+              const meta = normalize(
+                (el.getAttribute('placeholder') || '')
+                + ' '
+                + (el.getAttribute('aria-label') || '')
+                + ' '
+                + (el.getAttribute('data-placeholder') || '')
+              );
+              const currentValue = tagName === 'textarea'
+                ? String(el.value || '')
+                : String(el.innerText || el.textContent || '');
+              return {
+                el,
+                tag_name: tagName,
+                meta,
+                current_value: currentValue,
+                in_form: Boolean(el.closest && el.closest('form')),
+                in_dialog: Boolean(el.closest && el.closest('div[role="dialog"]')),
+              };
+            });
+          const composer = candidates.find((item) =>
+            /(message|mensagem|send message|enviar mensagem|write a message|envie uma mensagem|digite sua mensagem)/i.test(item.meta)
+          ) || candidates.find((item) => item.in_form || item.in_dialog || item.current_value.length > 0) || candidates[0];
+          if (!composer) {
+            return { filled: false, reason: 'composer_not_found' };
+          }
+          try { composer.el.focus(); } catch (e) {}
+          try {
+            if (composer.tag_name === 'textarea') {
+              const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+              if (setter) setter.call(composer.el, messageText);
+              else composer.el.value = messageText;
+            } else {
+              composer.el.innerHTML = '';
+              const lines = messageText.split(/\\r?\\n/);
+              lines.forEach((line, index) => {
+                if (index > 0) composer.el.appendChild(document.createElement('br'));
+                composer.el.appendChild(document.createTextNode(line));
+              });
+            }
+            composer.el.dispatchEvent(new Event('input', { bubbles: true }));
+            composer.el.dispatchEvent(new Event('change', { bubbles: true }));
+            return { filled: true, text_length: messageText.length };
+          } catch (e) {
+            return { filled: false, reason: String(e || 'fill_failed') };
+          }
+        }
+        """
+        click_send_button_script = """
+        (...args) => {
+          const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+          const isVisible = (el) => {
+            if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+          };
+          const candidates = Array.from(document.querySelectorAll('button, div[role="button"]'))
+            .filter(isVisible)
+            .map((el) => ({
+              el,
+              text: normalize(
+                (el.textContent || '')
+                + ' '
+                + (el.getAttribute('aria-label') || '')
+                + ' '
+                + (el.getAttribute('title') || '')
+              ),
+            }))
+            .filter((item) => item.text === 'send' || item.text === 'enviar');
+          for (const candidate of candidates) {
+            try {
+              candidate.el.click();
+              return { clicked: true, text: candidate.text };
+            } catch (e) {}
+          }
+          return { clicked: false, reason: 'send_button_not_found' };
+        }
+        """
+
+        try:
+            for attempt in range(1, max_retries + 1):
+                browser_session = None
+                restore_event_bus = None
+                try:
+                    logger.info(
+                        "Browser Use: enviando direct condicional para %s (tentativa %s/%s)",
+                        normalized_profile_url,
+                        attempt,
+                        max_retries,
+                    )
+
+                    use_reconnect = bool(reconnect_url and attempt == 1)
+                    use_session_connect = bool((not reconnect_url) and session_connect_url and attempt == 1)
+                    if use_reconnect:
+                        cdp_url = self._ensure_ws_token(reconnect_url)
+                    elif use_session_connect:
+                        cdp_url = self._ensure_ws_token(session_connect_url)
+                    else:
+                        cdp_url = await self._resolve_browserless_cdp_url()
+
+                    browser_session = self._create_browser_session(
+                        cdp_url,
+                        storage_state=storage_state_for_session,
+                        user_agent=session_user_agent,
+                    )
+                    restore_event_bus = self._patch_event_bus_for_stop(browser_session)
+
+                    async def _read_direct_state() -> tuple[Optional[Any], Dict[str, Any]]:
+                        page_obj = await browser_session.get_current_page()
+                        if page_obj is None:
+                            return None, {}
+                        state_raw = await self._evaluate_page_json(
+                            page_obj,
+                            direct_state_script,
+                            target_username,
+                        )
+                        return page_obj, state_raw if isinstance(state_raw, dict) else {}
+
+                    async def _dismiss_overlays(page_obj: Optional[Any]) -> bool:
+                        if page_obj is None:
+                            return False
+                        dismissed_raw = await self._evaluate_page_json(page_obj, dismiss_overlay_script)
+                        dismissed_data = dismissed_raw if isinstance(dismissed_raw, dict) else {}
+                        return bool(dismissed_data.get("dismissed"))
+
+                    async def _press_enter(page_obj: Optional[Any]) -> bool:
+                        if page_obj is None:
+                            return False
+                        keyboard = getattr(page_obj, "keyboard", None)
+                        if inspect.isawaitable(keyboard):
+                            keyboard = await keyboard
+                        press = getattr(keyboard, "press", None)
+                        if not callable(press):
+                            return False
+                        await self._maybe_await(press("Enter"))
+                        return True
+
+                    await self._navigate_to_url_with_timeout(
+                        browser_session,
+                        normalized_profile_url,
+                        timeout_ms=30000,
+                    )
+                    await asyncio.sleep(max(1.0, float(getattr(settings, "browser_use_min_page_load_wait_s", 1.0))))
+
+                    page_obj = None
+                    state_data: Dict[str, Any] = {}
+                    thread_opened = False
+                    for _ in range(12):
+                        page_obj, state_data = await _read_direct_state()
+                        if state_data.get("login_required"):
+                            raise RuntimeError("login_required")
+                        if state_data.get("thread_ready"):
+                            thread_opened = True
+                            break
+                        if state_data.get("dismiss_button_found") and await _dismiss_overlays(page_obj):
+                            await asyncio.sleep(1.0)
+                            continue
+                        if state_data.get("message_button_found"):
+                            click_raw = await self._evaluate_page_json(page_obj, click_message_button_script)
+                            click_data = click_raw if isinstance(click_raw, dict) else {}
+                            if click_data.get("clicked"):
+                                await asyncio.sleep(2.0)
+                                continue
+                        await asyncio.sleep(1.0)
+
+                    if not thread_opened:
+                        if state_data.get("message_button_found") is False:
+                            raise RuntimeError("message_button_not_found")
+                        raise RuntimeError("direct_thread_not_opened")
+
+                    composer_ready = False
+                    for _ in range(8):
+                        page_obj, state_data = await _read_direct_state()
+                        if state_data.get("login_required"):
+                            raise RuntimeError("login_required")
+                        if state_data.get("dismiss_button_found") and await _dismiss_overlays(page_obj):
+                            await asyncio.sleep(1.0)
+                            continue
+                        if state_data.get("composer_found"):
+                            composer_ready = True
+                            break
+                        await asyncio.sleep(1.0)
+
+                    if not composer_ready:
+                        raise RuntimeError("direct_composer_not_available")
+
+                    checked_at = datetime.utcnow().replace(tzinfo=timezone.utc)
+                    time_candidates = state_data.get("time_candidates") or []
+                    parsed_timestamps: List[datetime] = []
+                    for candidate in time_candidates:
+                        if not isinstance(candidate, dict):
+                            continue
+                        for key in ("datetime", "text"):
+                            parsed_dt = self._parse_instagram_timestamp(candidate.get(key), now=checked_at)
+                            if parsed_dt is not None:
+                                parsed_timestamps.append(parsed_dt)
+                                break
+
+                    last_message_at = max(parsed_timestamps) if parsed_timestamps else None
+                    message_text_candidate_count = int(state_data.get("message_text_candidate_count") or 0)
+                    conversation_exists = bool(
+                        last_message_at
+                        or int(state_data.get("history_meta_label_count") or 0) > 0
+                        or message_text_candidate_count >= 3
+                    )
+                    no_history = bool(
+                        not conversation_exists
+                        or (
+                            state_data.get("empty_thread_markers")
+                            and not last_message_at
+                            and int(state_data.get("history_meta_label_count") or 0) == 0
+                        )
+                    )
+
+                    should_send, age_days = self._should_send_direct_message(
+                        last_message_at,
+                        safe_min_days,
+                        now=checked_at,
+                    )
+
+                    if last_message_at is None and conversation_exists and not no_history:
+                        return {
+                            "status": "skipped",
+                            "reason": "history_present_but_last_message_unresolved",
+                            "profile_url": normalized_profile_url,
+                            "thread_url": state_data.get("thread_url") or state_data.get("current_url"),
+                            "conversation_exists": True,
+                            "no_history": False,
+                            "last_message_at": None,
+                            "last_message_age_days": None,
+                            "sent_at": None,
+                            "checked_at": checked_at.replace(tzinfo=None),
+                        }
+
+                    if not no_history and not should_send:
+                        return {
+                            "status": "skipped",
+                            "reason": "recent_history",
+                            "profile_url": normalized_profile_url,
+                            "thread_url": state_data.get("thread_url") or state_data.get("current_url"),
+                            "conversation_exists": conversation_exists,
+                            "no_history": False,
+                            "last_message_at": (
+                                last_message_at.astimezone(timezone.utc).replace(tzinfo=None)
+                                if last_message_at is not None
+                                else None
+                            ),
+                            "last_message_age_days": age_days,
+                            "sent_at": None,
+                            "checked_at": checked_at.replace(tzinfo=None),
+                        }
+
+                    fill_raw = await self._evaluate_page_json(page_obj, fill_message_script, safe_message_text)
+                    fill_data = fill_raw if isinstance(fill_raw, dict) else {}
+                    if not fill_data.get("filled"):
+                        raise RuntimeError(str(fill_data.get("reason") or "direct_message_fill_failed"))
+
+                    await asyncio.sleep(1.0)
+
+                    send_raw = await self._evaluate_page_json(page_obj, click_send_button_script)
+                    send_data = send_raw if isinstance(send_raw, dict) else {}
+                    used_enter_fallback = False
+                    if not send_data.get("clicked"):
+                        used_enter_fallback = await _press_enter(page_obj)
+                        if not used_enter_fallback:
+                            raise RuntimeError(str(send_data.get("reason") or "direct_send_button_not_found"))
+
+                    sent_confirmed = False
+                    sent_at = datetime.utcnow().replace(tzinfo=timezone.utc)
+                    for _ in range(6):
+                        await asyncio.sleep(1.0)
+                        page_obj, post_send_state = await _read_direct_state()
+                        if post_send_state.get("login_required"):
+                            raise RuntimeError("login_required")
+                        composer_length = int(post_send_state.get("composer_value_length") or 0)
+                        if composer_length == 0:
+                            state_data = post_send_state
+                            sent_confirmed = True
+                            break
+
+                    if not sent_confirmed:
+                        raise RuntimeError("direct_message_send_not_confirmed")
+
+                    return {
+                        "status": "sent",
+                        "reason": "no_history" if no_history else "last_message_older_than_threshold",
+                        "profile_url": normalized_profile_url,
+                        "thread_url": state_data.get("thread_url") or state_data.get("current_url"),
+                        "conversation_exists": True,
+                        "no_history": no_history,
+                        "last_message_at": (
+                            last_message_at.astimezone(timezone.utc).replace(tzinfo=None)
+                            if last_message_at is not None
+                            else None
+                        ),
+                        "last_message_age_days": age_days,
+                        "sent_at": sent_at.replace(tzinfo=None),
+                        "checked_at": checked_at.replace(tzinfo=None),
+                        "send_strategy": "enter_key" if used_enter_fallback else "send_button",
+                    }
+                except Exception as exc:
+                    error_msg = str(exc).lower()
+                    is_retryable = any(
+                        marker in error_msg
+                        for marker in (
+                            "http 500",
+                            "connection",
+                            "timeout",
+                            "websocket",
+                            "failed to establish",
+                            "protocol error",
+                            "reserved bits",
+                            "client is stopping",
+                        )
+                    )
+                    if is_retryable and attempt < max_retries:
+                        wait_time = retry_delay * attempt
+                        logger.warning(
+                            "Tentativa %s/%s falhou no direct message: %s. Retentando em %ss...",
+                            attempt,
+                            max_retries,
+                            str(exc)[:160],
+                            wait_time,
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    raise
+                finally:
+                    if callable(restore_event_bus):
+                        restore_event_bus()
+                    if browser_session:
+                        await self._detach_browser_session(browser_session)
         finally:
             self._cleanup_storage_state_temp_file(storage_state_file)
 

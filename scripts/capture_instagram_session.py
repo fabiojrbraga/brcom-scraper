@@ -223,7 +223,7 @@ async def _capture(
             user_agent = ""
 
         payload = dict(storage_state)
-        payload["_meta"] = {
+        base_meta = {
             "captured_at": datetime.now(timezone.utc).isoformat(),
             "capture_mode": mode,
             "local_browser": browser_name if mode == "local" else None,
@@ -239,6 +239,8 @@ async def _capture(
             ),
             "user_agent": user_agent or None,
         }
+        payload["_meta"] = dict(base_meta)
+
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),

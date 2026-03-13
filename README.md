@@ -15,6 +15,7 @@ Sistema de raspagem de dados de sites usando IA Generativa, Browser Automation e
 
 - **Camada API (FastAPI)**:
   - endpoints de scraping: `/api/scrape`, `/api/profiles/scrape`, `/api/generic_scrape`, `/api/investing_scrape`
+  - endpoint de direct autenticado: `/api/direct_messages/send`
   - endpoints de consulta: `/api/scrape/{job_id}`, `/api/scrape/{job_id}/results`, `/api/profiles/{username}/*`
   - endpoints administrativos de sessao: `/api/instagram_sessions`, `/api/instagram_sessions/{session_id}/deactivate`
 - **Autenticacao da API**:
@@ -175,6 +176,21 @@ Resposta:
   "status": "pending",
   "created_at": "2024-01-28T10:30:00Z"
 }
+```
+
+### Direct condicional
+
+```bash
+curl -X POST http://localhost:8000/api/direct_messages/send \
+  -H "X-API-Key: change-me" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "profile_url": "https://www.instagram.com/username/",
+    "session_username": "conta_logada",
+    "primeiro_nome": "Fabio",
+    "mensagem": "Oi, {{primeiro_nome}}! Tudo bem?",
+    "dias_minimos_desde_ultima_mensagem": 30
+  }'
 ```
 
 ### 2. Verificar Status
