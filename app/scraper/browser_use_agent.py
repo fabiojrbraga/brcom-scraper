@@ -5427,13 +5427,48 @@ class BrowserUseAgent:
             const style = window.getComputedStyle(el);
             return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
           };
+          const getCenter = (el) => {
+            if (!el || typeof el.getBoundingClientRect !== 'function') return null;
+            const rect = el.getBoundingClientRect();
+            return {
+              x: Math.max(2, Math.floor(rect.left + (rect.width / 2))),
+              y: Math.max(2, Math.floor(rect.top + (rect.height / 2))),
+            };
+          };
+          const dispatchCenterEvents = (el) => {
+            const center = getCenter(el);
+            if (!center) return null;
+            const target = document.elementFromPoint(center.x, center.y) || el;
+            ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach((eventName) => {
+              try {
+                target.dispatchEvent(new MouseEvent(eventName, {
+                  bubbles: true,
+                  cancelable: true,
+                  composed: true,
+                  clientX: center.x,
+                  clientY: center.y,
+                  view: window,
+                }));
+              } catch (e) {}
+            });
+            return center;
+          };
           const tryClick = (el) => {
-            if (!el) return false;
+            if (!el) return { clicked: false };
             const clickable = (typeof el.closest === 'function')
               ? (el.closest('button, a, div[role="button"]') || el)
               : el;
+            const center = getCenter(clickable);
             try { clickable.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
-            try { clickable.click(); return true; } catch (e) { return false; }
+            try {
+              clickable.click();
+              return { clicked: true, strategy: 'dom_click', x: center ? center.x : null, y: center ? center.y : null };
+            } catch (e) {}
+            const eventCenter = dispatchCenterEvents(clickable);
+            if (eventCenter) {
+              return { clicked: true, strategy: 'center_events', x: eventCenter.x, y: eventCenter.y };
+            }
+            return { clicked: false, strategy: 'not_clicked', x: center ? center.x : null, y: center ? center.y : null };
           };
           const candidates = Array.from(document.querySelectorAll('button, a, div[role="button"]'))
             .filter(isVisible)
@@ -5456,8 +5491,9 @@ class BrowserUseAgent:
             )
             .sort((a, b) => Math.abs(a.top - 220) - Math.abs(b.top - 220));
           for (const candidate of candidates) {
-            if (tryClick(candidate.el)) {
-              return { clicked: true, text: candidate.text };
+            const result = tryClick(candidate.el);
+            if (result.clicked) {
+              return { clicked: true, text: candidate.text, strategy: result.strategy, x: result.x, y: result.y };
             }
           }
           return { clicked: false, reason: 'message_button_not_found' };
@@ -5702,6 +5738,30 @@ class BrowserUseAgent:
                         await self._maybe_await(press("Enter"))
                         return True
 
+                    async def _click_page_coordinates(page_obj: Optional[Any], x: Any, y: Any) -> bool:
+                        if page_obj is None:
+                            return False
+                        try:
+                            target_x = int(float(x))
+                            target_y = int(float(y))
+                        except (TypeError, ValueError):
+                            return False
+
+                        try:
+                            mouse = await page_obj.mouse
+                            await mouse.move(target_x, target_y)
+                            await asyncio.sleep(0.1)
+                            await mouse.click(target_x, target_y)
+                            return True
+                        except Exception as exc:
+                            logger.debug(
+                                "Direct JS: falha ao clicar por coordenadas (%s, %s): %s",
+                                target_x,
+                                target_y,
+                                exc,
+                            )
+                            return False
+
                     await self._navigate_to_url_with_timeout(
                         browser_session,
                         normalized_profile_url,
@@ -5726,6 +5786,17 @@ class BrowserUseAgent:
                             click_raw = await self._evaluate_page_json(page_obj, click_message_button_script)
                             click_data = click_raw if isinstance(click_raw, dict) else {}
                             if click_data.get("clicked"):
+                                mouse_clicked = await _click_page_coordinates(
+                                    page_obj,
+                                    click_data.get("x"),
+                                    click_data.get("y"),
+                                )
+                                if mouse_clicked:
+                                    logger.info(
+                                        "Direct JS: clique do botao Message reforcado por coordenadas (%s, %s).",
+                                        click_data.get("x"),
+                                        click_data.get("y"),
+                                    )
                                 await asyncio.sleep(2.0)
                                 continue
                         if iteration in {7, 14}:
