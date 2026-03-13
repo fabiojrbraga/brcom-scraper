@@ -5762,6 +5762,34 @@ class BrowserUseAgent:
                             )
                             return False
 
+                    async def _run_direct_agent_fallback(task: str, label: str) -> bool:
+                        if not self.api_key:
+                            return False
+                        try:
+                            llm = ChatOpenAI(model=self.model, api_key=self.api_key)
+                            agent = self._create_agent(
+                                task=task,
+                                llm=llm,
+                                browser_session=browser_session,
+                            )
+                            history = await agent.run()
+                            final_text = (history.final_result() or "").strip()
+                            success = history.is_successful() or "OPEN_DM_OK" in final_text.upper() or "COMPOSER_READY" in final_text.upper()
+                            logger.info(
+                                "Direct JS: Browser Use fallback (%s): success=%s final=%s",
+                                label,
+                                success,
+                                final_text[:180],
+                            )
+                            return success
+                        except Exception as exc:
+                            logger.warning(
+                                "Direct JS: Browser Use fallback falhou (%s): %s",
+                                label,
+                                str(exc)[:180],
+                            )
+                            return False
+
                     await self._navigate_to_url_with_timeout(
                         browser_session,
                         normalized_profile_url,
@@ -5772,6 +5800,7 @@ class BrowserUseAgent:
                     page_obj = None
                     state_data: Dict[str, Any] = {}
                     thread_opened = False
+                    thread_agent_fallback_used = False
                     for iteration in range(20):
                         page_obj, state_data = await _read_direct_state()
                         if state_data.get("login_required"):
@@ -5799,6 +5828,49 @@ class BrowserUseAgent:
                                     )
                                 await asyncio.sleep(2.0)
                                 continue
+                        if (
+                            not thread_agent_fallback_used
+                            and iteration >= 3
+                            and state_data.get("message_button_found")
+                        ):
+                            thread_agent_fallback_used = True
+                            await _capture_direct_debug(
+                                page_obj,
+                                "thread_before_agent_fallback",
+                                state_data=state_data,
+                            )
+                            await _run_direct_agent_fallback(
+                                task=f"""
+                                You are already logged into Instagram Web and are using the current tab only.
+
+                                Target profile:
+                                - {normalized_profile_url}
+
+                                Goal:
+                                - Open the direct-message conversation for this exact profile in the current tab.
+                                - Stop as soon as the conversation thread is open.
+
+                                Instructions:
+                                1) If a blocking popup appears, dismiss it only if needed.
+                                2) Click the profile button labeled "Message" or "Mensagem".
+                                3) Wait for the conversation to open.
+                                4) If the first attempt does not work, try one more time.
+                                5) Do not type or send any message.
+                                6) Do not open a new tab.
+                                7) Do not switch to another conversation.
+
+                                Success condition:
+                                - The URL contains /direct/t/
+                                - OR a visible message composer for this conversation is present.
+
+                                Final answer:
+                                - Respond with exactly OPEN_DM_OK on success
+                                - Otherwise respond with exactly OPEN_DM_FAILED
+                                """,
+                                label="open_thread",
+                            )
+                            await asyncio.sleep(2.0)
+                            continue
                         if iteration in {7, 14}:
                             await _capture_direct_debug(
                                 page_obj,
@@ -5820,6 +5892,7 @@ class BrowserUseAgent:
                     composer_ready = False
                     thread_url = str(state_data.get("thread_url") or state_data.get("current_url") or "").strip()
                     thread_refreshed_once = False
+                    composer_agent_fallback_used = False
                     for iteration in range(20):
                         page_obj, state_data = await _read_direct_state()
                         if state_data.get("login_required"):
@@ -5847,6 +5920,42 @@ class BrowserUseAgent:
                                 browser_session,
                                 thread_url,
                                 timeout_ms=30000,
+                            )
+                            await asyncio.sleep(2.0)
+                            continue
+                        if not composer_agent_fallback_used and iteration >= 8:
+                            composer_agent_fallback_used = True
+                            await _capture_direct_debug(
+                                page_obj,
+                                "composer_before_agent_fallback",
+                                state_data=state_data,
+                            )
+                            await _run_direct_agent_fallback(
+                                task=f"""
+                                You are already logged into Instagram Web and must use the current tab only.
+
+                                Target profile:
+                                - {normalized_profile_url}
+
+                                Goal:
+                                - Make the direct-message composer for this profile available and ready in the current tab.
+
+                                Instructions:
+                                1) If you are still on the profile page, click "Message" / "Mensagem" to open the DM thread.
+                                2) If the DM thread is open, wait until the message composer is visible and ready.
+                                3) If a blocking popup appears, dismiss it only if needed.
+                                4) Do not type or send any message.
+                                5) Do not open a new tab.
+                                6) Do not switch to another conversation.
+
+                                Success condition:
+                                - A visible message composer / textbox for this conversation exists.
+
+                                Final answer:
+                                - Respond with exactly COMPOSER_READY on success
+                                - Otherwise respond with exactly COMPOSER_FAILED
+                                """,
+                                label="composer_ready",
                             )
                             await asyncio.sleep(2.0)
                             continue
