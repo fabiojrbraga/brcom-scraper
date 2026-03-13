@@ -55,14 +55,88 @@ class BrowserUseAgent:
             log = logging.getLogger(name)
             log.setLevel(level)
             log.propagate = True
+        self._patch_browser_use_ax_tree()
         self._patch_websocket_compression(self.ws_compression_mode)
         logger.info("Browser Use WebSocket compression mode: %s", self.ws_compression_mode)
         if self.fallback_model:
             logger.info("Browser Use fallback model enabled: %s -> %s", self.model, self.fallback_model)
 
+    _ax_tree_patched = False
     _ws_patched = False
     _ws_patch_mode = "auto"
     _ws_original_connect = None
+
+    @classmethod
+    def _patch_browser_use_ax_tree(cls) -> None:
+        if cls._ax_tree_patched:
+            return
+        try:
+            from browser_use.dom.service import DomService
+        except Exception:
+            return
+
+        original = getattr(DomService, "_get_ax_tree_for_all_frames", None)
+        if not callable(original):
+            return
+
+        async def _patched_get_ax_tree_for_all_frames(self, target_id):
+            cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=target_id, focus=False)
+            frame_tree = await cdp_session.cdp_client.send.Page.getFrameTree(session_id=cdp_session.session_id)
+
+            def collect_all_frame_ids(frame_tree_node) -> list[str]:
+                frame_ids = [frame_tree_node["frame"]["id"]]
+                child_frames = frame_tree_node.get("childFrames") or []
+                for child_frame in child_frames:
+                    frame_ids.extend(collect_all_frame_ids(child_frame))
+                return frame_ids
+
+            all_frame_ids = collect_all_frame_ids(frame_tree["frameTree"])
+            ax_tree_requests = [
+                cdp_session.cdp_client.send.Accessibility.getFullAXTree(
+                    params={"frameId": frame_id},
+                    session_id=cdp_session.session_id,
+                )
+                for frame_id in all_frame_ids
+            ]
+
+            ax_trees = await asyncio.gather(*ax_tree_requests, return_exceptions=True)
+            merged_nodes: list[dict[str, Any]] = []
+            skipped_frames = 0
+            first_error: Optional[BaseException] = None
+
+            for frame_id, ax_tree in zip(all_frame_ids, ax_trees):
+                if isinstance(ax_tree, BaseException):
+                    first_error = first_error or ax_tree
+                    error_text = str(ax_tree)
+                    if "Frame with the given frameId is not found" in error_text:
+                        skipped_frames += 1
+                        continue
+                    if hasattr(self, "logger") and self.logger:
+                        self.logger.warning(
+                            "AX tree frame ignorado (%s): %s",
+                            frame_id,
+                            error_text[:180],
+                        )
+                    continue
+                merged_nodes.extend(ax_tree.get("nodes") or [])
+
+            if skipped_frames and hasattr(self, "logger") and self.logger:
+                self.logger.info(
+                    "AX tree: %s frame(s) obsoletos ignorados durante leitura do DOM.",
+                    skipped_frames,
+                )
+
+            if merged_nodes:
+                return {"nodes": merged_nodes}
+            if first_error is not None:
+                raise first_error
+            return {"nodes": []}
+
+        try:
+            DomService._get_ax_tree_for_all_frames = _patched_get_ax_tree_for_all_frames  # type: ignore[assignment]
+            cls._ax_tree_patched = True
+        except Exception:
+            return
 
     @classmethod
     def _normalize_ws_compression_mode(cls, mode: Optional[str]) -> str:
@@ -391,6 +465,7 @@ class BrowserUseAgent:
             minimum_wait_page_load_time=min_page_load_wait,
             wait_for_network_idle_page_load_time=network_idle_wait,
             wait_between_actions=wait_between_actions,
+            cross_origin_iframes=False,
         )
         if user_agent:
             base_kwargs["user_agent"] = user_agent
@@ -5338,6 +5413,12 @@ class BrowserUseAgent:
                         user_agent=session_user_agent,
                     )
                     restore_event_bus = self._patch_event_bus_for_stop(browser_session)
+                    await self._navigate_to_url_with_timeout(
+                        browser_session,
+                        normalized_profile_url,
+                        timeout_ms=30000,
+                    )
+                    await asyncio.sleep(max(2.0, float(getattr(settings, "browser_use_min_page_load_wait_s", 1.0))))
                     checked_at = datetime.utcnow().replace(tzinfo=timezone.utc)
 
                     task = f"""
@@ -5362,8 +5443,8 @@ class BrowserUseAgent:
                     Navigation rules:
                     - First open the target profile.
                     - Try the profile button "Message" / "Mensagem".
-                    - If needed, navigate in the same tab to https://www.instagram.com/direct/inbox/ and use search or the new-message flow to open the exact one-to-one conversation with @{target_username}.
-                    - Never use the floating Messages widget/bubble in the lower-right corner.
+                    - If the floating Messages widget/bubble opens the exact conversation or new-message composer for @{target_username}, you may use it.
+                    - Only if the target conversation is still not open, navigate in the same tab to https://www.instagram.com/direct/inbox/ and use search or the new-message flow to open the exact one-to-one conversation with @{target_username}.
                     - Never open a new tab.
                     - Never switch to a different username.
 
@@ -5391,6 +5472,9 @@ class BrowserUseAgent:
                         task=task,
                         llm=llm,
                         browser_session=browser_session,
+                        directly_open_url=False,
+                        max_failures=6,
+                        step_timeout=180,
                     )
                     history = await agent.run()
                     final_result = (history.final_result() or "").strip()
@@ -6064,9 +6148,9 @@ class BrowserUseAgent:
 
                                 Instructions:
                                 1) Use only the current tab.
-                                2) Never use the floating Messages widget/bubble in the lower-right corner.
-                                3) First try the profile button labeled "Message" or "Mensagem".
-                                4) If that does not open the conversation, navigate in the same tab to https://www.instagram.com/direct/inbox/
+                                2) First try the profile button labeled "Message" or "Mensagem".
+                                3) If the floating Messages widget/bubble opens the exact conversation or new-message composer for @{target_username}, you may use it.
+                                4) Only if the target conversation is still not open, navigate in the same tab to https://www.instagram.com/direct/inbox/
                                 5) In inbox, use search or the new-message flow to open the one-to-one conversation with @{target_username}.
                                 6) If there are multiple results, choose the one whose username matches exactly @{target_username}.
                                 7) Do not type or send any message.
@@ -6158,9 +6242,9 @@ class BrowserUseAgent:
 
                                 Instructions:
                                 1) Use only the current tab.
-                                2) Never use the floating Messages widget/bubble in the lower-right corner.
-                                3) If you are still on the profile page, try "Message" / "Mensagem" once.
-                                4) If that does not open the correct conversation, navigate in the same tab to https://www.instagram.com/direct/inbox/
+                                2) If you are still on the profile page, try "Message" / "Mensagem" once.
+                                3) If the floating Messages widget/bubble opens the exact conversation or new-message composer for @{target_username}, you may use it.
+                                4) Only if that still does not open the correct conversation, navigate in the same tab to https://www.instagram.com/direct/inbox/
                                 5) In inbox, use search or the new-message flow to open the one-to-one conversation with @{target_username}.
                                 6) If there are multiple results, choose the one whose username matches exactly @{target_username}.
                                 7) Wait until the message composer is visible and ready in that exact conversation.
