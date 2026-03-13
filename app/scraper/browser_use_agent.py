@@ -5294,6 +5294,212 @@ class BrowserUseAgent:
             self._prepare_storage_state_for_browser_session(storage_state)
         )
 
+        if not self.api_key:
+            raise RuntimeError("openai_api_key_missing")
+
+        def _coerce_agent_datetime(value: Any, now: datetime) -> Optional[datetime]:
+            if value in (None, "", "null"):
+                return None
+            if isinstance(value, datetime):
+                return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            text = str(value).strip()
+            if not text:
+                return None
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            except Exception:
+                return self._parse_instagram_timestamp(text, now=now)
+
+        try:
+            for attempt in range(1, max_retries + 1):
+                browser_session = None
+                restore_event_bus = None
+                try:
+                    logger.info(
+                        "Browser Use: enviando direct condicional para %s (tentativa %s/%s)",
+                        normalized_profile_url,
+                        attempt,
+                        max_retries,
+                    )
+
+                    use_reconnect = bool(reconnect_url and attempt == 1)
+                    use_session_connect = bool((not reconnect_url) and session_connect_url and attempt == 1)
+                    if use_reconnect:
+                        cdp_url = self._ensure_ws_token(reconnect_url)
+                    elif use_session_connect:
+                        cdp_url = self._ensure_ws_token(session_connect_url)
+                    else:
+                        cdp_url = await self._resolve_browserless_cdp_url()
+
+                    browser_session = self._create_browser_session(
+                        cdp_url,
+                        storage_state=storage_state_for_session,
+                        user_agent=session_user_agent,
+                    )
+                    restore_event_bus = self._patch_event_bus_for_stop(browser_session)
+                    checked_at = datetime.utcnow().replace(tzinfo=timezone.utc)
+
+                    task = f"""
+                    You are already logged into Instagram Web and must use only the current tab.
+
+                    Current UTC datetime:
+                    - {checked_at.isoformat()}
+
+                    Target profile:
+                    - {normalized_profile_url}
+                    - Exact username: {target_username}
+
+                    Message to send exactly as written:
+                    {safe_message_text}
+
+                    Business rule:
+                    - If there is no direct-message history with @{target_username}, send the message.
+                    - If there is message history and the last visible message was sent less than {safe_min_days} days ago, do not send.
+                    - If there is message history and the last visible message was sent more than {safe_min_days} days ago, send the message.
+                    - If there is message history but you cannot reliably determine when the last visible message was sent, do not send.
+
+                    Navigation rules:
+                    - First open the target profile.
+                    - Try the profile button "Message" / "Mensagem".
+                    - If needed, navigate in the same tab to https://www.instagram.com/direct/inbox/ and use search or the new-message flow to open the exact one-to-one conversation with @{target_username}.
+                    - Never use the floating Messages widget/bubble in the lower-right corner.
+                    - Never open a new tab.
+                    - Never switch to a different username.
+
+                    Output rules:
+                    - Return ONLY one valid JSON object.
+                    - Do not use markdown.
+                    - Use these exact keys:
+                      status, reason, profile_url, thread_url, conversation_exists, no_history, last_message_at, last_message_age_days, sent_at, checked_at
+
+                    Valid values:
+                    - status: "sent" or "skipped"
+                    - reason: "no_history", "last_message_older_than_threshold", "recent_history", or "history_present_but_last_message_unresolved"
+                    - profile_url: the target profile URL
+                    - thread_url: current conversation URL or null
+                    - conversation_exists: true or false
+                    - no_history: true or false
+                    - last_message_at: ISO-8601 datetime string or null
+                    - last_message_age_days: number or null
+                    - sent_at: ISO-8601 datetime string if sent, otherwise null
+                    - checked_at: ISO-8601 datetime string
+                    """
+
+                    llm = ChatOpenAI(model=self.model, api_key=self.api_key)
+                    agent = self._create_agent(
+                        task=task,
+                        llm=llm,
+                        browser_session=browser_session,
+                    )
+                    history = await agent.run()
+                    final_result = (history.final_result() or "").strip()
+                    logger.info(
+                        "Direct Agent final result (tentativa %s): %s",
+                        attempt,
+                        final_result[:500] or "<empty>",
+                    )
+
+                    parsed = self._extract_first_json_value(final_result)
+                    if not isinstance(parsed, dict):
+                        if self._contains_protocol_error(final_result) and attempt < max_retries:
+                            wait_time = retry_delay * attempt
+                            logger.warning(
+                                "Falha de protocolo no direct agent (%s/%s). Retentando em %ss...",
+                                attempt,
+                                max_retries,
+                                wait_time,
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+                        raise RuntimeError("direct_agent_result_parse_failed")
+
+                    effective_checked_at = _coerce_agent_datetime(parsed.get("checked_at"), checked_at) or checked_at
+                    last_message_at = _coerce_agent_datetime(parsed.get("last_message_at"), effective_checked_at)
+                    sent_at = _coerce_agent_datetime(parsed.get("sent_at"), effective_checked_at)
+
+                    try:
+                        last_message_age_days = (
+                            float(parsed.get("last_message_age_days"))
+                            if parsed.get("last_message_age_days") not in (None, "", "null")
+                            else None
+                        )
+                    except (TypeError, ValueError):
+                        last_message_age_days = None
+
+                    status = str(parsed.get("status") or "skipped").strip().lower()
+                    if status not in {"sent", "skipped"}:
+                        status = "skipped"
+
+                    reason = str(parsed.get("reason") or "").strip() or (
+                        "no_history" if status == "sent" and bool(parsed.get("no_history")) else "recent_history"
+                    )
+                    if reason not in {
+                        "no_history",
+                        "last_message_older_than_threshold",
+                        "recent_history",
+                        "history_present_but_last_message_unresolved",
+                    }:
+                        reason = "history_present_but_last_message_unresolved"
+
+                    conversation_exists = bool(parsed.get("conversation_exists"))
+                    no_history = bool(parsed.get("no_history"))
+
+                    return {
+                        "status": status,
+                        "reason": reason,
+                        "profile_url": normalized_profile_url,
+                        "thread_url": str(parsed.get("thread_url") or "").strip() or None,
+                        "conversation_exists": conversation_exists,
+                        "no_history": no_history,
+                        "last_message_at": (
+                            last_message_at.astimezone(timezone.utc).replace(tzinfo=None)
+                            if last_message_at is not None
+                            else None
+                        ),
+                        "last_message_age_days": last_message_age_days,
+                        "sent_at": (
+                            sent_at.astimezone(timezone.utc).replace(tzinfo=None)
+                            if sent_at is not None
+                            else None
+                        ),
+                        "checked_at": effective_checked_at.astimezone(timezone.utc).replace(tzinfo=None),
+                    }
+                except Exception as exc:
+                    error_msg = str(exc).lower()
+                    is_retryable = any(
+                        marker in error_msg
+                        for marker in (
+                            "http 500",
+                            "connection",
+                            "timeout",
+                            "websocket",
+                            "failed to establish",
+                            "protocol error",
+                            "reserved bits",
+                            "client is stopping",
+                        )
+                    )
+                    if is_retryable and attempt < max_retries:
+                        wait_time = retry_delay * attempt
+                        logger.warning(
+                            "Tentativa %s/%s falhou no direct message: %s. Retentando em %ss...",
+                            attempt,
+                            max_retries,
+                            str(exc)[:160],
+                            wait_time,
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    raise
+                finally:
+                    if callable(restore_event_bus):
+                        restore_event_bus()
+                    if browser_session:
+                        await self._detach_browser_session(browser_session)
+        finally:
+            self._cleanup_storage_state_temp_file(storage_state_file)
+
         direct_state_script = """
         (...args) => {
           const targetUsername = String(args[0] || '').trim().replace(/^@/, '').toLowerCase();
