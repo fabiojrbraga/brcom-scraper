@@ -5343,23 +5343,27 @@ class BrowserUseAgent:
             .filter((item) => messagePatterns.some((pattern) => pattern.test(item.text)))
             .sort((a, b) => Math.abs(a.top - 220) - Math.abs(b.top - 220))[0] || null;
           const dismissButton = controlEntries.find((item) => dismissPatterns.some((pattern) => pattern.test(item.text))) || null;
-          const composerCandidates = Array.from(document.querySelectorAll('textarea, div[contenteditable="true"], div[role="textbox"]'))
+          const composerCandidates = Array.from(document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [contenteditable="plaintext-only"], [role="textbox"]'))
             .filter(isVisible)
             .map((el) => {
               const tagName = String(el.tagName || '').toLowerCase();
               const meta = getText(el);
               const rawValue = tagName === 'textarea'
                 ? String(el.value || '')
+                : tagName === 'input'
+                  ? String(el.value || '')
                 : String(el.innerText || el.textContent || '');
               return {
                 meta,
                 value_text: rawValue.replace(/\\s+/g, ' ').trim(),
                 in_dialog: Boolean(el.closest && el.closest('div[role="dialog"]')),
                 in_form: Boolean(el.closest && el.closest('form')),
+                is_search_like: /(search|pesquisar|buscar|find)/i.test(meta),
               };
             });
           const composer = composerCandidates.find((item) =>
-            /(message|mensagem|send message|enviar mensagem|write a message|envie uma mensagem|digite sua mensagem)/i.test(item.meta)
+            !item.is_search_like
+            && /(message|mensagem|send message|enviar mensagem|write a message|envie uma mensagem|digite sua mensagem|start a message|iniciar mensagem|escreva uma mensagem)/i.test(item.meta)
           ) || composerCandidates.find((item) => item.in_form || item.in_dialog || item.value_text.length > 0) || composerCandidates[0] || null;
           const sendButton = controlEntries.find((item) => sendPatterns.some((pattern) => pattern.test(item.text))) || null;
           const timeCandidates = Array.from(root.querySelectorAll('time'))
@@ -5403,7 +5407,7 @@ class BrowserUseAgent:
             thread_url: threadLikeUrl ? href : '',
             message_button_found: Boolean(messageButton),
             dismiss_button_found: Boolean(dismissButton),
-            composer_found: Boolean(composer),
+            composer_found: Boolean(composer && !composer.is_search_like),
             composer_value_length: composer ? composer.value_text.length : 0,
             send_button_found: Boolean(sendButton),
             time_candidates: timeCandidates,
@@ -5501,7 +5505,7 @@ class BrowserUseAgent:
             const style = window.getComputedStyle(el);
             return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
           };
-          const candidates = Array.from(document.querySelectorAll('textarea, div[contenteditable="true"], div[role="textbox"]'))
+          const candidates = Array.from(document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [contenteditable="plaintext-only"], [role="textbox"]'))
             .filter(isVisible)
             .map((el) => {
               const tagName = String(el.tagName || '').toLowerCase();
@@ -5514,6 +5518,8 @@ class BrowserUseAgent:
               );
               const currentValue = tagName === 'textarea'
                 ? String(el.value || '')
+                : tagName === 'input'
+                  ? String(el.value || '')
                 : String(el.innerText || el.textContent || '');
               return {
                 el,
@@ -5522,18 +5528,23 @@ class BrowserUseAgent:
                 current_value: currentValue,
                 in_form: Boolean(el.closest && el.closest('form')),
                 in_dialog: Boolean(el.closest && el.closest('div[role="dialog"]')),
+                is_search_like: /(search|pesquisar|buscar|find)/i.test(meta),
               };
             });
           const composer = candidates.find((item) =>
-            /(message|mensagem|send message|enviar mensagem|write a message|envie uma mensagem|digite sua mensagem)/i.test(item.meta)
-          ) || candidates.find((item) => item.in_form || item.in_dialog || item.current_value.length > 0) || candidates[0];
+            !item.is_search_like
+            && /(message|mensagem|send message|enviar mensagem|write a message|envie uma mensagem|digite sua mensagem|start a message|iniciar mensagem|escreva uma mensagem)/i.test(item.meta)
+          ) || candidates.find((item) => !item.is_search_like && (item.in_form || item.in_dialog || item.current_value.length > 0)) || candidates.find((item) => !item.is_search_like) || candidates[0];
           if (!composer) {
             return { filled: false, reason: 'composer_not_found' };
           }
           try { composer.el.focus(); } catch (e) {}
           try {
-            if (composer.tag_name === 'textarea') {
-              const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+            if (composer.tag_name === 'textarea' || composer.tag_name === 'input') {
+              const proto = composer.tag_name === 'input'
+                ? window.HTMLInputElement.prototype
+                : window.HTMLTextAreaElement.prototype;
+              const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
               if (setter) setter.call(composer.el, messageText);
               else composer.el.value = messageText;
             } else {
@@ -5583,6 +5594,55 @@ class BrowserUseAgent:
           return { clicked: false, reason: 'send_button_not_found' };
         }
         """
+
+        debug_run_id = (
+            f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_"
+            f"{self._sanitize_debug_artifact_name(target_username or 'direct')}_"
+            f"{uuid4().hex[:8]}"
+        )
+        debug_output_dir = Path(__file__).resolve().parents[2] / ".artifacts" / "direct-debug" / debug_run_id
+        debug_capture_count = 0
+        debug_capture_limit = 8
+
+        async def _capture_direct_debug(
+            page_obj: Optional[Any],
+            label: str,
+            state_data: Optional[Dict[str, Any]] = None,
+            extra: Optional[Dict[str, Any]] = None,
+        ) -> Optional[Dict[str, Any]]:
+            nonlocal debug_capture_count
+            if page_obj is None or debug_capture_count >= debug_capture_limit:
+                return None
+
+            effective_state = state_data
+            if effective_state is None:
+                try:
+                    state_raw = await self._evaluate_page_json(page_obj, direct_state_script, target_username)
+                    effective_state = state_raw if isinstance(state_raw, dict) else {}
+                except Exception as exc:
+                    effective_state = {"state_capture_error": str(exc)}
+
+            debug_capture_count += 1
+            artifact = await self._capture_page_debug_artifacts(
+                page_obj,
+                output_dir=debug_output_dir,
+                label=f"{debug_capture_count:02d}_{label}",
+                state_data=effective_state,
+                extra={
+                    "profile_url": normalized_profile_url,
+                    "target_username": target_username,
+                    **(extra or {}),
+                },
+            )
+            if artifact:
+                logger.info(
+                    "Direct JS: debug salvo (%s): screenshot=%s html=%s meta=%s",
+                    label,
+                    artifact.get("screenshot_path"),
+                    artifact.get("html_path"),
+                    artifact.get("meta_path"),
+                )
+            return artifact
 
         try:
             for attempt in range(1, max_retries + 1):
@@ -5652,7 +5712,7 @@ class BrowserUseAgent:
                     page_obj = None
                     state_data: Dict[str, Any] = {}
                     thread_opened = False
-                    for _ in range(12):
+                    for iteration in range(20):
                         page_obj, state_data = await _read_direct_state()
                         if state_data.get("login_required"):
                             raise RuntimeError("login_required")
@@ -5668,15 +5728,28 @@ class BrowserUseAgent:
                             if click_data.get("clicked"):
                                 await asyncio.sleep(2.0)
                                 continue
+                        if iteration in {7, 14}:
+                            await _capture_direct_debug(
+                                page_obj,
+                                f"thread_wait_{iteration + 1}",
+                                state_data=state_data,
+                            )
                         await asyncio.sleep(1.0)
 
                     if not thread_opened:
+                        await _capture_direct_debug(
+                            page_obj,
+                            "thread_not_opened",
+                            state_data=state_data,
+                        )
                         if state_data.get("message_button_found") is False:
                             raise RuntimeError("message_button_not_found")
                         raise RuntimeError("direct_thread_not_opened")
 
                     composer_ready = False
-                    for _ in range(8):
+                    thread_url = str(state_data.get("thread_url") or state_data.get("current_url") or "").strip()
+                    thread_refreshed_once = False
+                    for iteration in range(20):
                         page_obj, state_data = await _read_direct_state()
                         if state_data.get("login_required"):
                             raise RuntimeError("login_required")
@@ -5686,10 +5759,48 @@ class BrowserUseAgent:
                         if state_data.get("composer_found"):
                             composer_ready = True
                             break
+                        if (
+                            not thread_refreshed_once
+                            and iteration >= 6
+                            and thread_url
+                            and "/direct/" in thread_url
+                        ):
+                            thread_refreshed_once = True
+                            logger.info("Direct JS: composer nao apareceu; reabrindo thread %s", thread_url)
+                            await _capture_direct_debug(
+                                page_obj,
+                                "composer_before_thread_reload",
+                                state_data=state_data,
+                            )
+                            await self._navigate_to_url_with_timeout(
+                                browser_session,
+                                thread_url,
+                                timeout_ms=30000,
+                            )
+                            await asyncio.sleep(2.0)
+                            continue
+                        if iteration in {7, 14}:
+                            await _capture_direct_debug(
+                                page_obj,
+                                f"composer_wait_{iteration + 1}",
+                                state_data=state_data,
+                            )
                         await asyncio.sleep(1.0)
 
                     if not composer_ready:
-                        raise RuntimeError("direct_composer_not_available")
+                        fill_probe_raw = await self._evaluate_page_json(page_obj, fill_message_script, safe_message_text)
+                        fill_probe_data = fill_probe_raw if isinstance(fill_probe_raw, dict) else {}
+                        if fill_probe_data.get("filled"):
+                            composer_ready = True
+                            logger.info("Direct JS: composer detectado apenas no fill fallback.")
+                        else:
+                            await _capture_direct_debug(
+                                page_obj,
+                                "composer_not_available",
+                                state_data=state_data,
+                                extra={"fill_probe": fill_probe_data},
+                            )
+                            raise RuntimeError("direct_composer_not_available")
 
                     checked_at = datetime.utcnow().replace(tzinfo=timezone.utc)
                     time_candidates = state_data.get("time_candidates") or []
@@ -5760,6 +5871,12 @@ class BrowserUseAgent:
                     fill_raw = await self._evaluate_page_json(page_obj, fill_message_script, safe_message_text)
                     fill_data = fill_raw if isinstance(fill_raw, dict) else {}
                     if not fill_data.get("filled"):
+                        await _capture_direct_debug(
+                            page_obj,
+                            "fill_failed",
+                            state_data=state_data,
+                            extra={"fill_data": fill_data},
+                        )
                         raise RuntimeError(str(fill_data.get("reason") or "direct_message_fill_failed"))
 
                     await asyncio.sleep(1.0)
@@ -5770,6 +5887,12 @@ class BrowserUseAgent:
                     if not send_data.get("clicked"):
                         used_enter_fallback = await _press_enter(page_obj)
                         if not used_enter_fallback:
+                            await _capture_direct_debug(
+                                page_obj,
+                                "send_button_not_found",
+                                state_data=state_data,
+                                extra={"send_data": send_data},
+                            )
                             raise RuntimeError(str(send_data.get("reason") or "direct_send_button_not_found"))
 
                     sent_confirmed = False
@@ -5786,6 +5909,11 @@ class BrowserUseAgent:
                             break
 
                     if not sent_confirmed:
+                        await _capture_direct_debug(
+                            page_obj,
+                            "send_not_confirmed",
+                            state_data=state_data,
+                        )
                         raise RuntimeError("direct_message_send_not_confirmed")
 
                     return {
