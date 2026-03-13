@@ -5431,7 +5431,7 @@ class BrowserUseAgent:
                     - {normalized_profile_url}
                     - Exact username: {target_username}
 
-                    Message to send exactly as written:
+                    Message to send exactly as written (do not split it. Send just one text message):
                     {safe_message_text}
 
                     Business rule:
