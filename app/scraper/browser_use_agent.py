@@ -5372,399 +5372,19 @@ class BrowserUseAgent:
         if not self.api_key:
             raise RuntimeError("openai_api_key_missing")
 
-        # The send path below fills the Instagram composer once and triggers a
-        # single submit action, avoiding prompt-driven multi-message splits.
-
-        direct_state_script = """
-        (...args) => {
-          const targetUsername = String(args[0] || '').trim().replace(/^@/, '').toLowerCase();
-          const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-          const isVisible = (el) => {
-            if (!el || typeof el.getBoundingClientRect !== 'function') return false;
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return rect.width > 0
-              && rect.height > 0
-              && style.display !== 'none'
-              && style.visibility !== 'hidden'
-              && style.opacity !== '0';
-          };
-          const getText = (el) => normalize(
-            (el && el.textContent ? el.textContent : '')
-            + ' '
-            + (el && el.getAttribute ? (el.getAttribute('aria-label') || '') : '')
-            + ' '
-            + (el && el.getAttribute ? (el.getAttribute('aria-placeholder') || '') : '')
-            + ' '
-            + (el && el.getAttribute ? (el.getAttribute('title') || '') : '')
-            + ' '
-            + (el && el.getAttribute ? (el.getAttribute('placeholder') || '') : '')
-            + ' '
-            + (el && el.getAttribute ? (el.getAttribute('data-placeholder') || '') : '')
-          );
-          const href = window.location.href || '';
-          const path = window.location.pathname || '';
-          const pageText = (document.body && document.body.innerText) ? document.body.innerText : '';
-          const textSample = pageText.slice(0, 14000).toLowerCase();
-          const loginPath = /\\/accounts\\/login/i.test(path);
-          const challengePath = /\\/challenge\\/?|\\/accounts\\/suspended\\/?|\\/two_factor\\/?|\\/reauthentication\\//i.test(path);
-          const hasPasswordInput = Boolean(document.querySelector('input[type="password"]'));
-          const loginText = /\\blog in\\b|\\bentrar\\b|incorrect password|senha incorreta|create new account|criar nova conta/i.test(textSample);
-          const challengeText = /confirm it's you|confirm its you|security code|codigo de seguranca|c[oó]digo de seguran[cç]a|challenge required|checkpoint required|two-factor|duas etapas/i.test(textSample);
-          const loginRequired = loginPath || challengePath || (hasPasswordInput && (loginText || challengeText));
-          const controls = Array.from(document.querySelectorAll('button, a, div[role="button"]')).filter(isVisible);
-          const controlEntries = controls.map((el) => ({
-            text: getText(el),
-            top: typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect().top : 9999,
-          }));
-          const dialogs = Array.from(document.querySelectorAll('div[role="dialog"]')).filter(isVisible);
-          const root = dialogs[0] || document.querySelector('main') || document.body;
-          const messagePatterns = [/^message$/, /^mensagem$/, /^send message$/, /^enviar mensagem$/];
-          const dismissPatterns = [/^not now$/, /^agora nao$/, /^agora n[ãa]o$/, /^cancel$/, /^cancelar$/, /^close$/, /^fechar$/, /^ok$/];
-          const sendPatterns = [/^send$/, /^enviar$/];
-          const messageButton = controlEntries
-            .filter((item) => messagePatterns.some((pattern) => pattern.test(item.text)))
-            .sort((a, b) => Math.abs(a.top - 220) - Math.abs(b.top - 220))[0] || null;
-          const dismissButton = controlEntries.find((item) => dismissPatterns.some((pattern) => pattern.test(item.text))) || null;
-          const composerCandidates = Array.from(document.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable], [role="textbox"], [aria-placeholder]'))
-            .filter(isVisible)
-            .map((el) => {
-              const tagName = String(el.tagName || '').toLowerCase();
-              const meta = getText(el);
-              const rawValue = tagName === 'textarea'
-                ? String(el.value || '')
-                : tagName === 'input'
-                  ? String(el.value || '')
-                : String(el.innerText || el.textContent || '');
-              return {
-                meta,
-                value_text: rawValue.replace(/\\s+/g, ' ').trim(),
-                in_dialog: Boolean(el.closest && el.closest('div[role="dialog"]')),
-                in_form: Boolean(el.closest && el.closest('form')),
-                is_search_like: /(search|pesquisar|buscar|find)/i.test(meta),
-              };
-            });
-          const composer = composerCandidates.find((item) =>
-            !item.is_search_like
-            && /(message|mensagem|send message|enviar mensagem|write a message|envie uma mensagem|digite sua mensagem|start a message|iniciar mensagem|escreva uma mensagem)/i.test(item.meta)
-          ) || composerCandidates.find((item) => item.in_form || item.in_dialog || item.value_text.length > 0) || composerCandidates[0] || null;
-          const sendButton = controlEntries.find((item) => sendPatterns.some((pattern) => pattern.test(item.text))) || null;
-          const timeCandidates = Array.from(root.querySelectorAll('time'))
-            .map((el) => ({
-              datetime: String(el.getAttribute('datetime') || '').trim(),
-              text: String(el.textContent || '').trim(),
-            }))
-            .filter((item) => item.datetime || item.text)
-            .slice(-20);
-          const historyMetaLabelCount = Array.from(root.querySelectorAll('[aria-label], [title]'))
-            .map((el) => normalize((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '')))
-            .filter((text) => /(\\b|^)(sent|seen|delivered|enviou|enviado|visto|visualizado|entregue)(\\b|$)/i.test(text)).length;
-          const ignoredTexts = new Set([
-            'message',
-            'mensagem',
-            'send',
-            'enviar',
-            'search',
-            'pesquisar',
-            'video chat',
-            'audio call',
-            'call',
-            'ligar',
-            'info',
-            'profile',
-            'perfil',
-          ]);
-          const conversationTextCount = Array.from(root.querySelectorAll('div, span, p, li'))
-            .filter(isVisible)
-            .map((el) => String(el.textContent || '').replace(/\\s+/g, ' ').trim())
-            .filter((text) => text && text.length > 1 && text.length < 300)
-            .filter((text) => !ignoredTexts.has(text.toLowerCase()))
-            .filter((text, index, arr) => arr.indexOf(text) === index)
-            .slice(0, 6).length;
-          const emptyThreadMarkers = /start chatting|say hi|send a message to start|start a chat|envie uma mensagem|mande uma mensagem|nenhuma mensagem|comece uma conversa|seja o primeiro a mandar uma mensagem/.test(textSample);
-          const threadLikeUrl = /\\/direct\\/t\\//i.test(path);
-          const directPath = /\\/direct\\/(?:t\\/|inbox\\/?)/i.test(path);
-          return {
-            current_url: href,
-            login_required: loginRequired,
-            thread_ready: threadLikeUrl || Boolean(directPath && composer && !composer.is_search_like),
-            thread_url: directPath ? href : '',
-            message_button_found: Boolean(messageButton),
-            dismiss_button_found: Boolean(dismissButton),
-            composer_found: Boolean(composer && !composer.is_search_like),
-            composer_value_length: composer ? composer.value_text.length : 0,
-            send_button_found: Boolean(sendButton),
-            time_candidates: timeCandidates,
-            history_meta_label_count: historyMetaLabelCount,
-            message_text_candidate_count: conversationTextCount,
-            empty_thread_markers: emptyThreadMarkers,
-            target_username_mentioned: Boolean(targetUsername) && textSample.includes(targetUsername),
-          };
-        }
-        """
-        click_message_button_script = """
-        (...args) => {
-          const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-          const isVisible = (el) => {
-            if (!el || typeof el.getBoundingClientRect !== 'function') return false;
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-          };
-          const getCenter = (el) => {
-            if (!el || typeof el.getBoundingClientRect !== 'function') return null;
-            const rect = el.getBoundingClientRect();
-            return {
-              x: Math.max(2, Math.floor(rect.left + (rect.width / 2))),
-              y: Math.max(2, Math.floor(rect.top + (rect.height / 2))),
-            };
-          };
-          const dispatchCenterEvents = (el) => {
-            const center = getCenter(el);
-            if (!center) return null;
-            const target = document.elementFromPoint(center.x, center.y) || el;
-            ['pointerdown', 'mousedown', 'mouseup', 'click'].forEach((eventName) => {
-              try {
-                target.dispatchEvent(new MouseEvent(eventName, {
-                  bubbles: true,
-                  cancelable: true,
-                  composed: true,
-                  clientX: center.x,
-                  clientY: center.y,
-                  view: window,
-                }));
-              } catch (e) {}
-            });
-            return center;
-          };
-          const tryClick = (el) => {
-            if (!el) return { clicked: false };
-            const clickable = (typeof el.closest === 'function')
-              ? (el.closest('button, a, div[role="button"]') || el)
-              : el;
-            const center = getCenter(clickable);
-            try { clickable.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
-            try {
-              clickable.click();
-              return { clicked: true, strategy: 'dom_click', x: center ? center.x : null, y: center ? center.y : null };
-            } catch (e) {}
-            const eventCenter = dispatchCenterEvents(clickable);
-            if (eventCenter) {
-              return { clicked: true, strategy: 'center_events', x: eventCenter.x, y: eventCenter.y };
-            }
-            return { clicked: false, strategy: 'not_clicked', x: center ? center.x : null, y: center ? center.y : null };
-          };
-          const candidates = Array.from(document.querySelectorAll('button, a, div[role="button"]'))
-            .filter(isVisible)
-            .map((el) => ({
-              el,
-              text: normalize(
-                (el.textContent || '')
-                + ' '
-                + (el.getAttribute('aria-label') || '')
-                + ' '
-                + (el.getAttribute('title') || '')
-              ),
-              top: typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect().top : 9999,
-            }))
-            .filter((item) =>
-              item.text === 'message'
-              || item.text === 'mensagem'
-              || item.text === 'send message'
-              || item.text === 'enviar mensagem'
-            )
-            .sort((a, b) => Math.abs(a.top - 220) - Math.abs(b.top - 220));
-          for (const candidate of candidates) {
-            const result = tryClick(candidate.el);
-            if (result.clicked) {
-              return { clicked: true, text: candidate.text, strategy: result.strategy, x: result.x, y: result.y };
-            }
-          }
-          return { clicked: false, reason: 'message_button_not_found' };
-        }
-        """
-        dismiss_overlay_script = """
-        (...args) => {
-          const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-          const isVisible = (el) => {
-            if (!el || typeof el.getBoundingClientRect !== 'function') return false;
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-          };
-          const patterns = new Set(['not now', 'agora nao', 'agora não', 'cancel', 'cancelar', 'close', 'fechar', 'ok']);
-          const candidates = Array.from(document.querySelectorAll('button, a, div[role="button"]'))
-            .filter(isVisible)
-            .map((el) => ({
-              el,
-              text: normalize(
-                (el.textContent || '')
-                + ' '
-                + (el.getAttribute('aria-label') || '')
-                + ' '
-                + (el.getAttribute('title') || '')
-              ),
-            }))
-            .filter((item) => patterns.has(item.text));
-          for (const candidate of candidates) {
-            try {
-              candidate.el.click();
-              return { dismissed: true, text: candidate.text };
-            } catch (e) {}
-          }
-          return { dismissed: false, reason: 'dismiss_button_not_found' };
-        }
-        """
-        fill_message_script = """
-        (...args) => {
-          const messageText = String(args[0] || '');
-          const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-          const isVisible = (el) => {
-            if (!el || typeof el.getBoundingClientRect !== 'function') return false;
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-          };
-          const candidates = Array.from(document.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable], [role="textbox"], [aria-placeholder]'))
-            .filter(isVisible)
-            .map((el) => {
-              const tagName = String(el.tagName || '').toLowerCase();
-              const meta = normalize(
-                (el.getAttribute('placeholder') || '')
-                + ' '
-                + (el.getAttribute('aria-label') || '')
-                + ' '
-                + (el.getAttribute('aria-placeholder') || '')
-                + ' '
-                + (el.getAttribute('data-placeholder') || '')
-              );
-              const currentValue = tagName === 'textarea'
-                ? String(el.value || '')
-                : tagName === 'input'
-                  ? String(el.value || '')
-                : String(el.innerText || el.textContent || '');
-              return {
-                el,
-                tag_name: tagName,
-                meta,
-                current_value: currentValue,
-                in_form: Boolean(el.closest && el.closest('form')),
-                in_dialog: Boolean(el.closest && el.closest('div[role="dialog"]')),
-                is_search_like: /(search|pesquisar|buscar|find)/i.test(meta),
-              };
-            });
-          const composer = candidates.find((item) =>
-            !item.is_search_like
-            && /(message|mensagem|send message|enviar mensagem|write a message|envie uma mensagem|digite sua mensagem|start a message|iniciar mensagem|escreva uma mensagem)/i.test(item.meta)
-          ) || candidates.find((item) => !item.is_search_like && (item.in_form || item.in_dialog || item.current_value.length > 0)) || candidates.find((item) => !item.is_search_like) || candidates[0];
-          if (!composer) {
-            return { filled: false, reason: 'composer_not_found' };
-          }
-          try { composer.el.focus(); } catch (e) {}
-          try {
-            if (composer.tag_name === 'textarea' || composer.tag_name === 'input') {
-              const proto = composer.tag_name === 'input'
-                ? window.HTMLInputElement.prototype
-                : window.HTMLTextAreaElement.prototype;
-              const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-              if (setter) setter.call(composer.el, messageText);
-              else composer.el.value = messageText;
-            } else {
-              composer.el.innerHTML = '';
-              const lines = messageText.split(/\\r?\\n/);
-              lines.forEach((line, index) => {
-                if (index > 0) composer.el.appendChild(document.createElement('br'));
-                composer.el.appendChild(document.createTextNode(line));
-              });
-            }
-            composer.el.dispatchEvent(new Event('input', { bubbles: true }));
-            composer.el.dispatchEvent(new Event('change', { bubbles: true }));
-            return { filled: true, text_length: messageText.length };
-          } catch (e) {
-            return { filled: false, reason: String(e || 'fill_failed') };
-          }
-        }
-        """
-        click_send_button_script = """
-        (...args) => {
-          const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-          const isVisible = (el) => {
-            if (!el || typeof el.getBoundingClientRect !== 'function') return false;
-            const rect = el.getBoundingClientRect();
-            const style = window.getComputedStyle(el);
-            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-          };
-          const candidates = Array.from(document.querySelectorAll('button, div[role="button"]'))
-            .filter(isVisible)
-            .map((el) => ({
-              el,
-              text: normalize(
-                (el.textContent || '')
-                + ' '
-                + (el.getAttribute('aria-label') || '')
-                + ' '
-                + (el.getAttribute('title') || '')
-              ),
-            }))
-            .filter((item) => item.text === 'send' || item.text === 'enviar');
-          for (const candidate of candidates) {
-            try {
-              candidate.el.click();
-              return { clicked: true, text: candidate.text };
-            } catch (e) {}
-          }
-          return { clicked: false, reason: 'send_button_not_found' };
-        }
-        """
-
-        debug_run_id = (
-            f"{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_"
-            f"{self._sanitize_debug_artifact_name(target_username or 'direct')}_"
-            f"{uuid4().hex[:8]}"
-        )
-        debug_output_dir = Path(__file__).resolve().parents[2] / ".artifacts" / "direct-debug" / debug_run_id
-        debug_capture_count = 0
-        debug_capture_limit = 8
-
-        async def _capture_direct_debug(
-            page_obj: Optional[Any],
-            label: str,
-            state_data: Optional[Dict[str, Any]] = None,
-            extra: Optional[Dict[str, Any]] = None,
-        ) -> Optional[Dict[str, Any]]:
-            nonlocal debug_capture_count
-            if page_obj is None or debug_capture_count >= debug_capture_limit:
+        def _coerce_agent_datetime(value: Any, now: datetime) -> Optional[datetime]:
+            if value in (None, "", "null"):
                 return None
-
-            effective_state = state_data
-            if effective_state is None:
-                try:
-                    state_raw = await self._evaluate_page_json(page_obj, direct_state_script, target_username)
-                    effective_state = state_raw if isinstance(state_raw, dict) else {}
-                except Exception as exc:
-                    effective_state = {"state_capture_error": str(exc)}
-
-            debug_capture_count += 1
-            artifact = await self._capture_page_debug_artifacts(
-                page_obj,
-                output_dir=debug_output_dir,
-                label=f"{debug_capture_count:02d}_{label}",
-                state_data=effective_state,
-                extra={
-                    "profile_url": normalized_profile_url,
-                    "target_username": target_username,
-                    **(extra or {}),
-                },
-            )
-            if artifact:
-                logger.info(
-                    "Direct JS: debug salvo (%s): screenshot=%s html=%s meta=%s",
-                    label,
-                    artifact.get("screenshot_path"),
-                    artifact.get("html_path"),
-                    artifact.get("meta_path"),
-                )
-            return artifact
+            if isinstance(value, datetime):
+                return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            text = str(value).strip()
+            if not text:
+                return None
+            try:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            except Exception:
+                return self._parse_instagram_timestamp(text, now=now)
 
         try:
             for attempt in range(1, max_retries + 1):
@@ -5793,422 +5413,141 @@ class BrowserUseAgent:
                         user_agent=session_user_agent,
                     )
                     restore_event_bus = self._patch_event_bus_for_stop(browser_session)
-
-                    async def _read_direct_state() -> tuple[Optional[Any], Dict[str, Any]]:
-                        page_obj = await browser_session.get_current_page()
-                        if page_obj is None:
-                            return None, {}
-                        state_raw = await self._evaluate_page_json(
-                            page_obj,
-                            direct_state_script,
-                            target_username,
-                        )
-                        return page_obj, state_raw if isinstance(state_raw, dict) else {}
-
-                    async def _dismiss_overlays(page_obj: Optional[Any]) -> bool:
-                        if page_obj is None:
-                            return False
-                        dismissed_raw = await self._evaluate_page_json(page_obj, dismiss_overlay_script)
-                        dismissed_data = dismissed_raw if isinstance(dismissed_raw, dict) else {}
-                        return bool(dismissed_data.get("dismissed"))
-
-                    async def _press_enter(page_obj: Optional[Any]) -> bool:
-                        if page_obj is None:
-                            return False
-                        keyboard = getattr(page_obj, "keyboard", None)
-                        if inspect.isawaitable(keyboard):
-                            keyboard = await keyboard
-                        press = getattr(keyboard, "press", None)
-                        if not callable(press):
-                            return False
-                        await self._maybe_await(press("Enter"))
-                        return True
-
-                    async def _click_page_coordinates(page_obj: Optional[Any], x: Any, y: Any) -> bool:
-                        if page_obj is None:
-                            return False
-                        try:
-                            target_x = int(float(x))
-                            target_y = int(float(y))
-                        except (TypeError, ValueError):
-                            return False
-
-                        try:
-                            mouse = await page_obj.mouse
-                            await mouse.move(target_x, target_y)
-                            await asyncio.sleep(0.1)
-                            await mouse.click(target_x, target_y)
-                            return True
-                        except Exception as exc:
-                            logger.debug(
-                                "Direct JS: falha ao clicar por coordenadas (%s, %s): %s",
-                                target_x,
-                                target_y,
-                                exc,
-                            )
-                            return False
-
-                    async def _run_direct_agent_fallback(task: str, label: str) -> bool:
-                        if not self.api_key:
-                            return False
-                        try:
-                            llm = ChatOpenAI(model=self.model, api_key=self.api_key)
-                            agent = self._create_agent(
-                                task=task,
-                                llm=llm,
-                                browser_session=browser_session,
-                            )
-                            history = await agent.run()
-                            final_text = (history.final_result() or "").strip()
-                            success = history.is_successful() or "OPEN_DM_OK" in final_text.upper() or "COMPOSER_READY" in final_text.upper()
-                            logger.info(
-                                "Direct JS: Browser Use fallback (%s): success=%s final=%s",
-                                label,
-                                success,
-                                final_text[:180],
-                            )
-                            return success
-                        except Exception as exc:
-                            logger.warning(
-                                "Direct JS: Browser Use fallback falhou (%s): %s",
-                                label,
-                                str(exc)[:180],
-                            )
-                            return False
-
                     await self._navigate_to_url_with_timeout(
                         browser_session,
                         normalized_profile_url,
                         timeout_ms=30000,
                     )
-                    await asyncio.sleep(max(1.0, float(getattr(settings, "browser_use_min_page_load_wait_s", 1.0))))
-
-                    page_obj = None
-                    state_data: Dict[str, Any] = {}
-                    thread_opened = False
-                    thread_agent_fallback_used = False
-                    for iteration in range(20):
-                        page_obj, state_data = await _read_direct_state()
-                        if state_data.get("login_required"):
-                            raise RuntimeError("login_required")
-                        if state_data.get("thread_ready"):
-                            thread_opened = True
-                            break
-                        if state_data.get("dismiss_button_found") and await _dismiss_overlays(page_obj):
-                            await asyncio.sleep(1.0)
-                            continue
-                        if state_data.get("message_button_found"):
-                            click_raw = await self._evaluate_page_json(page_obj, click_message_button_script)
-                            click_data = click_raw if isinstance(click_raw, dict) else {}
-                            if click_data.get("clicked"):
-                                mouse_clicked = await _click_page_coordinates(
-                                    page_obj,
-                                    click_data.get("x"),
-                                    click_data.get("y"),
-                                )
-                                if mouse_clicked:
-                                    logger.info(
-                                        "Direct JS: clique do botao Message reforcado por coordenadas (%s, %s).",
-                                        click_data.get("x"),
-                                        click_data.get("y"),
-                                    )
-                                await asyncio.sleep(2.0)
-                                continue
-                        if (
-                            not thread_agent_fallback_used
-                            and iteration >= 3
-                            and state_data.get("message_button_found")
-                        ):
-                            thread_agent_fallback_used = True
-                            await _capture_direct_debug(
-                                page_obj,
-                                "thread_before_agent_fallback",
-                                state_data=state_data,
-                            )
-                            await _run_direct_agent_fallback(
-                                task=f"""
-                                You are already logged into Instagram Web and are using the current tab only.
-
-                                Target profile:
-                                - {normalized_profile_url}
-                                - Exact username: {target_username}
-
-                                Goal:
-                                - Open the direct-message conversation for this exact username in the current tab.
-                                - Stop as soon as the conversation thread is open.
-
-                                Instructions:
-                                1) Use only the current tab.
-                                2) First try the profile button labeled "Message" or "Mensagem".
-                                3) If the floating Messages widget/bubble opens the exact conversation or new-message composer for @{target_username}, you may use it.
-                                4) Only if the target conversation is still not open, navigate in the same tab to https://www.instagram.com/direct/inbox/
-                                5) In inbox, use search or the new-message flow to open the one-to-one conversation with @{target_username}.
-                                6) If there are multiple results, choose the one whose username matches exactly @{target_username}.
-                                7) Do not type or send any message.
-                                8) Do not open a new tab.
-                                9) Do not switch to a different username.
-
-                                Success condition:
-                                - The current URL contains /direct/
-                                - AND the active conversation is for @{target_username}
-                                - AND a visible message composer for this conversation is present.
-
-                                Final answer:
-                                - Respond with exactly OPEN_DM_OK on success
-                                - Otherwise respond with exactly OPEN_DM_FAILED
-                                """,
-                                label="open_thread",
-                            )
-                            await asyncio.sleep(2.0)
-                            continue
-                        if iteration in {7, 14}:
-                            await _capture_direct_debug(
-                                page_obj,
-                                f"thread_wait_{iteration + 1}",
-                                state_data=state_data,
-                            )
-                        await asyncio.sleep(1.0)
-
-                    if not thread_opened:
-                        await _capture_direct_debug(
-                            page_obj,
-                            "thread_not_opened",
-                            state_data=state_data,
-                        )
-                        if state_data.get("message_button_found") is False:
-                            raise RuntimeError("message_button_not_found")
-                        raise RuntimeError("direct_thread_not_opened")
-
-                    composer_ready = False
-                    thread_url = str(state_data.get("thread_url") or state_data.get("current_url") or "").strip()
-                    thread_refreshed_once = False
-                    composer_agent_fallback_used = False
-                    for iteration in range(20):
-                        page_obj, state_data = await _read_direct_state()
-                        if state_data.get("login_required"):
-                            raise RuntimeError("login_required")
-                        if state_data.get("dismiss_button_found") and await _dismiss_overlays(page_obj):
-                            await asyncio.sleep(1.0)
-                            continue
-                        if state_data.get("composer_found"):
-                            composer_ready = True
-                            break
-                        if (
-                            not thread_refreshed_once
-                            and iteration >= 6
-                            and thread_url
-                            and "/direct/" in thread_url
-                        ):
-                            thread_refreshed_once = True
-                            logger.info("Direct JS: composer nao apareceu; reabrindo thread %s", thread_url)
-                            await _capture_direct_debug(
-                                page_obj,
-                                "composer_before_thread_reload",
-                                state_data=state_data,
-                            )
-                            await self._navigate_to_url_with_timeout(
-                                browser_session,
-                                thread_url,
-                                timeout_ms=30000,
-                            )
-                            await asyncio.sleep(2.0)
-                            continue
-                        if not composer_agent_fallback_used and iteration >= 8:
-                            composer_agent_fallback_used = True
-                            await _capture_direct_debug(
-                                page_obj,
-                                "composer_before_agent_fallback",
-                                state_data=state_data,
-                            )
-                            await _run_direct_agent_fallback(
-                                task=f"""
-                                You are already logged into Instagram Web and must use the current tab only.
-
-                                Target profile:
-                                - {normalized_profile_url}
-                                - Exact username: {target_username}
-
-                                Goal:
-                                - Make the direct-message composer for @{target_username} available and ready in the current tab.
-
-                                Instructions:
-                                1) Use only the current tab.
-                                2) If you are still on the profile page, try "Message" / "Mensagem" once.
-                                3) If the floating Messages widget/bubble opens the exact conversation or new-message composer for @{target_username}, you may use it.
-                                4) Only if that still does not open the correct conversation, navigate in the same tab to https://www.instagram.com/direct/inbox/
-                                5) In inbox, use search or the new-message flow to open the one-to-one conversation with @{target_username}.
-                                6) If there are multiple results, choose the one whose username matches exactly @{target_username}.
-                                7) Wait until the message composer is visible and ready in that exact conversation.
-                                8) Do not type or send any message.
-                                9) Do not open a new tab.
-                                10) Do not switch to a different username.
-
-                                Success condition:
-                                - The current URL contains /direct/
-                                - AND the active conversation is for @{target_username}
-                                - AND a visible message composer / textbox for this conversation exists.
-
-                                Final answer:
-                                - Respond with exactly COMPOSER_READY on success
-                                - Otherwise respond with exactly COMPOSER_FAILED
-                                """,
-                                label="composer_ready",
-                            )
-                            await asyncio.sleep(2.0)
-                            continue
-                        if iteration in {7, 14}:
-                            await _capture_direct_debug(
-                                page_obj,
-                                f"composer_wait_{iteration + 1}",
-                                state_data=state_data,
-                            )
-                        await asyncio.sleep(1.0)
-
-                    if not composer_ready:
-                        fill_probe_raw = await self._evaluate_page_json(page_obj, fill_message_script, safe_message_text)
-                        fill_probe_data = fill_probe_raw if isinstance(fill_probe_raw, dict) else {}
-                        if fill_probe_data.get("filled"):
-                            composer_ready = True
-                            logger.info("Direct JS: composer detectado apenas no fill fallback.")
-                        else:
-                            await _capture_direct_debug(
-                                page_obj,
-                                "composer_not_available",
-                                state_data=state_data,
-                                extra={"fill_probe": fill_probe_data},
-                            )
-                            raise RuntimeError("direct_composer_not_available")
-
+                    await asyncio.sleep(max(2.0, float(getattr(settings, "browser_use_min_page_load_wait_s", 1.0))))
                     checked_at = datetime.utcnow().replace(tzinfo=timezone.utc)
-                    time_candidates = state_data.get("time_candidates") or []
-                    parsed_timestamps: List[datetime] = []
-                    for candidate in time_candidates:
-                        if not isinstance(candidate, dict):
-                            continue
-                        for key in ("datetime", "text"):
-                            parsed_dt = self._parse_instagram_timestamp(candidate.get(key), now=checked_at)
-                            if parsed_dt is not None:
-                                parsed_timestamps.append(parsed_dt)
-                                break
 
-                    last_message_at = max(parsed_timestamps) if parsed_timestamps else None
-                    message_text_candidate_count = int(state_data.get("message_text_candidate_count") or 0)
-                    conversation_exists = bool(
-                        last_message_at
-                        or int(state_data.get("history_meta_label_count") or 0) > 0
-                        or message_text_candidate_count >= 3
+                    task = f"""
+                    You are already logged into Instagram Web and must use only the current tab.
+
+                    Current UTC datetime:
+                    - {checked_at.isoformat()}
+
+                    Target profile:
+                    - {normalized_profile_url}
+                    - Exact username: {target_username}
+
+                    Message to send exactly as written (do not split it. Send just one text message):
+                    {safe_message_text}
+
+                    Business rule:
+                    - If there is no direct-message history with @{target_username}, send the message.
+                    - If there is message history and the last visible message was sent less than {safe_min_days} days ago, do not send.
+                    - If there is message history and the last visible message was sent more than {safe_min_days} days ago, send the message.
+                    - If there is message history but you cannot reliably determine when the last visible message was sent, do not send.
+
+                    Navigation rules:
+                    - First open the target profile.
+                    - Try the profile button "Message" / "Mensagem".
+                    - If the floating Messages widget/bubble opens the exact conversation or new-message composer for @{target_username}, you may use it.
+                    - Only if the target conversation is still not open, navigate in the same tab to https://www.instagram.com/direct/inbox/ and use search or the new-message flow to open the exact one-to-one conversation with @{target_username}.
+                    - Never open a new tab.
+                    - Never switch to a different username.
+
+                    Output rules:
+                    - Return ONLY one valid JSON object.
+                    - Do not use markdown.
+                    - Use these exact keys:
+                      status, reason, profile_url, thread_url, conversation_exists, no_history, last_message_at, last_message_age_days, sent_at, checked_at
+
+                    Valid values:
+                    - status: "sent" or "skipped"
+                    - reason: "no_history", "last_message_older_than_threshold", "recent_history", or "history_present_but_last_message_unresolved"
+                    - profile_url: the target profile URL
+                    - thread_url: current conversation URL or null
+                    - conversation_exists: true or false
+                    - no_history: true or false
+                    - last_message_at: ISO-8601 datetime string or null
+                    - last_message_age_days: number or null
+                    - sent_at: ISO-8601 datetime string if sent, otherwise null
+                    - checked_at: ISO-8601 datetime string
+                    """
+
+                    llm = ChatOpenAI(model=self.model, api_key=self.api_key)
+                    agent = self._create_agent(
+                        task=task,
+                        llm=llm,
+                        browser_session=browser_session,
+                        directly_open_url=False,
+                        max_failures=6,
+                        step_timeout=180,
                     )
-                    no_history = bool(
-                        not conversation_exists
-                        or (
-                            state_data.get("empty_thread_markers")
-                            and not last_message_at
-                            and int(state_data.get("history_meta_label_count") or 0) == 0
-                        )
+                    history = await agent.run()
+                    final_result = (history.final_result() or "").strip()
+                    logger.info(
+                        "Direct Agent final result (tentativa %s): %s",
+                        attempt,
+                        final_result[:500] or "<empty>",
                     )
 
-                    should_send, age_days = self._should_send_direct_message(
-                        last_message_at,
-                        safe_min_days,
-                        now=checked_at,
-                    )
-
-                    if last_message_at is None and conversation_exists and not no_history:
-                        return {
-                            "status": "skipped",
-                            "reason": "history_present_but_last_message_unresolved",
-                            "profile_url": normalized_profile_url,
-                            "thread_url": state_data.get("thread_url") or state_data.get("current_url"),
-                            "conversation_exists": True,
-                            "no_history": False,
-                            "last_message_at": None,
-                            "last_message_age_days": None,
-                            "sent_at": None,
-                            "checked_at": checked_at.replace(tzinfo=None),
-                        }
-
-                    if not no_history and not should_send:
-                        return {
-                            "status": "skipped",
-                            "reason": "recent_history",
-                            "profile_url": normalized_profile_url,
-                            "thread_url": state_data.get("thread_url") or state_data.get("current_url"),
-                            "conversation_exists": conversation_exists,
-                            "no_history": False,
-                            "last_message_at": (
-                                last_message_at.astimezone(timezone.utc).replace(tzinfo=None)
-                                if last_message_at is not None
-                                else None
-                            ),
-                            "last_message_age_days": age_days,
-                            "sent_at": None,
-                            "checked_at": checked_at.replace(tzinfo=None),
-                        }
-
-                    fill_raw = await self._evaluate_page_json(page_obj, fill_message_script, safe_message_text)
-                    fill_data = fill_raw if isinstance(fill_raw, dict) else {}
-                    if not fill_data.get("filled"):
-                        await _capture_direct_debug(
-                            page_obj,
-                            "fill_failed",
-                            state_data=state_data,
-                            extra={"fill_data": fill_data},
-                        )
-                        raise RuntimeError(str(fill_data.get("reason") or "direct_message_fill_failed"))
-
-                    await asyncio.sleep(1.0)
-
-                    send_raw = await self._evaluate_page_json(page_obj, click_send_button_script)
-                    send_data = send_raw if isinstance(send_raw, dict) else {}
-                    used_enter_fallback = False
-                    if not send_data.get("clicked"):
-                        used_enter_fallback = await _press_enter(page_obj)
-                        if not used_enter_fallback:
-                            await _capture_direct_debug(
-                                page_obj,
-                                "send_button_not_found",
-                                state_data=state_data,
-                                extra={"send_data": send_data},
+                    parsed = self._extract_first_json_value(final_result)
+                    if not isinstance(parsed, dict):
+                        if self._contains_protocol_error(final_result) and attempt < max_retries:
+                            wait_time = retry_delay * attempt
+                            logger.warning(
+                                "Falha de protocolo no direct agent (%s/%s). Retentando em %ss...",
+                                attempt,
+                                max_retries,
+                                wait_time,
                             )
-                            raise RuntimeError(str(send_data.get("reason") or "direct_send_button_not_found"))
+                            await asyncio.sleep(wait_time)
+                            continue
+                        raise RuntimeError("direct_agent_result_parse_failed")
 
-                    sent_confirmed = False
-                    sent_at = datetime.utcnow().replace(tzinfo=timezone.utc)
-                    for _ in range(6):
-                        await asyncio.sleep(1.0)
-                        page_obj, post_send_state = await _read_direct_state()
-                        if post_send_state.get("login_required"):
-                            raise RuntimeError("login_required")
-                        composer_length = int(post_send_state.get("composer_value_length") or 0)
-                        if composer_length == 0:
-                            state_data = post_send_state
-                            sent_confirmed = True
-                            break
+                    effective_checked_at = _coerce_agent_datetime(parsed.get("checked_at"), checked_at) or checked_at
+                    last_message_at = _coerce_agent_datetime(parsed.get("last_message_at"), effective_checked_at)
+                    sent_at = _coerce_agent_datetime(parsed.get("sent_at"), effective_checked_at)
 
-                    if not sent_confirmed:
-                        await _capture_direct_debug(
-                            page_obj,
-                            "send_not_confirmed",
-                            state_data=state_data,
+                    try:
+                        last_message_age_days = (
+                            float(parsed.get("last_message_age_days"))
+                            if parsed.get("last_message_age_days") not in (None, "", "null")
+                            else None
                         )
-                        raise RuntimeError("direct_message_send_not_confirmed")
+                    except (TypeError, ValueError):
+                        last_message_age_days = None
+
+                    status = str(parsed.get("status") or "skipped").strip().lower()
+                    if status not in {"sent", "skipped"}:
+                        status = "skipped"
+
+                    reason = str(parsed.get("reason") or "").strip() or (
+                        "no_history" if status == "sent" and bool(parsed.get("no_history")) else "recent_history"
+                    )
+                    if reason not in {
+                        "no_history",
+                        "last_message_older_than_threshold",
+                        "recent_history",
+                        "history_present_but_last_message_unresolved",
+                    }:
+                        reason = "history_present_but_last_message_unresolved"
+
+                    conversation_exists = bool(parsed.get("conversation_exists"))
+                    no_history = bool(parsed.get("no_history"))
 
                     return {
-                        "status": "sent",
-                        "reason": "no_history" if no_history else "last_message_older_than_threshold",
+                        "status": status,
+                        "reason": reason,
                         "profile_url": normalized_profile_url,
-                        "thread_url": state_data.get("thread_url") or state_data.get("current_url"),
-                        "conversation_exists": True,
+                        "thread_url": str(parsed.get("thread_url") or "").strip() or None,
+                        "conversation_exists": conversation_exists,
                         "no_history": no_history,
                         "last_message_at": (
                             last_message_at.astimezone(timezone.utc).replace(tzinfo=None)
                             if last_message_at is not None
                             else None
                         ),
-                        "last_message_age_days": age_days,
-                        "sent_at": sent_at.replace(tzinfo=None),
-                        "checked_at": checked_at.replace(tzinfo=None),
-                        "send_strategy": "enter_key" if used_enter_fallback else "send_button",
+                        "last_message_age_days": last_message_age_days,
+                        "sent_at": (
+                            sent_at.astimezone(timezone.utc).replace(tzinfo=None)
+                            if sent_at is not None
+                            else None
+                        ),
+                        "checked_at": effective_checked_at.astimezone(timezone.utc).replace(tzinfo=None),
                     }
                 except Exception as exc:
                     error_msg = str(exc).lower()
