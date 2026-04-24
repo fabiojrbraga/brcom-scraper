@@ -61,6 +61,140 @@ class InstagramScraper:
             raise RuntimeError(f"session_username e obrigatorio no fluxo {flow}.")
         return normalized_username
 
+    def _normalize_story_persist_user(self, raw_user: Any) -> Optional[Dict[str, Optional[str]]]:
+        user_url = ""
+        user_username = ""
+        if isinstance(raw_user, dict):
+            user_url = str(raw_user.get("user_url") or "").strip()
+            user_username = str(raw_user.get("user_username") or "").strip().lstrip("@")
+        elif isinstance(raw_user, str):
+            candidate = raw_user.strip()
+            if "instagram.com" in candidate:
+                user_url = candidate
+            else:
+                user_username = candidate.lstrip("@")
+        else:
+            return None
+
+        if user_url.startswith("/"):
+            user_url = f"https://www.instagram.com{user_url}"
+        if not user_url and user_username:
+            user_url = f"https://www.instagram.com/{user_username}/"
+
+        if user_url and "instagram.com" in user_url:
+            parsed_user = urlparse(user_url)
+            path_parts = [part for part in parsed_user.path.split("/") if part]
+            if path_parts:
+                normalized_username = path_parts[0].strip().lstrip("@")
+                if normalized_username:
+                    user_username = user_username or normalized_username
+                    user_url = f"https://www.instagram.com/{normalized_username}/"
+
+        if not user_url:
+            return None
+        if not user_username:
+            try:
+                user_username = self._extract_username_from_url(user_url)
+            except Exception:
+                user_username = ""
+
+        return {
+            "user_url": user_url,
+            "user_username": user_username or None,
+        }
+
+    async def _persist_story_interaction_item(
+        self,
+        db: Session,
+        profile_id: str,
+        story_item: Dict[str, Any],
+    ) -> Optional[str]:
+        story_url_value = str(story_item.get("story_url") or "").strip()
+        if not story_url_value:
+            return None
+
+        viewer_users = story_item.get("viewer_users") or []
+        if not isinstance(viewer_users, list):
+            viewer_users = []
+
+        liked_users = story_item.get("liked_users") or []
+        if not isinstance(liked_users, list):
+            liked_users = []
+
+        seen_story_view_keys: set[str] = set()
+        seen_story_like_keys: set[str] = set()
+        interactions_to_persist: List[Dict[str, Any]] = []
+
+        for viewer_user in viewer_users:
+            normalized_viewer = self._normalize_story_persist_user(viewer_user)
+            if not normalized_viewer:
+                continue
+
+            user_url = str(normalized_viewer["user_url"])
+            story_user_key = user_url
+
+            if story_user_key not in seen_story_view_keys:
+                interactions_to_persist.append(
+                    {
+                        "type": "view",
+                        "user_url": user_url,
+                        "user_username": normalized_viewer.get("user_username"),
+                        "_post_url": story_url_value,
+                    }
+                )
+                seen_story_view_keys.add(story_user_key)
+
+            viewer_liked = False
+            if isinstance(viewer_user, dict):
+                viewer_liked = bool(
+                    viewer_user.get("liked") is True
+                    or viewer_user.get("badge_heart_red") is True
+                )
+            if viewer_liked and story_user_key not in seen_story_like_keys:
+                interactions_to_persist.append(
+                    {
+                        "type": "like",
+                        "user_url": user_url,
+                        "user_username": normalized_viewer.get("user_username"),
+                        "_post_url": story_url_value,
+                    }
+                )
+                seen_story_like_keys.add(story_user_key)
+
+        for liked_user in liked_users:
+            normalized_liker = self._normalize_story_persist_user(liked_user)
+            if not normalized_liker:
+                continue
+            user_url = str(normalized_liker["user_url"])
+            story_user_key = user_url
+            if story_user_key in seen_story_like_keys:
+                continue
+            interactions_to_persist.append(
+                {
+                    "type": "like",
+                    "user_url": user_url,
+                    "user_username": normalized_liker.get("user_username"),
+                    "_post_url": story_url_value,
+                }
+            )
+            seen_story_like_keys.add(story_user_key)
+
+        await self._save_posts_and_interactions(
+            db,
+            profile_id,
+            [
+                {
+                    "post_url": story_url_value,
+                    "caption": None,
+                    "like_count": len(seen_story_like_keys),
+                    "comment_count": 0,
+                    "posted_at": None,
+                }
+            ],
+            interactions_to_persist,
+        )
+        return story_url_value
+
     def _render_direct_message(self, message_template: str, first_name: str) -> str:
         """Renderiza placeholders simples de primeiro nome sem alterar o resto da mensagem."""
         rendered = html_lib.unescape(str(message_template or ""))
@@ -1764,10 +1898,44 @@ class InstagramScraper:
                     "E necessario estar logado no Instagram para coletar interacoes de stories."
                 )
 
+            profile_payload = {
+                "username": username,
+                "bio": None,
+                "is_private": False,
+                "follower_count": None,
+                "verified": False,
+            }
+            profile_db: Optional[Profile] = None
+            persisted_story_urls: set[str] = set()
+
+            if db:
+                profile_db = await self._save_profile(db, profile_url, profile_payload)
+
+            async def _persist_story_before_next_navigation(story_item: Dict[str, Any]) -> None:
+                if not db or profile_db is None:
+                    return
+
+                story_url_value = str(story_item.get("story_url") or "").strip()
+                if not story_url_value or story_url_value in persisted_story_urls:
+                    return
+
+                persisted_story_url = await self._persist_story_interaction_item(
+                    db,
+                    profile_db.id,
+                    story_item,
+                )
+                if persisted_story_url:
+                    persisted_story_urls.add(persisted_story_url)
+                    logger.info(
+                        "Story persistido antes da navegacao seguinte: %s",
+                        persisted_story_url,
+                    )
+
             raw_result = await browser_use_agent.scrape_story_interactions(
                 profile_url=profile_url,
                 storage_state=storage_state,
                 max_interactions=safe_max_interactions,
+                on_story_collected=_persist_story_before_next_navigation if db else None,
             )
             raw_error = str(raw_result.get("error") or "").strip().lower()
             raw_story_posts = []
@@ -2010,147 +2178,18 @@ class InstagramScraper:
                     profile_url,
                 )
 
-            if db:
-                profile_payload = {
-                    "username": username,
-                    "bio": None,
-                    "is_private": False,
-                    "follower_count": None,
-                    "verified": False,
-                }
-                profile_db = await self._save_profile(db, profile_url, profile_payload)
-
-                posts_to_persist: List[Dict[str, Any]] = []
-                interactions_to_persist: List[Dict[str, Any]] = []
-
+            if db and profile_db is not None:
                 for story_item in normalized_story_posts:
                     story_url_value = str(story_item.get("story_url") or "").strip()
-                    if not story_url_value:
+                    if not story_url_value or story_url_value in persisted_story_urls:
                         continue
-
-                    viewer_users = story_item.get("viewer_users") or []
-                    if not isinstance(viewer_users, list):
-                        viewer_users = []
-
-                    liked_users = story_item.get("liked_users") or []
-                    if not isinstance(liked_users, list):
-                        liked_users = []
-
-                    seen_story_view_keys: set[str] = set()
-                    seen_story_like_keys: set[str] = set()
-
-                    def _normalize_persist_user(raw_user: Any) -> Optional[Dict[str, Optional[str]]]:
-                        user_url = ""
-                        user_username = ""
-                        if isinstance(raw_user, dict):
-                            user_url = str(raw_user.get("user_url") or "").strip()
-                            user_username = str(raw_user.get("user_username") or "").strip().lstrip("@")
-                        elif isinstance(raw_user, str):
-                            candidate = raw_user.strip()
-                            if "instagram.com" in candidate:
-                                user_url = candidate
-                            else:
-                                user_username = candidate.lstrip("@")
-                        else:
-                            return None
-
-                        if user_url.startswith("/"):
-                            user_url = f"https://www.instagram.com{user_url}"
-                        if not user_url and user_username:
-                            user_url = f"https://www.instagram.com/{user_username}/"
-
-                        if user_url and "instagram.com" in user_url:
-                            parsed_user = urlparse(user_url)
-                            path_parts = [part for part in parsed_user.path.split("/") if part]
-                            if path_parts:
-                                normalized_username = path_parts[0].strip().lstrip("@")
-                                if normalized_username:
-                                    user_username = user_username or normalized_username
-                                    user_url = f"https://www.instagram.com/{normalized_username}/"
-
-                        if not user_url:
-                            return None
-                        if not user_username:
-                            try:
-                                user_username = self._extract_username_from_url(user_url)
-                            except Exception:
-                                user_username = ""
-
-                        return {
-                            "user_url": user_url,
-                            "user_username": user_username or None,
-                        }
-
-                    for viewer_user in viewer_users:
-                        normalized_viewer = _normalize_persist_user(viewer_user)
-                        if not normalized_viewer:
-                            continue
-
-                        user_url = str(normalized_viewer["user_url"])
-                        story_user_key = user_url
-
-                        if story_user_key not in seen_story_view_keys:
-                            interactions_to_persist.append(
-                                {
-                                    "type": "view",
-                                    "user_url": user_url,
-                                    "user_username": normalized_viewer.get("user_username"),
-                                    "_post_url": story_url_value,
-                                }
-                            )
-                            seen_story_view_keys.add(story_user_key)
-
-                        viewer_liked = False
-                        if isinstance(viewer_user, dict):
-                            viewer_liked = bool(
-                                viewer_user.get("liked") is True
-                                or viewer_user.get("badge_heart_red") is True
-                            )
-                        if viewer_liked and story_user_key not in seen_story_like_keys:
-                            interactions_to_persist.append(
-                                {
-                                    "type": "like",
-                                    "user_url": user_url,
-                                    "user_username": normalized_viewer.get("user_username"),
-                                    "_post_url": story_url_value,
-                                }
-                            )
-                            seen_story_like_keys.add(story_user_key)
-
-                    for liked_user in liked_users:
-                        normalized_liker = _normalize_persist_user(liked_user)
-                        if not normalized_liker:
-                            continue
-                        user_url = str(normalized_liker["user_url"])
-                        story_user_key = user_url
-                        if story_user_key in seen_story_like_keys:
-                            continue
-                        interactions_to_persist.append(
-                            {
-                                "type": "like",
-                                "user_url": user_url,
-                                "user_username": normalized_liker.get("user_username"),
-                                "_post_url": story_url_value,
-                            }
-                        )
-                        seen_story_like_keys.add(story_user_key)
-
-                    posts_to_persist.append(
-                        {
-                            "post_url": story_url_value,
-                            "caption": None,
-                            "like_count": len(seen_story_like_keys),
-                            "comment_count": 0,
-                            "posted_at": None,
-                        }
+                    persisted_story_url = await self._persist_story_interaction_item(
+                        db,
+                        profile_db.id,
+                        story_item,
                     )
-
-                await self._save_posts_and_interactions(
-                    db,
-                    profile_db.id,
-                    posts_to_persist,
-                    interactions_to_persist,
-                )
+                    if persisted_story_url:
+                        persisted_story_urls.add(persisted_story_url)
 
             if raw_error:
                 logger.warning(

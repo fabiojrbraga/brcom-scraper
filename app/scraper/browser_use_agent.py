@@ -11,7 +11,7 @@ import re
 import tempfile
 import unicodedata
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Union
+from typing import Optional, Dict, Any, List, Union, Callable, Awaitable
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -1427,6 +1427,7 @@ class BrowserUseAgent:
         profile_url: str,
         story_url: str,
         safe_max_interactions: int,
+        on_story_collected: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         target_username = self._extract_instagram_username(profile_url) or ""
         state_script = """
@@ -2825,14 +2826,31 @@ class BrowserUseAgent:
                 extraction_debug or None,
             )
 
-            story_posts.append(
-                {
-                    "story_url": current_story_url,
-                    "view_count": view_count,
-                    "viewer_users": viewer_users,
-                    "liked_users": liked_users,
-                }
-            )
+            story_payload = {
+                "story_url": current_story_url,
+                "view_count": view_count,
+                "viewer_users": viewer_users,
+                "liked_users": liked_users,
+            }
+            story_posts.append(story_payload)
+            if callable(on_story_collected):
+                # Persiste o story atual antes de qualquer tentativa de navegar para o proximo.
+                await on_story_collected(
+                    {
+                        "story_url": str(story_payload.get("story_url") or "").strip(),
+                        "view_count": story_payload.get("view_count"),
+                        "viewer_users": [
+                            dict(viewer_user)
+                            for viewer_user in (story_payload.get("viewer_users") or [])
+                            if isinstance(viewer_user, dict)
+                        ],
+                        "liked_users": [
+                            dict(liked_user)
+                            for liked_user in (story_payload.get("liked_users") or [])
+                            if isinstance(liked_user, dict)
+                        ],
+                    }
+                )
 
             for _close_try in range(3):
                 await self._evaluate_page_json(page, close_modal_script)
@@ -4427,9 +4445,10 @@ class BrowserUseAgent:
         profile_url: str,
         storage_state: Optional[Dict[str, Any]],
         max_interactions: int = 300,
+        on_story_collected: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """
-        Abre stories de um perfil e extrai por story:
+        Abre stories de um perfil usando somente o fluxo JS e extrai por story:
         - URL do story
         - numero de visualizacoes
         - usuarios que deram like (username + url)
@@ -4457,61 +4476,6 @@ class BrowserUseAgent:
             self._prepare_storage_state_for_browser_session(storage_state)
         )
 
-        def _to_int_or_none(value: Any) -> Optional[int]:
-            if value is None:
-                return None
-            if isinstance(value, bool):
-                return None
-            if isinstance(value, int):
-                return value
-            if isinstance(value, float):
-                return int(value)
-            text = str(value).strip()
-            if not text:
-                return None
-            digits = "".join(ch for ch in text if ch.isdigit())
-            if not digits:
-                return None
-            try:
-                return int(digits)
-            except Exception:
-                return None
-
-        def _normalize_story_url(value: Any) -> str:
-            raw_url = str(value or "").strip()
-            if not raw_url:
-                return ""
-            if raw_url.startswith("/"):
-                raw_url = f"https://www.instagram.com{raw_url}"
-            parsed = urlparse(raw_url)
-            path_parts = [part for part in parsed.path.split("/") if part]
-            if len(path_parts) >= 3 and path_parts[0].lower() == "stories":
-                username_part = path_parts[1].strip().lstrip("@")
-                story_id_part = path_parts[2].strip()
-                if username_part and story_id_part:
-                    return f"https://www.instagram.com/stories/{username_part}/{story_id_part}/"
-            if raw_url and "/stories/" in raw_url and not raw_url.endswith("/"):
-                raw_url = f"{raw_url}/"
-            return raw_url
-
-        def _is_explicit_liked_user(raw_user: Any) -> bool:
-            if not isinstance(raw_user, dict):
-                return False
-            has_marker = False
-            if "badge_heart_red" in raw_user:
-                has_marker = True
-                if raw_user.get("badge_heart_red") is not True:
-                    return False
-            if "liked" in raw_user:
-                has_marker = True
-                if raw_user.get("liked") is not True:
-                    return False
-            if "type" in raw_user:
-                has_marker = True
-                if self._normalize_story_interaction_type(raw_user.get("type")) != "like":
-                    return False
-            return has_marker
-
         try:
             if not storage_state:
                 return {
@@ -4536,9 +4500,6 @@ class BrowserUseAgent:
                         max_retries,
                     )
 
-                    if not self.api_key:
-                        raise ValueError("OPENAI_API_KEY is required for Browser Use.")
-
                     use_reconnect = bool(reconnect_url and attempt == 1 and not force_fresh_cdp)
                     use_session_connect = bool(
                         (not reconnect_url) and session_connect_url and attempt == 1 and not force_fresh_cdp
@@ -4557,94 +4518,42 @@ class BrowserUseAgent:
                     )
                     restore_event_bus = self._patch_event_bus_for_stop(browser_session)
 
-                    js_result: Optional[Dict[str, Any]] = None
-                    try:
-                        js_result = await self._scrape_story_interactions_via_js(
-                            browser_session=browser_session,
-                            profile_url=profile_url,
-                            story_url=story_url,
-                            safe_max_interactions=safe_max_interactions,
-                        )
-                    except Exception as js_exc:
-                        js_error_text = str(js_exc or "")
-                        js_failure_error = self._classify_agent_failure_error(exc=js_exc)
+                    js_result = await self._scrape_story_interactions_via_js(
+                        browser_session=browser_session,
+                        profile_url=profile_url,
+                        story_url=story_url,
+                        safe_max_interactions=safe_max_interactions,
+                        on_story_collected=on_story_collected,
+                    )
+                    if not isinstance(js_result, dict):
+                        raise RuntimeError("stories_js_no_result")
 
-                        if js_failure_error != "protocol_error":
-                            try:
-                                await self._ensure_browser_session_connected(
-                                    browser_session,
-                                    timeout_ms=10000,
-                                )
-                            except Exception as reconnect_exc:
-                                combined_error_text = " | ".join(
-                                    part
-                                    for part in (js_error_text, str(reconnect_exc or ""))
-                                    if part
-                                )
-                                if self._contains_protocol_error(combined_error_text):
-                                    js_error_text = combined_error_text
-                                    js_failure_error = "protocol_error"
-
-                        if js_failure_error == "protocol_error":
-                            if attempt < max_retries:
-                                self._toggle_ws_compression_mode("protocol_error no fluxo JS de stories")
-                                reconnect_url = None
-                                session_connect_url = None
-                                force_fresh_cdp = True
-                                wait_time = retry_delay * attempt
-                                logger.warning(
-                                    "Fluxo JS com protocolo instavel em stories (%s/%s). Retentando em %ss...",
-                                    attempt,
-                                    max_retries,
-                                    wait_time,
-                                )
-                                await asyncio.sleep(wait_time)
-                                continue
-                            return {
-                                "profile_url": profile_url,
-                                "stories_accessible": False,
-                                "story_posts": [],
-                                "total_story_posts": 0,
-                                "total_story_viewers": 0,
-                                "total_liked_users": 0,
-                                "total_collected": 0,
-                                "error": "protocol_error",
-                            }
+                    js_error = str(js_result.get("error") or "").strip().lower()
+                    if js_error == "protocol_error" and attempt < max_retries:
+                        self._toggle_ws_compression_mode("protocol_error no fluxo JS de stories")
+                        reconnect_url = None
+                        session_connect_url = None
+                        force_fresh_cdp = True
+                        wait_time = retry_delay * attempt
                         logger.warning(
-                            "Fluxo JS de stories falhou; fallback para LLM (%s/%s): %s",
+                            "Fluxo JS com protocolo instavel em stories (%s/%s). Retentando em %ss...",
                             attempt,
                             max_retries,
-                            str(js_exc)[:180],
+                            wait_time,
                         )
-                        js_result = None
-
-                    if isinstance(js_result, dict):
-                        js_error = str(js_result.get("error") or "").strip().lower()
-                        if js_error == "protocol_error" and attempt < max_retries:
-                            self._toggle_ws_compression_mode("protocol_error no fluxo JS de stories")
-                            reconnect_url = None
-                            session_connect_url = None
-                            force_fresh_cdp = True
-                            wait_time = retry_delay * attempt
-                            logger.warning(
-                                "Fluxo JS com protocolo instavel em stories (%s/%s). Retentando em %ss...",
-                                attempt,
-                                max_retries,
-                                wait_time,
-                            )
-                            await asyncio.sleep(wait_time)
-                            continue
-                        if js_error == "story_open_failed" and attempt < max_retries:
-                            wait_time = retry_delay * attempt
-                            logger.warning(
-                                "Fluxo JS nao conseguiu abrir viewer de stories (%s/%s). Retentando em %ss...",
-                                attempt,
-                                max_retries,
-                                wait_time,
-                            )
-                            await asyncio.sleep(wait_time)
-                            continue
-                        return js_result
+                        await asyncio.sleep(wait_time)
+                        continue
+                    if js_error == "story_open_failed" and attempt < max_retries:
+                        wait_time = retry_delay * attempt
+                        logger.warning(
+                            "Fluxo JS nao conseguiu abrir viewer de stories (%s/%s). Retentando em %ss...",
+                            attempt,
+                            max_retries,
+                            wait_time,
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    return js_result
 
                     task = f"""
                     Voce esta em um navegador autenticado no Instagram e deve coletar likes dos stories.
@@ -5130,7 +5039,23 @@ class BrowserUseAgent:
                     }
 
                 except Exception as exc:
+                    error_text = str(exc or "")
                     failure_error = self._classify_agent_failure_error(exc=exc)
+                    if failure_error != "protocol_error" and browser_session is not None:
+                        try:
+                            await self._ensure_browser_session_connected(
+                                browser_session,
+                                timeout_ms=10000,
+                            )
+                        except Exception as reconnect_exc:
+                            combined_error_text = " | ".join(
+                                part
+                                for part in (error_text, str(reconnect_exc or ""))
+                                if part
+                            )
+                            if self._contains_protocol_error(combined_error_text):
+                                error_text = combined_error_text
+                                failure_error = "protocol_error"
                     if failure_error == "rate_limit_exceeded":
                         return {
                             "profile_url": profile_url,
@@ -5142,7 +5067,7 @@ class BrowserUseAgent:
                             "total_collected": 0,
                             "error": failure_error,
                         }
-                    error_msg = str(exc).lower()
+                    error_msg = error_text.lower()
                     is_retryable = any(
                         marker in error_msg
                         for marker in (
@@ -5156,6 +5081,7 @@ class BrowserUseAgent:
                             "sent 1002",
                             "connectionclosederror",
                             "client is stopping",
+                            "stories_js_no_result",
                         )
                     )
                     if is_retryable and attempt < max_retries:
@@ -5169,12 +5095,12 @@ class BrowserUseAgent:
                             "Tentativa %s/%s falhou ao coletar stories: %s. Retentando em %ss...",
                             attempt,
                             max_retries,
-                            str(exc)[:120],
+                            error_text[:120],
                             wait_time,
                         )
                         await asyncio.sleep(wait_time)
                         continue
-                    normalized_error = "protocol_error" if self._contains_protocol_error(error_msg) else str(exc)
+                    normalized_error = "protocol_error" if self._contains_protocol_error(error_msg) else error_text
                     return {
                         "profile_url": profile_url,
                         "stories_accessible": False,
