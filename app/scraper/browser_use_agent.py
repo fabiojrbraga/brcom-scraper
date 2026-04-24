@@ -769,6 +769,11 @@ class BrowserUseAgent:
             "cannot navigate - browser not connected",
             "failed to establish cdp connection",
             "root cdp client not initialized",
+            "cdp requests failed or timed out",
+            "snapshot, dom_tree, ax_tree",
+            "failed to build dom tree without highlights",
+            "dom build failed",
+            "clean screenshot failed",
         )
         return any(marker in lowered for marker in markers)
 
@@ -3306,6 +3311,11 @@ class BrowserUseAgent:
             "client is stopping",
             "websocket",
             "navigation failed",
+            "cdp requests failed or timed out",
+            "snapshot, dom_tree, ax_tree",
+            "failed to build dom tree without highlights",
+            "dom build failed",
+            "clean screenshot failed",
         )
         return any(marker in message for marker in retry_markers)
 
@@ -4557,7 +4567,25 @@ class BrowserUseAgent:
                         )
                     except Exception as js_exc:
                         js_error_text = str(js_exc or "")
-                        if self._contains_protocol_error(js_error_text):
+                        js_failure_error = self._classify_agent_failure_error(exc=js_exc)
+
+                        if js_failure_error != "protocol_error":
+                            try:
+                                await self._ensure_browser_session_connected(
+                                    browser_session,
+                                    timeout_ms=10000,
+                                )
+                            except Exception as reconnect_exc:
+                                combined_error_text = " | ".join(
+                                    part
+                                    for part in (js_error_text, str(reconnect_exc or ""))
+                                    if part
+                                )
+                                if self._contains_protocol_error(combined_error_text):
+                                    js_error_text = combined_error_text
+                                    js_failure_error = "protocol_error"
+
+                        if js_failure_error == "protocol_error":
                             if attempt < max_retries:
                                 self._toggle_ws_compression_mode("protocol_error no fluxo JS de stories")
                                 reconnect_url = None

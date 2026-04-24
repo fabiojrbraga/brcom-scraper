@@ -39,6 +39,18 @@ class BrowserUseErrorClassificationTest(unittest.TestCase):
         )
         self.assertEqual(err, "protocol_error")
 
+    def test_cdp_timeout_classification_treated_as_protocol_error(self):
+        err = self.agent._classify_agent_failure_error(
+            exc=TimeoutError("CDP requests failed or timed out: snapshot, dom_tree, ax_tree")
+        )
+        self.assertEqual(err, "protocol_error")
+
+    def test_retry_login_error_for_cdp_timeout(self):
+        should_retry = self.agent._should_retry_login_error(
+            TimeoutError("CDP requests failed or timed out: snapshot, dom_tree, ax_tree")
+        )
+        self.assertTrue(should_retry)
+
     def test_unknown_error_falls_back_to_parse_failed(self):
         err = self.agent._classify_agent_failure_error(final_result="unexpected format")
         self.assertEqual(err, "parse_failed")
