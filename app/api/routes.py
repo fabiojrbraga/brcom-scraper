@@ -1596,6 +1596,7 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
                 )
 
         if flow == "stories_interactions" and isinstance(result, dict):
+            story_job_result = str(result.get("job_result") or "").strip().lower()
             story_error = str(result.get("error") or "").strip().lower()
             fatal_story_errors = {
                 "story_open_failed",
@@ -1604,11 +1605,18 @@ async def _scrape_profile_background(job_id: str, profile_url: str, options: dic
                 "all_retries_failed",
                 "parse_failed",
             }
-            if story_error in fatal_story_errors:
+            should_fail_story_job = False
+            if story_job_result:
+                should_fail_story_job = story_job_result == "failed"
+            else:
+                should_fail_story_job = story_error in fatal_story_errors
+
+            if should_fail_story_job:
                 raise RuntimeError(
                     (
                         "Falha no fluxo stories_interactions "
-                        f"({story_error}); nao foi possivel confirmar as interacoes."
+                        f"({story_job_result or story_error or 'failed'}); "
+                        "nao foi possivel confirmar as interacoes com persistencia."
                     )
                 )
 

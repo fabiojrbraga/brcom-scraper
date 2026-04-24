@@ -195,6 +195,43 @@ class InstagramScraper:
         )
         return story_url_value
 
+    def _summarize_story_item_counts(self, story_item: Dict[str, Any]) -> Dict[str, int]:
+        viewer_users = story_item.get("viewer_users") or []
+        if not isinstance(viewer_users, list):
+            viewer_users = []
+
+        liked_users = story_item.get("liked_users") or []
+        if not isinstance(liked_users, list):
+            liked_users = []
+
+        like_keys: set[str] = set()
+        for viewer_user in viewer_users:
+            if not isinstance(viewer_user, dict):
+                continue
+            if viewer_user.get("liked") is not True and viewer_user.get("badge_heart_red") is not True:
+                continue
+            dedupe_key = (
+                str(viewer_user.get("user_url") or "").strip()
+                or str(viewer_user.get("user_username") or "").strip().lstrip("@")
+            )
+            if dedupe_key:
+                like_keys.add(dedupe_key)
+
+        for liked_user in liked_users:
+            if not isinstance(liked_user, dict):
+                continue
+            dedupe_key = (
+                str(liked_user.get("user_url") or "").strip()
+                or str(liked_user.get("user_username") or "").strip().lstrip("@")
+            )
+            if dedupe_key:
+                like_keys.add(dedupe_key)
+
+        return {
+            "viewer_count": len(viewer_users),
+            "like_count": len(like_keys),
+        }
+
     def _render_direct_message(self, message_template: str, first_name: str) -> str:
         """Renderiza placeholders simples de primeiro nome sem alterar o resto da mensagem."""
         rendered = html_lib.unescape(str(message_template or ""))
@@ -1907,6 +1944,7 @@ class InstagramScraper:
             }
             profile_db: Optional[Profile] = None
             persisted_story_urls: set[str] = set()
+            persisted_story_stats: Dict[str, Dict[str, int]] = {}
 
             if db:
                 profile_db = await self._save_profile(db, profile_url, profile_payload)
@@ -1926,6 +1964,7 @@ class InstagramScraper:
                 )
                 if persisted_story_url:
                     persisted_story_urls.add(persisted_story_url)
+                    persisted_story_stats[persisted_story_url] = self._summarize_story_item_counts(story_item)
                     logger.info(
                         "Story persistido antes da navegacao seguinte: %s",
                         persisted_story_url,
@@ -2128,34 +2167,78 @@ class InstagramScraper:
                         }
                     )
 
+            if db and profile_db is not None:
+                for story_item in normalized_story_posts:
+                    story_url_value = str(story_item.get("story_url") or "").strip()
+                    if not story_url_value or story_url_value in persisted_story_urls:
+                        continue
+                    persisted_story_url = await self._persist_story_interaction_item(
+                        db,
+                        profile_db.id,
+                        story_item,
+                    )
+                    if persisted_story_url:
+                        persisted_story_urls.add(persisted_story_url)
+                        persisted_story_stats[persisted_story_url] = self._summarize_story_item_counts(story_item)
+
             total_liked_users = len(seen_like_keys)
             total_story_posts = len(normalized_story_posts)
             total_story_viewers = sum(
                 len(story_item.get("viewer_users", []) or [])
                 for story_item in normalized_story_posts
             )
-            total_story_like_interactions = sum(
-                len(story_item.get("liked_users", []) or [])
-                for story_item in normalized_story_posts
-                if isinstance(story_item.get("liked_users"), list)
+
+            if db:
+                persisted_story_posts = len(persisted_story_urls)
+                persisted_total_story_viewers = sum(
+                    item.get("viewer_count", 0)
+                    for item in persisted_story_stats.values()
+                )
+                persisted_total_story_likes = sum(
+                    item.get("like_count", 0)
+                    for item in persisted_story_stats.values()
+                )
+            else:
+                persisted_story_posts = total_story_posts
+                persisted_total_story_viewers = total_story_viewers
+                persisted_total_story_likes = total_liked_users
+
+            persisted_total_interactions = (
+                persisted_total_story_viewers + persisted_total_story_likes
             )
 
+            if (
+                raw_error == "story_open_failed"
+                and not normalized_story_posts
+            ):
+                logger.warning(
+                    "Falha ao abrir viewer de stories para %s; evitando falso no_active_stories.",
+                    profile_url,
+                )
+
+            if raw_error and persisted_story_posts > 0:
+                job_result = "partial_success"
+            elif raw_error and raw_error != "no_active_stories":
+                job_result = "failed"
+            else:
+                job_result = "success"
+
             result: Dict[str, Any] = {
-                "status": "success",
+                "status": job_result,
+                "job_result": job_result,
                 "flow": "stories_interactions",
                 "profile": {
                     "username": username,
                     "profile_url": profile_url,
                 },
-                "posts": [],
-                "story_posts": normalized_story_posts,
                 "summary": {
-                    "total_posts": total_story_posts,
-                    "total_story_posts": total_story_posts,
-                    "total_story_viewers": total_story_viewers,
-                    "total_story_likes": total_liked_users,
-                    "total_story_interactions": total_story_viewers + total_story_like_interactions,
-                    "total_interactions": total_story_viewers + total_story_like_interactions,
+                    "total_posts": persisted_story_posts,
+                    "total_story_posts": persisted_story_posts,
+                    "total_story_viewers": persisted_total_story_viewers,
+                    "total_story_likes": persisted_total_story_likes,
+                    "total_story_interactions": persisted_total_interactions,
+                    "total_interactions": persisted_total_interactions,
+                    "persisted_story_posts": persisted_story_posts,
                     "scraped_at": datetime.utcnow().isoformat(),
                 },
             }
@@ -2169,42 +2252,22 @@ class InstagramScraper:
                 if raw_result.get("raw_result"):
                     result["raw_result"] = raw_result.get("raw_result")
 
-            if (
-                raw_error == "story_open_failed"
-                and not normalized_story_posts
-            ):
-                logger.warning(
-                    "Falha ao abrir viewer de stories para %s; evitando falso no_active_stories.",
-                    profile_url,
-                )
-
-            if db and profile_db is not None:
-                for story_item in normalized_story_posts:
-                    story_url_value = str(story_item.get("story_url") or "").strip()
-                    if not story_url_value or story_url_value in persisted_story_urls:
-                        continue
-                    persisted_story_url = await self._persist_story_interaction_item(
-                        db,
-                        profile_db.id,
-                        story_item,
-                    )
-                    if persisted_story_url:
-                        persisted_story_urls.add(persisted_story_url)
-
             if raw_error:
                 logger.warning(
-                    "Fluxo stories_interactions finalizado com erro=%s: story_posts=%s viewers=%s likes=%s",
+                    "Fluxo stories_interactions finalizado com resultado=%s erro=%s: persisted_story_posts=%s viewers=%s likes=%s",
+                    job_result,
                     raw_error,
-                    total_story_posts,
-                    total_story_viewers,
-                    total_liked_users,
+                    persisted_story_posts,
+                    persisted_total_story_viewers,
+                    persisted_total_story_likes,
                 )
             else:
                 logger.info(
-                    "Fluxo stories_interactions concluido: story_posts=%s viewers=%s likes=%s",
-                    total_story_posts,
-                    total_story_viewers,
-                    total_liked_users,
+                    "Fluxo stories_interactions concluido com resultado=%s: persisted_story_posts=%s viewers=%s likes=%s",
+                    job_result,
+                    persisted_story_posts,
+                    persisted_total_story_viewers,
+                    persisted_total_story_likes,
                 )
             return result
         except Exception as exc:
