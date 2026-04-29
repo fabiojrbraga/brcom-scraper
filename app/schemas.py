@@ -303,7 +303,7 @@ class ScrapingJobCreate(BaseModel):
         description="Janela de dias para considerar post recente",
         validation_alias=AliasChoices("recent_days", "recent_hours"),
     )
-    max_like_users_per_post: int = Field(default=30, ge=1, le=200, description="Maximo de perfis curtidores por post")
+    max_like_users_per_post: int = Field(default=30, ge=1, le=300, description="Maximo de perfis curtidores por post")
     max_story_interactions: int = Field(
         default=300,
         ge=1,
