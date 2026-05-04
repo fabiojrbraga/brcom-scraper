@@ -13,7 +13,7 @@ Observacoes gerais:
 - Os IDs sao strings `VARCHAR(36)` contendo UUIDs gerados pela aplicacao.
 - As datas sao gravadas pela aplicacao com `datetime.utcnow`; trate como UTC.
 - Colunas chamadas `metadata` no banco aparecem no Python como `metadata_json`.
-- Para analises, prefira consultas `SELECT`. As tabelas de sessao contem estado de autenticacao e nao devem ser expostas em relatorios.
+- Para analises, prefira consultas `SELECT`.
 - O `create_all` do SQLAlchemy cria as tabelas e alguns indices. `app/database.py` tambem garante colunas/indices historicos em `interactions` e `profiles`.
 
 ## Visao geral das tabelas
@@ -24,8 +24,6 @@ Observacoes gerais:
 | `posts` | Posts/reels associados a um perfil. |
 | `interactions` | Interacoes capturadas em posts/stories, como likes, comentarios, shares, saves e views. |
 | `scraping_jobs` | Jobs assincronos de scraping e seus resultados/metadados. |
-| `instagram_sessions` | Sessoes autenticadas do Instagram para reutilizacao pelo scraper. |
-| `investing_sessions` | Sessoes autenticadas do Investing para reutilizacao pelo scraper. |
 
 ## Relacionamentos principais
 
@@ -35,7 +33,6 @@ Observacoes gerais:
 | `profiles.id` -> `interactions.profile_id` | 1 perfil para N interacoes | `interactions.profile_id = profiles.id` |
 | `posts.id` -> `interactions.post_id` | 1 post para N interacoes | `interactions.post_id = posts.id` |
 | `scraping_jobs.profile_url` -> `profiles.instagram_url` | Relacao logica, sem FK | Comparar URLs normalizadas quando necessario. |
-| `instagram_sessions` e `investing_sessions` | Sem FK | Usadas para autenticacao, nao para analise de negocio. |
 
 Importante: as delecoes em cascata estao configuradas nos relacionamentos ORM (`cascade="all, delete-orphan"`), mas as foreign keys nao declaram `ON DELETE CASCADE` no banco. Um SQL direto que delete linhas pai pode falhar ou deixar comportamento diferente do ORM.
 
@@ -184,56 +181,6 @@ Uso recomendado:
 - `metadata` pode conter `request`, `flow`, `result`, `raw_result`, dados de teste e payloads especificos dos endpoints `/scrape`, `/generic_scrape` e `/investing_scrape`.
 - Nao existe FK para `profiles`; quando precisar relacionar job e perfil, compare `profile_url` com `profiles.instagram_url` ou extraia o username da URL.
 
-## `instagram_sessions`
-
-Armazena sessoes autenticadas do Instagram. Esta tabela e operacional e sensivel; normalmente nao deve alimentar relatorios de negocio.
-
-Chaves e indices:
-
-- PK: `id`.
-- Index: `instagram_username`.
-- FKs: nenhuma.
-
-| Coluna | Tipo | Chave/indice | Nulo | Default | Descricao |
-| --- | --- | --- | --- | --- | --- |
-| `id` | `VARCHAR(36)` | PK | Nao | UUID gerado | Identificador da sessao. |
-| `instagram_username` | `VARCHAR(255)` | Index | Sim | - | Username associado a sessao autenticada. |
-| `storage_state` | `JSON` | - | Nao | - | Estado do navegador/cookies. Campo sensivel; nao selecione em relatorios. |
-| `is_active` | `BOOLEAN` | - | Sim | `true` | Indica se a sessao pode ser reutilizada. |
-| `last_used_at` | `DATETIME` | - | Sim | - | Ultima vez em que a sessao foi usada. |
-| `created_at` | `DATETIME` | - | Sim | `utcnow` | Data de criacao do registro. |
-| `updated_at` | `DATETIME` | - | Sim | `utcnow`, atualiza no update | Data da ultima atualizacao. |
-
-Uso recomendado:
-
-- Para auditoria operacional, consulte apenas `id`, `instagram_username`, `is_active`, `last_used_at`, `created_at`, `updated_at`.
-- Nunca inclua `storage_state` em uma resposta de tool para LLM, pois pode conter cookies e credenciais de sessao.
-
-## `investing_sessions`
-
-Armazena sessoes autenticadas do Investing. Assim como `instagram_sessions`, e uma tabela operacional e sensivel.
-
-Chaves e indices:
-
-- PK: `id`.
-- Index: `investing_username`.
-- FKs: nenhuma.
-
-| Coluna | Tipo | Chave/indice | Nulo | Default | Descricao |
-| --- | --- | --- | --- | --- | --- |
-| `id` | `VARCHAR(36)` | PK | Nao | UUID gerado | Identificador da sessao. |
-| `investing_username` | `VARCHAR(255)` | Index | Sim | - | Username associado a sessao autenticada do Investing. |
-| `storage_state` | `JSON` | - | Nao | - | Estado do navegador/cookies. Campo sensivel; nao selecione em relatorios. |
-| `is_active` | `BOOLEAN` | - | Sim | `true` | Indica se a sessao pode ser reutilizada. |
-| `last_used_at` | `DATETIME` | - | Sim | - | Ultima vez em que a sessao foi usada. |
-| `created_at` | `DATETIME` | - | Sim | `utcnow` | Data de criacao do registro. |
-| `updated_at` | `DATETIME` | - | Sim | `utcnow`, atualiza no update | Data da ultima atualizacao. |
-
-Uso recomendado:
-
-- Para auditoria operacional, consulte apenas `id`, `investing_username`, `is_active`, `last_used_at`, `created_at`, `updated_at`.
-- Nunca inclua `storage_state` em uma resposta de tool para LLM.
-
 ## Guia rapido para montar consultas
 
 ### Perfil com posts e metricas
@@ -369,8 +316,7 @@ ORDER BY total_jobs DESC;
 - Sempre qualifique colunas com alias quando usar joins (`p`, `po`, `i`, `j`).
 - Use `profiles.id`, `posts.id` e `interactions.id` como chaves tecnicas; use usernames/URLs apenas para filtro e apresentacao.
 - Ao filtrar `interaction_type`, prefira `lower(interaction_type::text)` para tolerar bases antigas com enum em caixa diferente.
-- Evite `SELECT *`, principalmente em tabelas com `metadata` e `storage_state`.
-- Nunca selecione `instagram_sessions.storage_state` ou `investing_sessions.storage_state` para um LLM.
+- Evite `SELECT *`, principalmente em tabelas com `metadata`.
 - Para rankings de usuarios, agrupe por `user_url` e use `MAX(user_username)` apenas como rotulo.
 - Para posts, faca join com `interactions` por `interactions.post_id = posts.id`; `post_url` deve ser usado como apoio, nao como chave primaria.
 - Campos de contagem extraidos do Instagram podem estar nulos ou desatualizados. Use `COALESCE(campo, 0)` em somas.
